@@ -98,7 +98,7 @@ async fn latest_bundled_version() -> i64 {
 #[tokio::test]
 async fn stuck_user_with_orphans_self_heals_and_030_applies() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
     build_v29_db(
         &path,
         &[
@@ -145,7 +145,7 @@ async fn v28_start_point_self_heals_across_029_and_030() {
     // aborted here (SQLite 275). Same dirty-data shape as the v29 case, but from
     // a start point that never passes through v29.
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
     build_db_through(
         &path,
         28,
@@ -199,7 +199,7 @@ async fn v28_start_point_self_heals_across_029_and_030() {
 #[tokio::test]
 async fn already_applied_030_upgrades_without_version_mismatch() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
     // Apply the FULL migrator (through 030) to simulate an already-migrated user.
     {
         let url = format!("sqlite://{}?mode=rwc", path.display());
@@ -225,7 +225,7 @@ async fn already_applied_030_upgrades_without_version_mismatch() {
 #[tokio::test]
 async fn repair_then_startup_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
     build_v29_db(
         &path,
         &[
@@ -247,6 +247,49 @@ async fn repair_then_startup_is_idempotent() {
 }
 
 #[tokio::test]
+async fn cross_scope_channel_session_is_detached_and_030_applies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("saydone.db");
+    build_v29_db(
+        &path,
+        &[
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+             VALUES ('system_default_user','admin','hash',1,1)",
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+             VALUES ('other_user','other','hash',1,1)",
+            "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at) \
+             VALUES ('c_other','other_user','Existing','acp','{}','pending',1,1)",
+            "INSERT INTO assistant_users (id, platform_user_id, platform_type, authorized_at) \
+             VALUES ('channel_user','external','telegram',1)",
+            "INSERT INTO assistant_sessions (id, user_id, agent_type, conversation_id, chat_id, created_at, last_activity) \
+             VALUES ('channel_session','channel_user','aionrs','c_other','chat',1,1)",
+        ],
+    )
+    .await;
+
+    let db = init_database_staged(&path)
+        .await
+        .expect("cross-owner channel session must not block migration 030");
+    assert_eq!(max_applied_version(&db).await, latest_bundled_version().await);
+
+    let conversation_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id='c_other'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(conversation_count, 1, "existing conversation is preserved");
+    let session_conversation: Option<String> =
+        sqlx::query_scalar("SELECT conversation_id FROM assistant_sessions WHERE id='channel_session'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        session_conversation, None,
+        "only the invalid session binding is detached"
+    );
+    db.close().await;
+}
+
+#[tokio::test]
 async fn defensive_dedup_prevents_unique_family_failure() {
     // spec §10 item 4: a DB whose 030 full-table rebuild would abort with the
     // UNIQUE/NOT-NULL family (not `ok = 1`) must be repaired so 030 succeeds.
@@ -261,7 +304,7 @@ async fn defensive_dedup_prevents_unique_family_failure() {
     // duplicates. This drives the real staged-init path (pre-migration dedup →
     // 030 rebuild) and proves the defensive dedup keeps 030 from aborting.
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
     build_v29_db(
         &path,
         &[
