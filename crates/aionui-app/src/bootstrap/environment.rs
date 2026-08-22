@@ -141,15 +141,6 @@ pub async fn init_data_layer(config: &AppConfig) -> Result<Database, BootstrapEr
     );
 
     let db_path = config.database_path();
-    aionui_db::maybe_copy_legacy_database(&db_path).map_err(|e| {
-        BootstrapError::new(
-            BootstrapErrorCode::DataInitFailed,
-            "data.legacy_db",
-            "failed to initialize application data",
-        )
-        .with_source(e)
-        .with_field("databasePath", db_path.display().to_string())
-    })?;
     info!("Initializing database at {}", db_path.display());
     let database = aionui_db::init_database_staged_with_options(
         &db_path,
@@ -231,7 +222,7 @@ mod tests {
             aionui_db::DbError::Migration(sqlx::migrate::MigrateError::VersionMissing(39)),
         );
 
-        let bootstrap = database_init_bootstrap_error(err, std::path::Path::new("/db/path/aionui-backend.db"));
+        let bootstrap = database_init_bootstrap_error(err, std::path::Path::new("/db/path/saydone.db"));
         let line = bootstrap.stderr_line();
         assert!(
             line.starts_with("BOOTSTRAP_DATA_INIT_FAILED stage=database.newer_than_app"),
@@ -251,7 +242,7 @@ mod tests {
             aionui_db::DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(7)),
         );
 
-        let bootstrap = database_init_bootstrap_error(err, std::path::Path::new("/db/path/aionui-backend.db"));
+        let bootstrap = database_init_bootstrap_error(err, std::path::Path::new("/db/path/saydone.db"));
         let line = bootstrap.stderr_line();
         assert!(
             line.starts_with("BOOTSTRAP_DATA_INIT_FAILED stage=database.migration"),

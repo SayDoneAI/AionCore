@@ -17,7 +17,7 @@ pub use agent_binding::{
 pub use database::{
     DATABASE_NEWER_THAN_APP_STAGE, Database, DatabaseInitError, DatabaseInitOptions, init_database,
     init_database_memory, init_database_staged, init_database_staged_with_options, init_database_with_options,
-    latest_known_migration_version, maybe_copy_legacy_database,
+    latest_known_migration_version,
 };
 pub use error::{
     DbError, SQLITE_BUSY_MESSAGE_MARKERS, SQLITE_UNIQUE_VIOLATION_MARKER, message_indicates_busy,

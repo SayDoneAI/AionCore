@@ -2,7 +2,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
-use aionui_db::{init_database, init_database_staged, maybe_copy_legacy_database};
+use aionui_db::{init_database, init_database_staged};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Row, SqlitePool};
 
@@ -82,7 +82,7 @@ async fn has_column(pool: &SqlitePool, table: &str, column: &str) -> bool {
 #[tokio::test]
 async fn advanced_legacy_db_missing_team_session_mode_still_initializes() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
 
     create_raw_legacy_backend_missing_team_session_mode(&path, "system_default_user").await;
 
@@ -101,7 +101,7 @@ async fn advanced_legacy_db_missing_team_session_mode_still_initializes() {
 #[tokio::test]
 async fn legacy_db_missing_message_hidden_column_still_initializes() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
 
     create_raw_legacy_backend_missing_message_hidden(&path, "system_default_user").await;
 
@@ -142,39 +142,61 @@ async fn legacy_db_missing_message_hidden_column_still_initializes() {
 }
 
 #[tokio::test]
-async fn existing_backend_db_is_repaired_in_place_without_recopied_legacy_source() {
+async fn raw_legacy_cross_scope_session_self_heals_before_migration_history_exists() {
     let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("aionui-backend.db");
-    let legacy = dir.path().join("aionui.db");
+    let path = dir.path().join("saydone.db");
+    create_raw_legacy_backend(&path, "system_default_user", true).await;
 
-    create_raw_legacy_backend_missing_team_session_mode(&legacy, "legacy_only").await;
-    create_raw_legacy_backend_missing_team_session_mode(&target, "backend_only").await;
+    let raw = open_raw_create(&path).await;
+    for statement in [
+        "CREATE TABLE assistant_users (\
+             id TEXT PRIMARY KEY NOT NULL,\
+             platform_user_id TEXT NOT NULL,\
+             platform_type TEXT NOT NULL,\
+             display_name TEXT,\
+             authorized_at INTEGER NOT NULL,\
+             last_active INTEGER,\
+             session_id TEXT,\
+             UNIQUE (platform_user_id, platform_type)\
+         )",
+        "INSERT INTO users (id, username, email, password_hash, created_at, updated_at) \
+         VALUES ('other_user', 'other_user', NULL, '', 1, 1)",
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at) \
+         VALUES ('other_conversation', 'other_user', 'Other', 'acp', '{}', 'pending', 1, 1)",
+        "INSERT INTO assistant_users (id, platform_user_id, platform_type, authorized_at) \
+         VALUES ('channel_user', 'external_user', 'telegram', 1)",
+        "INSERT INTO assistant_sessions (id, user_id, agent_type, conversation_id, chat_id, created_at, last_activity) \
+         VALUES ('channel_session', 'channel_user', 'aionrs', 'other_conversation', 'chat', 1, 1)",
+    ] {
+        sqlx::query(statement).execute(&raw).await.unwrap();
+    }
+    raw.close().await;
 
-    maybe_copy_legacy_database(&target).unwrap();
-    let repaired = init_database_staged(&target).await.unwrap();
-
-    let backend_user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = 'backend_only'")
-        .fetch_one(repaired.pool())
+    let repaired = init_database_staged(&path)
         .await
-        .unwrap();
-    let legacy_user_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = 'legacy_only'")
-        .fetch_one(repaired.pool())
-        .await
-        .unwrap();
-
-    assert_eq!(backend_user_count, 1, "existing backend DB must be preserved");
+        .expect("raw legacy database must repair before migration 030");
+    let conversation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversations WHERE id = 'other_conversation'")
+            .fetch_one(repaired.pool())
+            .await
+            .unwrap();
+    assert_eq!(conversation_count, 1, "the original conversation is preserved");
+    let session_conversation: Option<String> =
+        sqlx::query_scalar("SELECT conversation_id FROM assistant_sessions WHERE id = 'channel_session'")
+            .fetch_one(repaired.pool())
+            .await
+            .unwrap();
     assert_eq!(
-        legacy_user_count, 0,
-        "existing backend DB must not be overwritten from aionui.db"
+        session_conversation, None,
+        "only the invalid session binding is detached"
     );
-    assert!(has_column(repaired.pool(), "teams", "session_mode").await);
     repaired.close().await;
 }
 
 #[tokio::test]
 async fn upgraded_backend_db_reinit_is_noop_for_handoff_repair() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
 
     let db = init_database(&path).await.unwrap();
     sqlx::query(

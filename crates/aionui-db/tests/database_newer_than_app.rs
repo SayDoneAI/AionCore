@@ -30,7 +30,7 @@ async fn seed_future_migration_row(path: &std::path::Path) {
 #[tokio::test]
 async fn newer_database_fails_with_dedicated_stage() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
     seed_future_migration_row(&path).await;
 
     let err = init_database_staged(&path).await.expect_err("downgrade must fail");
@@ -50,7 +50,7 @@ async fn newer_database_fails_with_dedicated_stage() {
 #[tokio::test]
 async fn newer_database_is_not_recovered_as_corruption() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
     seed_future_migration_row(&path).await;
 
     // Even with the rebuild flag authorized, an intact newer database must not
@@ -78,7 +78,7 @@ async fn newer_database_is_not_recovered_as_corruption() {
 #[tokio::test]
 async fn genuine_migration_failures_keep_generic_stage() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aionui-backend.db");
+    let path = dir.path().join("saydone.db");
 
     // Tamper with an applied migration's checksum: sqlx reports
     // VersionMismatch, which is not a downgrade and must keep the generic

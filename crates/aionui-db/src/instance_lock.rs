@@ -24,7 +24,7 @@ pub fn instance_lock_path(db_path: &Path) -> PathBuf {
     let mut p = db_path.to_path_buf();
     let new_name = match p.file_name().and_then(|s| s.to_str()) {
         Some(name) => format!("{name}.instance.lock"),
-        None => "aionui.instance.lock".to_string(),
+        None => "saydone.instance.lock".to_string(),
     };
     p.set_file_name(new_name);
     p
@@ -90,15 +90,15 @@ mod tests {
     fn instance_lock_path_appends_instance_lock_suffix() {
         // Mirrors migrate_lock_path: the suffix is appended to the full file
         // name (kept next to the DB, on the same filesystem).
-        let path = instance_lock_path(Path::new("/data/aionui/aionui-backend.db"));
-        assert_eq!(path, PathBuf::from("/data/aionui/aionui-backend.db.instance.lock"));
+        let path = instance_lock_path(Path::new("/data/saydone/saydone.db"));
+        assert_eq!(path, PathBuf::from("/data/saydone/saydone.db.instance.lock"));
     }
 
     #[test]
     fn guard_is_exclusive_and_releases_on_drop() {
         let dir = std::env::temp_dir().join(format!("aionui-instance-lock-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let db_path = dir.join("aionui-backend.db");
+        let db_path = dir.join("saydone.db");
 
         // First acquisition wins.
         let guard = DataDirInstanceGuard::try_acquire(&db_path)

@@ -28,18 +28,22 @@ pub(crate) struct GuardViolation {
     pub count: i64,
 }
 
-/// True iff the database has a migration history (`_sqlx_migrations` exists) and
-/// migration 030 has NOT yet succeeded — i.e. 030 is still pending, so the raw
-/// data must be normalized before the migrator runs it.
+/// True iff migration 030 has not succeeded and the database can contain
+/// historical user data — i.e. 030 is still pending, so the raw data must be
+/// normalized before the migrator runs it.
 ///
 /// Returns false for:
-/// - **fresh installs** (no `_sqlx_migrations` table): the migrator builds the
-///   schema from empty and applies 001–030 on data-free tables, so there is
-///   nothing to repair. At this point in staged init the migrator has not yet
-///   created `_sqlx_migrations`, so this reads false.
+/// - **fresh installs** (no `_sqlx_migrations` or legacy `conversations`
+///   table): the migrator builds the schema from empty and applies 001–030 on
+///   data-free tables, so there is nothing to repair.
 /// - **already-migrated DBs** (030 present with `success = 1`): structurally
 ///   excludes migrated databases, so no `VersionMismatch` path exists (F2) and
 ///   the irreversible repair never re-runs on a DB already past 030.
+///
+/// A pre-Rust SayDone database has application tables but no migration history.
+/// It must run the repair before migrations 001–029 establish the history;
+/// otherwise the first startup reaches 030 before the repair has a chance to
+/// detach an invalid legacy channel-session binding.
 ///
 /// Unlike the previous `MAX(version) == 29` gate, this fires for ANY pre-030
 /// start point (e.g. v28 from AionCore 0.1.52 — the ELECTRON-31Z one-step
@@ -54,7 +58,13 @@ async fn should_run_user_scope_repair(conn: &mut sqlx::SqliteConnection) -> Resu
             .await
             .map_err(DbError::Query)?;
     if !has_table {
-        return Ok(false);
+        let has_legacy_conversations: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'conversations'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(DbError::Query)?;
+        return Ok(has_legacy_conversations);
     }
     let migration_030_applied: bool =
         sqlx::query_scalar("SELECT COUNT(*) > 0 FROM _sqlx_migrations WHERE version = ? AND success = 1")
@@ -169,12 +179,10 @@ const GUARD_COUNT_QUERIES: &[(&str, &str)] = &[
         "system_settings_non_primary_id",
         "SELECT COUNT(*) FROM system_settings WHERE (SELECT COUNT(*) FROM system_settings) = 1 AND id <> 1",
     ),
-    // --- B-class (DIAGNOSTIC-ONLY, no active repair): assistant_sessions cross-scope owner (030:812-824). ---
-    // 030 forces assistant_users.owner_user_id='system_default_user' (030:768) but never normalizes
-    // conversations.user_id, so 030's `c.user_id != u.owner_user_id` guard fails for a session-linked
-    // conversation whose user_id <> 'system_default_user'. Data-dependent (spec §7.1 "不得假设一定为空"):
-    // must be NAMED if it fires (spec §10 item 6 "含前置修复未覆盖的形态", §6 目标 5), even though this fix
-    // performs NO active repair for it (spec §7.1 B "覆盖到即可" is soft; §7.1 L3 diagnose-if-uncovered).
+    // --- B-class: legacy channel sessions whose conversation has another owner (030:812-824). ---
+    // Migration 030 assigns all legacy assistant_users to system_default_user.
+    // Detaching an old cross-owner conversation binding preserves both records
+    // and lets the channel create a correctly owned conversation on its next message.
     (
         "assistant_sessions_cross_scope_owner",
         "SELECT COUNT(*) FROM assistant_sessions s \
@@ -280,6 +288,18 @@ async fn apply_user_scope_repairs(conn: &mut sqlx::SqliteConnection) -> Result<(
            AND NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = assistant_sessions.conversation_id)",
     )
     .await?;
+    // Migration 030 gives every legacy assistant user the default Core owner.
+    // Keep the channel session and conversation, but clear a binding that would
+    // otherwise become cross-owner and make the migration abort.
+    exec_repair(
+        conn,
+        "UPDATE assistant_sessions SET conversation_id = NULL \
+         WHERE conversation_id IS NOT NULL \
+           AND EXISTS (SELECT 1 FROM conversations c \
+                       WHERE c.id = assistant_sessions.conversation_id \
+                         AND c.user_id <> 'system_default_user')",
+    )
+    .await?;
 
     // C-class dedup — keep the most-recently-updated row per composite-UNIQUE
     // key so 030's full-table rebuild INSERT does not hit UNIQUE(user_id,name)
@@ -378,9 +398,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_false_when_no_migrations_table() {
+    async fn gate_false_for_empty_database_without_migration_history() {
         let mut c = conn().await;
         assert!(!should_run_user_scope_repair(&mut c).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn gate_true_for_legacy_database_without_migration_history() {
+        let mut c = conn().await;
+        sqlx::query("CREATE TABLE conversations (id TEXT PRIMARY KEY, user_id TEXT)")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        assert!(should_run_user_scope_repair(&mut c).await.unwrap());
     }
 
     #[tokio::test]
@@ -637,15 +667,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_repair_recheck_reports_residual_after_clearing_repaired_guards() {
-        // The post-repair re-check re-evaluates the same guards after repair so a
-        // residual (e.g. diagnostic-only B-class) stays attributable while a
-        // repaired A-class guard reads clean. This asserts that exact sequence —
-        // the logic the "still violated after repair" warn / "all cleared" info
-        // lines report — without needing a log-capture harness.
+    async fn post_repair_recheck_clears_orphan_and_cross_scope_guards() {
+        // The post-repair re-check must report both independently repairable
+        // conditions as clean before migration 030 starts.
         let mut c = conn().await;
         create_min_v29_aggregate_tables(&mut c).await;
-        // A-class orphan (repaired) + B-class cross-scope session (diagnostic-only).
+        // A-class orphan + B-class cross-scope session.
         sqlx::query("INSERT INTO messages (id, conversation_id) VALUES ('m_orphan','missing')")
             .execute(&mut c)
             .await
@@ -677,16 +704,15 @@ mod tests {
             "repaired A-class orphan must NOT appear in the post-repair residual, got {residual:?}"
         );
         assert!(
-            residual
+            !residual
                 .iter()
-                .any(|v| v.check == "assistant_sessions_cross_scope_owner" && v.count == 1),
-            "diagnostic-only B-class must remain a named residual after repair, got {residual:?}"
+                .any(|v| v.check == "assistant_sessions_cross_scope_owner"),
+            "cross-scope session must be detached before migration 030, got {residual:?}"
         );
     }
 
     #[tokio::test]
-    async fn preflight_names_uncovered_cross_scope_guard() {
-        // spec §10 item 6: a DELIBERATELY-UNCOVERED (B-class) guard failure must still be NAMED.
+    async fn cross_scope_session_is_detached_without_removing_it() {
         let mut c = conn().await;
         create_min_v29_aggregate_tables(&mut c).await;
         // A conversation owned by a non-default user, linked by a session with a valid owner.
@@ -707,18 +733,17 @@ mod tests {
             "uncovered cross-scope guard must be named in the preflight, got {violations:?}"
         );
 
-        // B-class is diagnostic-only: apply_user_scope_repairs must NOT mutate it away.
         apply_user_scope_repairs(&mut c).await.unwrap();
-        let still: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM assistant_sessions s JOIN conversations c ON c.id = s.conversation_id \
-             WHERE c.user_id <> 'system_default_user'",
-        )
-        .fetch_one(&mut c)
-        .await
-        .unwrap();
-        assert_eq!(
-            still, 1,
-            "B-class cross-scope divergence is named but not repaired in this fix"
-        );
+        let conversation_id: Option<String> =
+            sqlx::query_scalar("SELECT conversation_id FROM assistant_sessions WHERE id = 's_x'")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+        assert_eq!(conversation_id, None, "only the invalid session binding is cleared");
+        let session_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM assistant_sessions WHERE id = 's_x'")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(session_count, 1, "channel session is preserved for the next message");
     }
 }
