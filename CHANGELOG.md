@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.1.72](https://github.com/SayDoneAI/AionCore/compare/v0.1.71...v0.1.72) (2026-08-22)
+
+
+### Features
+
+* **conversation:** persist plan snapshots and expose them for rehydration ([#916](https://github.com/SayDoneAI/AionCore/issues/916)) ([b2f12e9](https://github.com/SayDoneAI/AionCore/commit/b2f12e952ec8e71ed37f6240108998c9d7b016a1))
+
+
+### Bug Fixes
+
+* **auth:** extend JWT TTL to 30d to match cookie ([#918](https://github.com/SayDoneAI/AionCore/issues/918)) ([ecbedfa](https://github.com/SayDoneAI/AionCore/commit/ecbedfa622e80b7141cf1f0ab7dd007b23d1714d))
+* **storage:** use SayDone database path ([c8ebf68](https://github.com/SayDoneAI/AionCore/commit/c8ebf68ca3cce6dc46be98254c4b726434e716eb))
+
 ## [0.1.71](https://github.com/iOfficeAI/AionCore/compare/v0.1.70...v0.1.71) (2026-08-21)
 
 
