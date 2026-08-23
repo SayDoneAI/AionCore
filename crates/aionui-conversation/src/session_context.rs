@@ -672,6 +672,11 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
     {
         return s.clone();
     }
+
+    if *agent_type == AgentType::Aionrs {
+        return "saydone".into();
+    }
+
     agent_type.serde_name().to_owned()
 }
 
@@ -1238,7 +1243,23 @@ mod tests {
         let context = repos.builder().build(&row).await.unwrap();
         assert!(!context.workspace.is_custom);
         assert!(context.workspace.stored_path.is_empty());
-        assert!(context.workspace.path.ends_with("aionrs-temp-conv-1"));
+        assert!(context.workspace.path.ends_with("saydone-temp-conv-1"));
+    }
+
+    #[tokio::test]
+    async fn persisted_saydone_auto_workspace_is_not_custom() {
+        let repos = setup().await;
+        let workspace =
+            expected_auto_workspace_path(&repos.workspace_root, "user-1", "conv-1", &AgentType::Aionrs, None);
+        let row = row(
+            "aionrs",
+            serde_json::json!({ "workspace": workspace.to_string_lossy().to_string() }),
+            None,
+        );
+
+        let context = repos.builder().build(&row).await.unwrap();
+        assert!(!context.workspace.is_custom);
+        assert!(context.workspace.path.ends_with("saydone-temp-conv-1"));
     }
 
     #[tokio::test]
