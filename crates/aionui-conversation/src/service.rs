@@ -62,7 +62,9 @@ use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder}
 use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
+use crate::task_options::provider_model_from_conversation_row;
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
+use std::sync::Mutex;
 use std::sync::RwLock;
 
 pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
@@ -70,6 +72,33 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+
+#[derive(Debug, Clone)]
+struct ManagedConversationRuntime {
+    user_id: String,
+    model: String,
+    backend: String,
+    protocol: String,
+    base_url: String,
+    api_key: String,
+}
+
+fn managed_runtime_matches(
+    runtime: &ManagedConversationRuntime,
+    user_id: &str,
+    model: &str,
+    backend: &str,
+    protocol: &str,
+    base_url: &str,
+    api_key: &str,
+) -> bool {
+    runtime.user_id == user_id
+        && runtime.model == model
+        && runtime.backend == backend
+        && runtime.protocol == protocol
+        && runtime.base_url == base_url
+        && runtime.api_key == api_key
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 struct AssistantConversationOverrides {
@@ -338,6 +367,7 @@ pub struct ConversationService {
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    managed_runtimes: Arc<Mutex<HashMap<String, ManagedConversationRuntime>>>,
 
     /// One background-stream watcher per LIVE Session instance (keyed by
     /// conversation id; value remembers the instance pointer so a rebuilt
@@ -421,6 +451,7 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            managed_runtimes: Arc::new(Mutex::new(HashMap::new())),
             background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             conversation_repo,
@@ -2635,6 +2666,9 @@ impl ConversationService {
         if !had_active_turn {
             self.runtime_state.clear_deleting(id);
         }
+        if let Ok(mut runtimes) = self.managed_runtimes.lock() {
+            runtimes.remove(id);
+        }
         // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
         // conversations that used to be ACP (shouldn't happen but is
         // cheap to cover) still drop their orphaned session row.
@@ -4641,6 +4675,213 @@ impl ConversationService {
         })
     }
 
+    pub async fn switch_managed_runtime(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request: aionui_api_types::SwitchManagedConversationRuntimeRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if let Some(team_id) = team_id_from_extra(&row.extra) {
+            return Err(ConversationError::TeamRuntimeRequired {
+                conversation_id: conversation_id.to_owned(),
+                team_id,
+            });
+        }
+
+        let model = request.model.trim();
+        let backend = request.backend.trim().to_ascii_lowercase();
+        let protocol = request.protocol.trim().to_ascii_lowercase();
+        let base_url = request.base_url.trim();
+        let api_key = request.api_key.trim();
+        if model.is_empty() || base_url.is_empty() || api_key.is_empty() {
+            return Err(ConversationError::BadRequest {
+                reason: "managed runtime model, base_url and api_key are required".into(),
+            });
+        }
+        let expected_protocol = match backend.as_str() {
+            "claude" => "anthropic",
+            "codex" | "saydone" => "openai",
+            _ => {
+                return Err(ConversationError::BadRequest {
+                    reason: format!("unsupported managed runtime backend '{backend}'"),
+                });
+            }
+        };
+        if protocol != expected_protocol {
+            return Err(ConversationError::BadRequest {
+                reason: format!("managed runtime backend '{backend}' requires protocol '{expected_protocol}'"),
+            });
+        }
+        validate_managed_runtime_target(&row, &backend)?;
+        if !base_url.starts_with("https://") {
+            return Err(ConversationError::BadRequest {
+                reason: "managed runtime base_url must use HTTPS".into(),
+            });
+        }
+        if self.runtime_state.is_restarting(conversation_id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+
+        // Model selectors and send boxes can both prepare the same managed
+        // runtime. Once the requested credentials are already active, the
+        // second call must be idempotent; restarting here would kill the
+        // freshly started CLI and make the following turn race the restart
+        // gate (409 runtime_restarting).
+        let already_active = self
+            .managed_runtimes
+            .lock()
+            .ok()
+            .and_then(|runtimes| runtimes.get(conversation_id).cloned())
+            .is_some_and(|runtime| {
+                managed_runtime_matches(&runtime, user_id, model, &backend, &protocol, base_url, api_key)
+            });
+        if already_active {
+            let (agent, recovered) = self
+                .ensure_runtime_agent(user_id, conversation_id, task_manager, "managed_runtime_switch")
+                .await?;
+            let config_options = agent
+                .get_config_options()
+                .await
+                .map_err(ConversationError::from)?
+                .config_options;
+            return Ok(EnsureConversationRuntimeResponse {
+                recovered,
+                config_options,
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
+        }
+
+        self.runtime_state.begin_restart(conversation_id)?;
+        let previous = match self.managed_runtimes.lock() {
+            Ok(mut runtimes) => runtimes.insert(
+                conversation_id.to_owned(),
+                ManagedConversationRuntime {
+                    user_id: user_id.to_owned(),
+                    model: model.to_owned(),
+                    backend: backend.clone(),
+                    protocol: protocol.clone(),
+                    base_url: base_url.to_owned(),
+                    api_key: api_key.to_owned(),
+                },
+            ),
+            Err(_) => {
+                // `begin_restart` claimed the gate above. Release it when the
+                // managed-runtime table is unavailable so a transient poisoned
+                // lock cannot leave this conversation permanently blocked.
+                self.runtime_state.clear_restarting(conversation_id);
+                return Err(ConversationError::internal("managed runtime state lock poisoned"));
+            }
+        };
+        let switch_result = async {
+            if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
+                self.cancel_with_cause(
+                    user_id,
+                    conversation_id,
+                    &turn_id,
+                    task_manager,
+                    TurnCancelCause::RuntimeRestart,
+                )
+                .await?;
+            }
+            if task_manager.get_task(conversation_id).is_some() {
+                task_manager
+                    .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))
+                    .await;
+                self.runtime_state.clear_turn_state_for_restart(conversation_id);
+            }
+            // A model switch starts a fresh ACP backend session. The old
+            // provider-owned resume id may belong to the previous process and
+            // must not be handed to the newly launched CLI.
+            self.clear_acp_context_anchor(user_id, conversation_id).await?;
+            let (agent, recovered) = self
+                .ensure_runtime_agent(user_id, conversation_id, task_manager, "managed_runtime_switch")
+                .await?;
+            let config_options = agent
+                .get_config_options()
+                .await
+                .map_err(ConversationError::from)?
+                .config_options;
+            Ok::<_, ConversationError>((recovered, config_options))
+        }
+        .await;
+        self.runtime_state.clear_restarting(conversation_id);
+        let (recovered, config_options) = match switch_result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Ok(mut runtimes) = self.managed_runtimes.lock() {
+                    match previous {
+                        Some(runtime) => {
+                            runtimes.insert(conversation_id.to_owned(), runtime);
+                        }
+                        None => {
+                            runtimes.remove(conversation_id);
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.persist_confirmed_model(user_id, conversation_id, model).await {
+            task_manager
+                .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))
+                .await;
+            self.runtime_state.clear_turn_state_for_restart(conversation_id);
+            if let Ok(mut runtimes) = self.managed_runtimes.lock() {
+                match previous {
+                    Some(runtime) => {
+                        runtimes.insert(conversation_id.to_owned(), runtime);
+                    }
+                    None => {
+                        runtimes.remove(conversation_id);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        Ok(EnsureConversationRuntimeResponse {
+            recovered,
+            config_options,
+            runtime: self.runtime_summary_for(conversation_id).await,
+        })
+    }
+
+    /// Remove every in-memory managed credential owned by a desktop account.
+    /// The credentials are process-local by design, so account logout and
+    /// account replacement must invalidate them before another turn can run.
+    pub async fn clear_managed_runtimes(
+        &self,
+        user_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), ConversationError> {
+        let conversation_ids = self
+            .managed_runtimes
+            .lock()
+            .map_err(|_| ConversationError::internal("managed runtime state is unavailable"))?
+            .iter()
+            .filter_map(|(conversation_id, runtime)| (runtime.user_id == user_id).then(|| conversation_id.to_owned()))
+            .collect::<Vec<_>>();
+        if let Ok(mut runtimes) = self.managed_runtimes.lock() {
+            runtimes.retain(|_, runtime| runtime.user_id != user_id);
+        }
+        for conversation_id in conversation_ids {
+            task_manager
+                .kill_and_wait(&conversation_id, Some(AgentKillReason::RuntimeRestart))
+                .await;
+            self.runtime_state.clear_turn_state_for_restart(&conversation_id);
+        }
+        Ok(())
+    }
+
     async fn ensure_runtime_agent(
         &self,
         user_id: &str,
@@ -4657,6 +4898,7 @@ impl ConversationService {
             })?;
 
         reject_deprecated_runtime_row(&row)?;
+        self.clear_stale_managed_runtime_if_needed(&row, task_manager).await;
 
         if let Some(agent) = task_manager.get_task(conversation_id) {
             debug!(conversation_id, phase, "Conversation runtime already active");
@@ -4701,6 +4943,36 @@ impl ConversationService {
 
         info!(conversation_id, phase, "Conversation runtime recovered");
         Ok((agent, true))
+    }
+
+    /// A conversation can be changed through legacy/API paths without going
+    /// through the managed-model selector. Never let credentials captured for
+    /// the previous managed target leak into the replacement provider.
+    async fn clear_stale_managed_runtime_if_needed(
+        &self,
+        row: &ConversationRow,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) {
+        let stale = self
+            .managed_runtimes
+            .lock()
+            .ok()
+            .and_then(|runtimes| runtimes.get(&row.id).cloned())
+            .is_some_and(|runtime| validate_managed_runtime_target(row, &runtime.backend).is_err());
+        if !stale {
+            return;
+        }
+
+        if let Ok(mut runtimes) = self.managed_runtimes.lock() {
+            runtimes.remove(&row.id);
+        }
+        if task_manager.get_task(&row.id).is_some() {
+            task_manager
+                .kill_and_wait(&row.id, Some(AgentKillReason::RuntimeRestart))
+                .await;
+            self.runtime_state.clear_turn_state_for_restart(&row.id);
+        }
+        warn!(conversation_id = %row.id, "Cleared stale managed runtime after conversation target changed");
     }
 }
 
@@ -4853,6 +5125,81 @@ impl ConversationService {
             self.runtime_base_url.as_deref(),
             runtime_token.as_deref(),
         );
+        self.apply_managed_runtime_context(build_opts, conversation_id);
+    }
+
+    fn apply_managed_runtime_context(&self, build_opts: &mut BuildTaskOptions, conversation_id: &str) {
+        use aionui_ai_agent::types::{
+            SAYDONE_MANAGED_AGENT_ENV, SAYDONE_MANAGED_API_KEY_ENV, SAYDONE_MANAGED_BACKEND_ENV,
+            SAYDONE_MANAGED_BASE_URL_ENV, SAYDONE_MANAGED_MODEL_ENV, SAYDONE_MANAGED_PROTOCOL_ENV,
+        };
+        let Some(runtime) = self
+            .managed_runtimes
+            .lock()
+            .ok()
+            .and_then(|runtimes| runtimes.get(conversation_id).cloned())
+        else {
+            return;
+        };
+        let managed_keys = [
+            SAYDONE_MANAGED_AGENT_ENV,
+            SAYDONE_MANAGED_API_KEY_ENV,
+            SAYDONE_MANAGED_BACKEND_ENV,
+            SAYDONE_MANAGED_BASE_URL_ENV,
+            SAYDONE_MANAGED_MODEL_ENV,
+            SAYDONE_MANAGED_PROTOCOL_ENV,
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "OPENAI_MODEL",
+        ];
+        build_opts
+            .context
+            .runtime_env
+            .retain(|(key, _)| !managed_keys.contains(&key.as_str()));
+        match &mut build_opts.context.kind {
+            AgentSessionKind::Acp(context) => {
+                context.config.current_model_id = Some(runtime.model.clone());
+                if let Some(snapshot) = context.session_snapshot.as_mut() {
+                    snapshot.current_model_id =
+                        Some(aionui_ai_agent::shared_kernel::ModelId::new(runtime.model.clone()));
+                }
+            }
+            AgentSessionKind::Aionrs(_) => {
+                build_opts.context.model.use_model = Some(runtime.model.clone());
+            }
+            AgentSessionKind::Antigravity(_) => {}
+        }
+        let mut env = vec![
+            (SAYDONE_MANAGED_AGENT_ENV.to_owned(), "1".to_owned()),
+            (SAYDONE_MANAGED_BACKEND_ENV.to_owned(), runtime.backend.clone()),
+            (SAYDONE_MANAGED_PROTOCOL_ENV.to_owned(), runtime.protocol.clone()),
+            (SAYDONE_MANAGED_MODEL_ENV.to_owned(), runtime.model.clone()),
+            (SAYDONE_MANAGED_BASE_URL_ENV.to_owned(), runtime.base_url.clone()),
+            (SAYDONE_MANAGED_API_KEY_ENV.to_owned(), runtime.api_key.clone()),
+        ];
+        match runtime.protocol.as_str() {
+            "anthropic" => {
+                env.extend([
+                    ("ANTHROPIC_BASE_URL".to_owned(), runtime.base_url),
+                    ("ANTHROPIC_API_KEY".to_owned(), runtime.api_key.clone()),
+                    ("ANTHROPIC_AUTH_TOKEN".to_owned(), runtime.api_key),
+                    ("ANTHROPIC_MODEL".to_owned(), runtime.model),
+                ]);
+            }
+            "openai" => {
+                env.extend([
+                    ("OPENAI_BASE_URL".to_owned(), runtime.base_url),
+                    ("OPENAI_API_KEY".to_owned(), runtime.api_key),
+                    ("OPENAI_MODEL".to_owned(), runtime.model),
+                ]);
+            }
+            _ => {}
+        }
+        build_opts.context.runtime_env.extend(env);
     }
 
     fn runtime_token_for_build(
@@ -5359,6 +5706,43 @@ fn build_options_backend(options: &BuildTaskOptions) -> Option<&str> {
         AgentSessionKind::Antigravity(ctx) => ctx.config.backend.as_deref(),
         AgentSessionKind::Aionrs(_) => None,
     }
+}
+
+/// Keep the managed credential boundary limited to the three built-in
+/// SayDone agents. The HTTP route is authenticated, but its request body is
+/// still untrusted input and must not be able to attach SayDone credentials to
+/// a custom ACP agent or an arbitrary provider row.
+fn validate_managed_runtime_target(row: &ConversationRow, backend: &str) -> Result<(), ConversationError> {
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| ConversationError::BadRequest {
+        reason: format!("Invalid conversation runtime metadata: {error}"),
+    })?;
+    match backend {
+        "claude" | "codex" => {
+            let is_builtin = extra
+                .get("agent_source")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|source| source.eq_ignore_ascii_case("builtin"));
+            let configured_backend = extra.get("backend").and_then(serde_json::Value::as_str);
+            if row.r#type != "acp"
+                || !is_builtin
+                || configured_backend.is_none_or(|value| !value.eq_ignore_ascii_case(backend))
+            {
+                return Err(ConversationError::Forbidden {
+                    reason: "SayDone managed runtime is only available to the matching built-in ACP agent".into(),
+                });
+            }
+        }
+        "saydone" => {
+            let provider_id = provider_model_from_conversation_row(row).provider_id;
+            if row.r#type != "aionrs" || provider_id != "saydone-managed-openai" {
+                return Err(ConversationError::Forbidden {
+                    reason: "SayDone managed runtime is only available to the built-in SayDone CLI".into(),
+                });
+            }
+        }
+        _ => unreachable!("managed backend validated before target validation"),
+    }
+    Ok(())
 }
 
 fn context_skill_names(context: &AgentSessionContext) -> Vec<String> {
@@ -6129,6 +6513,87 @@ pub(crate) async fn apply_agent_title(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn managed_target_row(agent_type: &str, extra: &str, model: Option<&str>) -> ConversationRow {
+        ConversationRow {
+            id: "conv-1".into(),
+            user_id: "user-1".into(),
+            name: "test".into(),
+            r#type: agent_type.into(),
+            extra: extra.into(),
+            model: model.map(ToOwned::to_owned),
+            status: None,
+            source: None,
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: 0,
+            updated_at: 0,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
+        }
+    }
+
+    #[test]
+    fn managed_runtime_target_rejects_custom_acp_agents() {
+        let row = managed_target_row("acp", r#"{"backend":"claude","agent_source":"custom"}"#, None);
+
+        let error = validate_managed_runtime_target(&row, "claude").unwrap_err();
+
+        assert!(matches!(error, ConversationError::Forbidden { .. }));
+    }
+
+    #[test]
+    fn managed_runtime_target_accepts_matching_builtin_acp_agents() {
+        let row = managed_target_row("acp", r#"{"backend":"codex","agent_source":"builtin"}"#, None);
+
+        validate_managed_runtime_target(&row, "codex").unwrap();
+    }
+
+    #[test]
+    fn managed_runtime_target_requires_the_marker_provider_for_saydone_cli() {
+        let row = managed_target_row(
+            "aionrs",
+            "{}",
+            Some(r#"{"provider_id":"user-provider","model":"gpt-5"}"#),
+        );
+
+        let error = validate_managed_runtime_target(&row, "saydone").unwrap_err();
+
+        assert!(matches!(error, ConversationError::Forbidden { .. }));
+    }
+
+    #[test]
+    fn managed_runtime_match_requires_same_credentials_and_route() {
+        let runtime = ManagedConversationRuntime {
+            user_id: "user-1".into(),
+            model: "deepseek-v4-flash".into(),
+            backend: "claude".into(),
+            protocol: "anthropic".into(),
+            base_url: "https://admin.saydone.ai/proxy".into(),
+            api_key: "token-1".into(),
+        };
+
+        assert!(managed_runtime_matches(
+            &runtime,
+            "user-1",
+            "deepseek-v4-flash",
+            "claude",
+            "anthropic",
+            "https://admin.saydone.ai/proxy",
+            "token-1",
+        ));
+        assert!(!managed_runtime_matches(
+            &runtime,
+            "user-1",
+            "deepseek-v4-flash",
+            "claude",
+            "anthropic",
+            "https://admin.saydone.ai/proxy",
+            "token-2",
+        ));
+    }
 
     #[test]
     fn enum_to_db_agent_type() {

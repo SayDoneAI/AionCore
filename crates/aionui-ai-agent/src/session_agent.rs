@@ -31,7 +31,7 @@ use crate::protocol::events::{
 };
 use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::PersistedSessionState;
-use crate::types::{PromptMediaCaps, SendMessageData};
+use crate::types::{PromptMediaCaps, SAYDONE_MANAGED_AGENT_ENV, SendMessageData};
 use aionui_api_types::{AcpBuildExtra, TEAM_MCP_SERVER_NAME};
 use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
@@ -1891,15 +1891,6 @@ pub async fn build_session_instance(
     // Version-gated on the binary we actually resolved above: the flag is hidden
     // (absent from `--help`) and older builds reject it at argument-parse time, so
     // an ungated flag would make every session unspawnable. See `claude_flags`.
-    // Cost-ledger seed (claude only): claude's `total_cost_usd` is
-    // process-cumulative, so a rebuilt backend (app restart / conversation
-    // reopen) must start its ledger from the conversation's persisted
-    // cumulative cost — otherwise the "session cost" falls back to the new
-    // process's own spend. codex reports no cost; other backends ignore it.
-    if backend_label == "claude" {
-        session_config.initial_cost_usd = initial_cost_usd_from_snapshot(session_snapshot);
-    }
-
     if backend_label == "claude"
         && let Some(program) = session_config.cli_program.clone()
         && crate::claude_flags::supports_thinking_display(&program).await
@@ -1912,6 +1903,18 @@ pub async fn build_session_instance(
 
     // Spawn env (legacy spawn-surface parity, claude AND codex).
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
+    let is_saydone_managed = session_config
+        .spawn_env
+        .iter()
+        .any(|entry| entry.name == SAYDONE_MANAGED_AGENT_ENV && entry.value == "1");
+    // Cost-ledger seed (claude only): claude's `total_cost_usd` is
+    // process-cumulative, so a rebuilt backend (app restart / conversation
+    // reopen) must start its ledger from the conversation's persisted
+    // cumulative cost — otherwise the "session cost" falls back to the new
+    // process's own spend. codex reports no cost; other backends ignore it.
+    if backend_label == "claude" {
+        session_config.initial_cost_usd = initial_cost_usd_from_snapshot(session_snapshot);
+    }
     if !session_config.spawn_env.is_empty() {
         let keys: Vec<&str> = session_config.spawn_env.iter().map(|e| e.name.as_str()).collect();
         tracing::info!(conv_id = %conversation_id, ?keys, "session spawn env: agent overrides + runtime context");
@@ -1920,7 +1923,7 @@ pub async fn build_session_instance(
     // GAP #5 — claude cc-switch provider env: inject ANTHROPIC_BASE_URL /
     // ANTHROPIC_AUTH_TOKEN (third-party relay creds) into the spawn, mirroring the
     // legacy ACP-claude path. Empty (no cc-switch config) = byte-identical spawn.
-    if backend_label == "claude" {
+    if backend_label == "claude" && !is_saydone_managed {
         let provider_env = crate::cc_switch::read_claude_provider_env();
         if !provider_env.is_empty() {
             let keys: Vec<String> = provider_env.keys().cloned().collect();
@@ -2126,8 +2129,8 @@ fn assemble_spawn_env(
 /// captured just before `open_session`. Symmetric with the ACP path's
 /// `build_acp_final_input_dump_value`: returns `{ "input", "resolved_context" }`.
 /// `SessionConfig` has no `Serialize`, so fields are mapped by hand. Contents
-/// are RAW (dev-only, `--dump-prompts`): secrets in `spawn_env` / MCP env are
-/// not redacted, matching the existing acp dump.
+/// are redacted for process credentials. Prompt diagnostics remain development
+/// only, but SayDoneAI's in-memory runtime lease must never be written to disk.
 fn build_session_cli_config_dump_value(backend: &str, cfg: &aionui_session::SessionConfig) -> serde_json::Value {
     use aionui_session::McpTransport;
     let mcp_servers: Vec<serde_json::Value> = cfg
@@ -2160,7 +2163,14 @@ fn build_session_cli_config_dump_value(backend: &str, cfg: &aionui_session::Sess
     let spawn_env: Vec<serde_json::Value> = cfg
         .spawn_env
         .iter()
-        .map(|e| serde_json::json!({ "name": e.name, "value": e.value }))
+        .map(|e| {
+            let value = if is_runtime_secret_env_key(&e.name) {
+                "[REDACTED]"
+            } else {
+                &e.value
+            };
+            serde_json::json!({ "name": e.name, "value": value })
+        })
         .collect();
 
     serde_json::json!({
@@ -2181,6 +2191,11 @@ fn build_session_cli_config_dump_value(backend: &str, cfg: &aionui_session::Sess
             "extra_args": cfg.extra_args,
         }
     })
+}
+
+fn is_runtime_secret_env_key(name: &str) -> bool {
+    name == crate::types::SAYDONE_MANAGED_API_KEY_ENV
+        || matches!(name, "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "OPENAI_API_KEY")
 }
 
 /// Convert a neutral `SessionMcpServer` (already stdio-launch-resolved by
@@ -4685,11 +4700,11 @@ mod build_mapping_tests {
         assert_eq!(v["input"]["approval_policy"], "never");
         assert_eq!(v["input"]["cli_program"], "/opt/claude");
         assert_eq!(v["input"]["resume"], true);
-        // RAW, no redaction (dev-only), matching the acp dump behavior.
+        // Runtime credentials are redacted even in development diagnostics.
         assert_eq!(v["resolved_context"]["preset_context"], "SYSTEM PROMPT BODY");
         assert_eq!(v["resolved_context"]["skills"][0], "writer");
         assert_eq!(v["resolved_context"]["spawn_env"][0]["name"], "ANTHROPIC_AUTH_TOKEN");
-        assert_eq!(v["resolved_context"]["spawn_env"][0]["value"], "raw-token");
+        assert_eq!(v["resolved_context"]["spawn_env"][0]["value"], "[REDACTED]");
         assert_eq!(v["resolved_context"]["mcp_servers"][0]["name"], "team");
         assert_eq!(v["resolved_context"]["mcp_servers"][0]["transport"]["type"], "stdio");
     }

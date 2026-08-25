@@ -47,6 +47,33 @@ use futures_util::stream::{BoxStream, StreamExt};
 const CODEX_CONFIG_FLAG: &str = "-c";
 const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
 const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
+const SAYDONE_MANAGED_AGENT_ENV: &str = "SAYDONE_MANAGED_AGENT";
+const SAYDONE_MANAGED_BACKEND_ENV: &str = "SAYDONE_MANAGED_BACKEND";
+const SAYDONE_MANAGED_PROTOCOL_ENV: &str = "SAYDONE_MANAGED_PROTOCOL";
+const SAYDONE_MANAGED_MODEL_ENV: &str = "SAYDONE_MANAGED_MODEL";
+
+/// 仅在完整的 SayDone 托管 Codex 上保留服务端已授权的模型。
+///
+/// Codex CLI 的 `model/list` 只包含其原生目录；SayDone 通过 OpenAI
+/// 兼容运行时提供的模型不会出现在其中。四项标记和会话模型必须完全
+/// 一致，避免把普通用户的 Codex 配置误判为托管会话。
+fn saydone_managed_codex_model(config: &SessionConfig) -> Option<String> {
+    fn unique_env_value<'a>(entries: &'a [aionui_common::EnvVar], name: &str) -> Option<&'a str> {
+        let mut values = entries
+            .iter()
+            .filter(|entry| entry.name == name)
+            .map(|entry| entry.value.as_str());
+        let value = values.next()?;
+        values.all(|candidate| candidate == value).then_some(value)
+    }
+
+    let model = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_MODEL_ENV)?;
+    (unique_env_value(&config.spawn_env, SAYDONE_MANAGED_AGENT_ENV) == Some("1")
+        && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BACKEND_ENV) == Some("codex")
+        && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_PROTOCOL_ENV) == Some("openai")
+        && config.model.as_deref() == Some(model))
+    .then(|| model.to_owned())
+}
 
 /// Config overrides that make Codex command-execution children inherit the
 /// runtime environment injected into the app-server process.
@@ -155,6 +182,7 @@ impl BackendConnection for CodexConnection {
             Arc::new(SpawnedTitleIo::new(self.spawner.clone(), title_cmd)),
         ));
         title_gen.set_model(config.model.clone());
+        let managed_model = saydone_managed_codex_model(&config);
         let mut backend =
             CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms, title_gen).await;
         // Report a codex whose version differs from the release AionUi verified.
@@ -259,7 +287,12 @@ impl BackendConnection for CodexConnection {
         // (feature 012置换: permissions channel), but sequencing keeps the wire order stable.
         if matches!(spec, SessionSpec::Fresh { .. }) && (config.model.is_some() || config.mode.is_some()) {
             let backend = Arc::new(backend);
-            spawn_codex_reconcile(backend.clone(), config.model.clone(), config.mode.clone());
+            spawn_codex_reconcile(
+                backend.clone(),
+                config.model.clone(),
+                config.mode.clone(),
+                managed_model,
+            );
             return Ok(backend);
         }
 
@@ -297,10 +330,20 @@ const CODEX_RECONCILE_POLLS: u32 = 100;
 /// model MUST settle first because `SetMode` builds a `collaborationMode` around the
 /// tracked `current_model`; running them concurrently could fire `SetMode` while
 /// `current_model` is still the (possibly-invalid) optimistic seed or already cleared.
-fn spawn_codex_reconcile(backend: Arc<CodexSessionBackend>, model: Option<String>, mode: Option<String>) {
+fn spawn_codex_reconcile(
+    backend: Arc<CodexSessionBackend>,
+    model: Option<String>,
+    mode: Option<String>,
+    managed_model: Option<String>,
+) {
     tokio::spawn(async move {
         if let Some(model) = model {
-            reconcile_codex_model(&backend, model).await;
+            reconcile_codex_model(
+                &backend,
+                model.clone(),
+                managed_model.as_deref() == Some(model.as_str()),
+            )
+            .await;
         }
         if let Some(mode) = mode {
             reconcile_codex_mode(&backend, mode).await;
@@ -337,7 +380,13 @@ async fn await_codex_catalog(
 ///     model was applied only after `clear_invalid_desired_model` validated it against
 ///     the session/new catalog), adapted to codex's `model/list`-after-`thread/start`
 ///     ordering.
-async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String) {
+async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String, is_saydone_managed: bool) {
+    if is_saydone_managed {
+        // SayDone 的模型由 OPENAI_MODEL 与该模型专属租约决定；Codex 原生目录
+        // 不会包含它，不能再向 CLI 下发一次模型设置。
+        tracing::info!(model = %requested, "codex managed runtime: preserving SayDone model");
+        return;
+    }
     let catalog = await_codex_catalog(backend, |d| d.models.iter().map(|m| m.id.clone()).collect()).await;
 
     if catalog.is_empty() {
@@ -976,6 +1025,8 @@ struct CodexReaderState {
     /// terminal; runs on its OWN process (see `codex_title`), so nothing here
     /// touches `thread_binding` / `turn_in_flight` / the R8 `terminated` flag.
     title_gen: Arc<TitleGen>,
+    /// SayDone 托管 Codex 的服务端授权模型。CLI 的默认模型通知不能覆盖它。
+    managed_model: Option<String>,
 }
 
 /// Spawn a codex JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -1007,6 +1058,7 @@ fn start_codex_reader(
             state.discovered,
             state.stdin,
             state.turn_in_flight,
+            state.managed_model,
             state.title_gen,
         )
         .await;
@@ -1216,6 +1268,7 @@ impl CodexSessionBackend {
         let resume_poison = Arc::new(Mutex::new(None));
         let pending_fork = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        let managed_model = saydone_managed_codex_model(&wake.config);
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -1244,6 +1297,7 @@ impl CodexSessionBackend {
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
             title_gen: title_gen.clone(),
+            managed_model,
         };
         let reader = start_codex_reader(&reader_state, stdout, io.clone());
 
@@ -1538,6 +1592,7 @@ async fn reader_task(
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    managed_model: Option<String>,
     title_gen: Arc<TitleGen>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1815,7 +1870,7 @@ async fn reader_task(
                             }
                             continue;
                         }
-                        for ev in map_notification(m, params) {
+                        for ev in map_notification(m, params, managed_model.as_deref()) {
                             emit(&event_tx, &session_id, cur, scope_notice_to_turn(ev, cur));
                         }
                     }
@@ -2723,7 +2778,7 @@ async fn write_reverse_error(
 /// here: `item` payloads are matched on the `type` STRING (never deserialized
 /// into the closed 16-variant ThreadItem enum), so an unknown future variant is
 /// data (→ AdapterSpecific), not a panic.
-fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
+fn map_notification(method: &str, params: &Value, managed_model: Option<&str>) -> Vec<SessionEvent> {
     match method {
         "turn/started" => vec![], // optimistic; the orchestrator already lowered TurnStarted
         "item/agentMessage/delta" => {
@@ -2793,7 +2848,9 @@ fn map_notification(method: &str, params: &Value) -> Vec<SessionEvent> {
                 .get("threadSettings")
                 .or_else(|| params.get("thread_settings"))
                 .unwrap_or(&Value::Null);
-            let model = settings.get("model").and_then(Value::as_str).map(str::to_string);
+            let model = managed_model
+                .map(str::to_owned)
+                .or_else(|| settings.get("model").and_then(Value::as_str).map(str::to_string));
             let mode = settings
                 .get("activePermissionProfile")
                 .and_then(|p| p.get("id"))
@@ -7113,6 +7170,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn saydone_managed_codex_model_requires_complete_matching_context() {
+        let mut config = SessionConfig {
+            model: Some("deepseek-v4-flash".into()),
+            spawn_env: vec![
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_AGENT_ENV.into(),
+                    value: "1".into(),
+                },
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_BACKEND_ENV.into(),
+                    value: "codex".into(),
+                },
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_PROTOCOL_ENV.into(),
+                    value: "openai".into(),
+                },
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_MODEL_ENV.into(),
+                    value: "deepseek-v4-flash".into(),
+                },
+            ],
+            ..SessionConfig::default()
+        };
+        assert_eq!(
+            saydone_managed_codex_model(&config).as_deref(),
+            Some("deepseek-v4-flash")
+        );
+
+        config.model = Some("gpt-5.6-sol".into());
+        assert_eq!(saydone_managed_codex_model(&config), None);
+    }
+
+    #[test]
+    fn managed_codex_settings_notification_preserves_authorized_model() {
+        let params = serde_json::json!({
+            "threadSettings": {
+                "model": "gpt-5.6-sol",
+                "activePermissionProfile": { "id": ":workspace" }
+            }
+        });
+        let events = map_notification("thread/settings/updated", &params, Some("deepseek-v4-flash"));
+        assert!(matches!(
+            events.as_slice(),
+            [SessionEvent::ConfigChanged { model: Some(model), mode: Some(mode) }]
+                if model == "deepseek-v4-flash" && mode == "auto"
+        ));
+    }
+
     #[tokio::test]
     async fn dispatch_steer_writes_turn_steer_with_expected_turn_id() {
         // R6/B5 Steer → `turn/steer{threadId, expectedTurnId, input,
@@ -8544,7 +8650,7 @@ mod tests {
     #[tokio::test]
     async fn codex_model_reconcile_applies_valid_model() {
         let (backend, captured) = backend_with_catalog_and_binding().await;
-        reconcile_codex_model(&backend, "openai.gpt-5.4".into()).await;
+        reconcile_codex_model(&backend, "openai.gpt-5.4".into(), false).await;
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""method":"thread/settings/update""#),
@@ -8568,7 +8674,7 @@ mod tests {
         // Optimistic open-time seed (open_session sets this from config.model).
         *backend.current_model.lock().await = Some("gpt-5.5-that-local-codex-lacks".into());
         // Run the reconcile inline (awaited directly — no detached task).
-        reconcile_codex_model(&backend, "gpt-5.5-that-local-codex-lacks".into()).await;
+        reconcile_codex_model(&backend, "gpt-5.5-that-local-codex-lacks".into(), false).await;
         assert!(
             backend.current_model.lock().await.is_none(),
             "an invalid requested model must clear the optimistic current_model seed"
@@ -8577,6 +8683,25 @@ mod tests {
         assert!(
             !written.contains(r#""method":"thread/settings/update""#),
             "an invalid model must NOT be applied to codex (no thread/settings/update), got: {written}"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_codex_model_reconcile_keeps_non_catalog_model_without_cli_update() {
+        let (backend, captured) = backend_with_catalog_and_binding().await;
+        *backend.current_model.lock().await = Some("deepseek-v4-flash".into());
+
+        reconcile_codex_model(&backend, "deepseek-v4-flash".into(), true).await;
+
+        assert_eq!(
+            backend.current_model.lock().await.as_deref(),
+            Some("deepseek-v4-flash"),
+            "the SayDone-authorized model remains the session model"
+        );
+        let written = captured_str_allow_empty(&captured).await;
+        assert!(
+            !written.contains(r#""method":"thread/settings/update""#),
+            "a SayDone-only model must not be sent to Codex's native model setter, got: {written}"
         );
     }
 
@@ -9431,7 +9556,7 @@ mod tests {
                 { "step": "run tests", "status": "pending" },
             ],
         });
-        let events = map_notification("turn/plan/updated", &params);
+        let events = map_notification("turn/plan/updated", &params, None);
         match &events[..] {
             [SessionEvent::Plan { entries, explanation }] => {
                 assert_eq!(entries.len(), 3);

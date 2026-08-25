@@ -251,6 +251,19 @@ pub struct EnsureConversationRuntimeResponse {
     pub runtime: ConversationRuntimeSummary,
 }
 
+/// Runtime credentials for one SayDone-managed conversation.
+///
+/// The API accepts this only at the authenticated runtime switch boundary. The
+/// value is held in Core memory for the conversation and is never persisted.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SwitchManagedConversationRuntimeRequest {
+    pub model: String,
+    pub backend: String,
+    pub protocol: String,
+    pub base_url: String,
+    pub api_key: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationAssistantIdentityResponse {
     pub id: String,

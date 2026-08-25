@@ -25,7 +25,14 @@ use crate::factory::context::FactoryContext;
 use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
-use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
+use crate::types::{
+    AionrsCompatOverrides, AionrsResolvedConfig, SAYDONE_MANAGED_API_KEY_ENV, SAYDONE_MANAGED_BACKEND_ENV,
+    SAYDONE_MANAGED_BASE_URL_ENV, SAYDONE_MANAGED_MODEL_ENV, SAYDONE_MANAGED_PROTOCOL_ENV,
+};
+
+const SAYDONE_IMAGE_MCP_SERVER_NAME: &str = "saydone-image-generation";
+const SAYDONE_IMAGE_WORKSPACE_ENV: &str = "SAYDONE_IMAGE_WORKSPACE";
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AionrsSessionBuildContext,
@@ -71,6 +78,7 @@ pub(super) async fn build(
         deps.broadcaster.clone(),
     )
     .await;
+    inject_saydone_image_workspace(&mut extra_mcp_servers, &ctx.workspace);
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -89,27 +97,48 @@ pub(super) async fn build(
         .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
         .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
 
-    let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)
+    let stored_api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)
         .map_err(|e| AgentError::internal(e.to_string()))?;
 
-    let model_id = model
+    let requested_model_id = model
         .use_model
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(&model.model)
         .to_owned();
 
+    let managed = managed_runtime_from_env(&ctx.runtime_env);
+    let managed_for_model = managed
+        .as_ref()
+        .filter(|runtime| runtime.backend == "saydone" && runtime.protocol == "openai")
+        .filter(|runtime| runtime.model == requested_model_id);
+    if provider_id == "saydone-managed-openai" && managed_for_model.is_none() {
+        return Err(AgentError::unauthorized(
+            "SayDoneAI managed runtime credentials are required for this conversation",
+        ));
+    }
+    let api_key = managed_for_model
+        .map(|runtime| runtime.api_key.clone())
+        .unwrap_or(stored_api_key);
+    let model_id = managed_for_model
+        .map(|runtime| runtime.model.clone())
+        .unwrap_or(requested_model_id);
+
     let provider = map_aionrs_provider(&row.platform, &model_id, row.model_protocols.as_deref())?;
     let model_overrides = resolve_model_compat_overrides(&model_id, &row.model_settings)?;
 
-    let (base_url, mut compat_overrides) = resolve_aionrs_url_and_compat_with_mode(
-        &row.platform,
-        &row.base_url,
-        &provider,
-        &model_id,
-        row.is_full_url,
-        model_overrides.openai_api_mode,
-    );
+    let (base_url, mut compat_overrides) = if let Some(runtime) = managed_for_model {
+        (Some(runtime.base_url.clone()), AionrsCompatOverrides::default())
+    } else {
+        resolve_aionrs_url_and_compat_with_mode(
+            &row.platform,
+            &row.base_url,
+            &provider,
+            &model_id,
+            row.is_full_url,
+            model_overrides.openai_api_mode,
+        )
+    };
     compat_overrides.image_input = model_overrides.image_input;
 
     if provider == "openai" {
@@ -194,6 +223,32 @@ pub(super) async fn build(
 
     let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
+}
+
+#[derive(Debug, Clone)]
+struct ManagedRuntimeEnv {
+    backend: String,
+    protocol: String,
+    model: String,
+    base_url: String,
+    api_key: String,
+}
+
+fn managed_runtime_from_env(env: &[(String, String)]) -> Option<ManagedRuntimeEnv> {
+    let values = env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<HashMap<_, _>>();
+    if values.get(SAYDONE_MANAGED_BACKEND_ENV).copied() != Some("saydone") {
+        return None;
+    }
+    Some(ManagedRuntimeEnv {
+        backend: (*values.get(SAYDONE_MANAGED_BACKEND_ENV)?).to_owned(),
+        protocol: (*values.get(SAYDONE_MANAGED_PROTOCOL_ENV)?).to_owned(),
+        model: (*values.get(SAYDONE_MANAGED_MODEL_ENV)?).to_owned(),
+        base_url: (*values.get(SAYDONE_MANAGED_BASE_URL_ENV)?).to_owned(),
+        api_key: (*values.get(SAYDONE_MANAGED_API_KEY_ENV)?).to_owned(),
+    })
 }
 
 /// Resolve the session an aionrs build starts from.
@@ -776,6 +831,19 @@ async fn merge_session_snapshot_mcp_servers(
     }
 }
 
+fn inject_saydone_image_workspace(servers: &mut HashMap<String, McpServerConfig>, workspace: &str) {
+    let Some(server) = servers.get_mut(SAYDONE_IMAGE_MCP_SERVER_NAME) else {
+        return;
+    };
+    if server.transport != TransportType::Stdio {
+        return;
+    }
+    server
+        .env
+        .get_or_insert_with(HashMap::new)
+        .insert(SAYDONE_IMAGE_WORKSPACE_ENV.to_owned(), workspace.to_owned());
+}
+
 async fn ensure_stdio_launch(
     command: &str,
     args: &[String],
@@ -1043,6 +1111,59 @@ mod tests {
 
     fn test_broadcaster() -> Arc<dyn EventBroadcaster> {
         Arc::new(BroadcastEventBus::new(16))
+    }
+
+    #[test]
+    fn injects_workspace_only_into_the_builtin_image_stdio_server() {
+        let mut servers = HashMap::from([
+            (
+                SAYDONE_IMAGE_MCP_SERVER_NAME.to_owned(),
+                McpServerConfig {
+                    transport: TransportType::Stdio,
+                    command: Some("node".into()),
+                    args: Some(vec!["builtin-mcp-image-gen.js".into()]),
+                    env: None,
+                    url: None,
+                    headers: None,
+                    deferred: Some(false),
+                    startup_timeout_ms: None,
+                },
+            ),
+            (
+                "other".to_owned(),
+                McpServerConfig {
+                    transport: TransportType::Stdio,
+                    command: Some("node".into()),
+                    args: None,
+                    env: Some(HashMap::from([("EXISTING".into(), "value".into())])),
+                    url: None,
+                    headers: None,
+                    deferred: Some(false),
+                    startup_timeout_ms: None,
+                },
+            ),
+        ]);
+
+        inject_saydone_image_workspace(&mut servers, "/workspace/conversation");
+
+        assert_eq!(
+            servers[SAYDONE_IMAGE_MCP_SERVER_NAME]
+                .env
+                .as_ref()
+                .and_then(|env| env.get(SAYDONE_IMAGE_WORKSPACE_ENV)),
+            Some(&"/workspace/conversation".to_owned())
+        );
+        assert_eq!(
+            servers["other"]
+                .env
+                .as_ref()
+                .and_then(|env| env.get(SAYDONE_IMAGE_WORKSPACE_ENV)),
+            None
+        );
+        assert_eq!(
+            servers["other"].env.as_ref().and_then(|env| env.get("EXISTING")),
+            Some(&"value".to_owned())
+        );
     }
 
     #[tokio::test]

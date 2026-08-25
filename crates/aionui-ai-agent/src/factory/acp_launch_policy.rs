@@ -1,6 +1,7 @@
 use crate::cc_switch;
 use crate::manager::acp::mode_normalize::normalize_requested_mode;
 use crate::shared_kernel::PersistedSessionState;
+use crate::types::SAYDONE_MANAGED_AGENT_ENV;
 use aionui_api_types::{AcpBuildExtra, AgentMetadata};
 use aionui_common::CommandSpec;
 
@@ -34,6 +35,14 @@ fn append_runtime_env(command_spec: &mut CommandSpec, runtime_env: &[(String, St
 
 fn append_claude_provider_env(command_spec: &mut CommandSpec, metadata: &AgentMetadata) {
     if metadata.backend.as_deref() != Some("claude") {
+        return;
+    }
+
+    let is_saydone_managed = command_spec
+        .env
+        .iter()
+        .any(|entry| entry.name == SAYDONE_MANAGED_AGENT_ENV && entry.value == "1");
+    if is_saydone_managed {
         return;
     }
 
