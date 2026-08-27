@@ -7348,6 +7348,7 @@ mod tests {
         let model = &catalog["models"][0];
         assert_eq!(model["slug"], "deepseek-v4-flash");
         assert_eq!(model["support_verbosity"], false);
+        assert_eq!(model["truncation_policy"], json!({ "mode": "bytes", "limit": 10000 }));
         assert_eq!(model["supported_in_api"], true);
     }
 
