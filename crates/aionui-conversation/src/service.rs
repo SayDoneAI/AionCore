@@ -4868,8 +4868,8 @@ impl ConversationService {
             .lock()
             .map_err(|_| ConversationError::internal("managed runtime state is unavailable"))?
             .iter()
-            .filter(|&(conversation_id, runtime)| (runtime.user_id == user_id))
-            .map(|(conversation_id, runtime)| conversation_id.to_owned())
+            .filter(|&(_conversation_id, runtime)| runtime.user_id == user_id)
+            .map(|(conversation_id, _runtime)| conversation_id.to_owned())
             .collect::<Vec<_>>();
         if let Ok(mut runtimes) = self.managed_runtimes.lock() {
             runtimes.retain(|_, runtime| runtime.user_id != user_id);
