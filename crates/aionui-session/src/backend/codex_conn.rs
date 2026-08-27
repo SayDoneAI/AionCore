@@ -90,20 +90,58 @@ fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManage
     })
 }
 
+fn saydone_managed_reasoning_levels(model: &str) -> (&'static str, &'static [(&'static str, &'static str)]) {
+    const LOW_TO_HIGH: &[(&str, &str)] = &[
+        ("low", "Fast responses with lighter reasoning."),
+        ("medium", "Balances speed and reasoning depth for everyday tasks."),
+        ("high", "Greater reasoning depth for complex problems."),
+    ];
+    const LOW_TO_XHIGH: &[(&str, &str)] = &[
+        ("low", "Fast responses with lighter reasoning."),
+        ("medium", "Balances speed and reasoning depth for everyday tasks."),
+        ("high", "Greater reasoning depth for complex problems."),
+        ("xhigh", "Extra high reasoning depth for complex problems."),
+    ];
+    const LOW_TO_MAX: &[(&str, &str)] = &[
+        ("low", "Fast responses with lighter reasoning."),
+        ("medium", "Balances speed and reasoning depth for everyday tasks."),
+        ("high", "Greater reasoning depth for complex problems."),
+        ("xhigh", "Extra high reasoning depth for complex problems."),
+        ("max", "Maximum reasoning depth for the hardest problems."),
+    ];
+    const LOW_TO_ULTRA: &[(&str, &str)] = &[
+        ("low", "Fast responses with lighter reasoning."),
+        ("medium", "Balances speed and reasoning depth for everyday tasks."),
+        ("high", "Greater reasoning depth for complex problems."),
+        ("xhigh", "Extra high reasoning depth for complex problems."),
+        ("max", "Maximum reasoning depth for the hardest problems."),
+        ("ultra", "Maximum reasoning with automatic task delegation."),
+    ];
+
+    match model {
+        "gpt-5.6-sol" => ("low", LOW_TO_ULTRA),
+        "gpt-5.6-terra" => ("medium", LOW_TO_ULTRA),
+        "gpt-5.6-luna" => ("medium", LOW_TO_MAX),
+        "gpt-5.5" | "gpt-5.4" => ("medium", LOW_TO_XHIGH),
+        _ => ("medium", LOW_TO_HIGH),
+    }
+}
+
 fn write_saydone_managed_model_catalog(
     runtime: &SaydoneManagedCodexRuntime,
 ) -> Result<tempfile::TempPath, BackendError> {
+    let (default_reasoning_level, supported_reasoning_levels) = saydone_managed_reasoning_levels(&runtime.model);
     let catalog = json!({
         "models": [{
             "slug": runtime.model,
             "display_name": runtime.model,
             "description": "SayDone managed model.",
-            "default_reasoning_level": "medium",
-            "supported_reasoning_levels": [
-                { "effort": "low", "description": "Low reasoning effort." },
-                { "effort": "medium", "description": "Balanced reasoning effort." },
-                { "effort": "high", "description": "High reasoning effort." }
-            ],
+            "base_instructions": "You are a coding agent. Follow the user's instructions and work in the current workspace.",
+            "default_reasoning_level": default_reasoning_level,
+            "supported_reasoning_levels": supported_reasoning_levels.iter().map(|(effort, description)| json!({
+                "effort": effort,
+                "description": description,
+            })).collect::<Vec<_>>(),
             "shell_type": "shell_command",
             "visibility": "list",
             "supported_in_api": true,
@@ -112,6 +150,8 @@ fn write_saydone_managed_model_catalog(
             // user-selectable verbosity parameter.
             "support_verbosity": false,
             "truncation_policy": { "mode": "bytes", "limit": 10000 },
+            "supports_parallel_tool_calls": true,
+            "experimental_supported_tools": [],
             "priority": 1
         }]
     });
@@ -7349,7 +7389,43 @@ mod tests {
         assert_eq!(model["slug"], "deepseek-v4-flash");
         assert_eq!(model["support_verbosity"], false);
         assert_eq!(model["truncation_policy"], json!({ "mode": "bytes", "limit": 10000 }));
+        assert_eq!(model["supports_parallel_tool_calls"], true);
+        assert_eq!(model["experimental_supported_tools"], json!([]));
+        assert!(
+            model["base_instructions"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
         assert_eq!(model["supported_in_api"], true);
+    }
+
+    #[test]
+    fn managed_codex_reasoning_levels_match_each_model_capability() {
+        let cases = [
+            (
+                "gpt-5.6-sol",
+                "low",
+                &["low", "medium", "high", "xhigh", "max", "ultra"][..],
+            ),
+            (
+                "gpt-5.6-terra",
+                "medium",
+                &["low", "medium", "high", "xhigh", "max", "ultra"][..],
+            ),
+            ("gpt-5.6-luna", "medium", &["low", "medium", "high", "xhigh", "max"][..]),
+            ("gpt-5.5", "medium", &["low", "medium", "high", "xhigh"][..]),
+            ("deepseek-v4-flash", "medium", &["low", "medium", "high"][..]),
+        ];
+
+        for (model, default_level, expected_levels) in cases {
+            let (actual_default, actual_levels) = saydone_managed_reasoning_levels(model);
+            assert_eq!(actual_default, default_level, "default for {model}");
+            assert_eq!(
+                actual_levels.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
+                expected_levels,
+                "levels for {model}"
+            );
+        }
     }
 
     #[test]
