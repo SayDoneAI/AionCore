@@ -111,6 +111,7 @@ fn write_saydone_managed_model_catalog(
             // model catalog. SayDone's managed endpoint does not expose a
             // user-selectable verbosity parameter.
             "support_verbosity": false,
+            "truncation_policy": { "mode": "bytes", "limit": 10000 },
             "priority": 1
         }]
     });
