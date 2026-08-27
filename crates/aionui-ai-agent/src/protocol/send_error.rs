@@ -656,6 +656,17 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
 }
 
 fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
+    if lower.contains("credit package points are insufficient") {
+        return Some(ClassifiedError {
+            message: "The SayDone account does not have enough points",
+            code: AgentErrorCode::SaydoneAccountPointsInsufficient,
+            ownership: AgentErrorOwnership::Aionui,
+            retryable: false,
+            feedback_recommended: false,
+            resolution_kind: Some(AgentErrorResolutionKind::OpenAccountCenter),
+            resolution_target: Some(AgentErrorResolutionTarget::AccountCenter),
+        });
+    }
     if contains_sso_expired_auth_signature(lower) {
         return Some(provider_error(
             "The model provider rejected the request",
@@ -1810,6 +1821,16 @@ mod tests {
 
     #[test]
     fn classifies_provider_billing_auth_and_rate_limit() {
+        assert_classification(
+            "unexpected status 402 Payment Required: Credit package points are insufficient",
+            AgentErrorCode::SaydoneAccountPointsInsufficient,
+            AgentErrorOwnership::Aionui,
+            AgentErrorResolutionKind::OpenAccountCenter,
+        );
+        assert_resolution_target(
+            "unexpected status 402 Payment Required: Credit package points are insufficient",
+            AgentErrorResolutionTarget::AccountCenter,
+        );
         assert_classification(
             "Aionrs agent error: Provider error: API error 402: {\"error\":{\"message\":\"Insufficient Balance\"}}",
             AgentErrorCode::UserLlmProviderBillingRequired,

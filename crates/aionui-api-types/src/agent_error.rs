@@ -17,6 +17,7 @@ pub enum AgentErrorCode {
     AionuiStateInconsistent,
     AionuiPermissionError,
     AionuiInternalError,
+    SaydoneAccountPointsInsufficient,
     #[serde(alias = "WORKSPACE_PATH_CONTAINS_WHITESPACE_RUNTIME_UNSUPPORTED")]
     WorkspacePathRuntimeUnavailable,
     UserAgentHandshakeFailed,
@@ -71,6 +72,7 @@ pub enum AgentErrorResolutionKind {
     CheckLocalCommand,
     CheckProviderCredentials,
     CheckProviderBilling,
+    OpenAccountCenter,
     CheckProviderBaseUrl,
     ChangeModel,
     ReduceContext,
@@ -84,6 +86,7 @@ pub enum AgentErrorResolutionTarget {
     AgentSettings,
     NewConversation,
     Feedback,
+    AccountCenter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +208,28 @@ mod tests {
         assert_eq!(json["code"], "AIONUI_CONVERSATION_BUSY");
         assert_eq!(json["resolution"]["kind"], "wait_for_current_response");
         assert_eq!(json["resolution"]["target"], "new_conversation");
+    }
+
+    #[test]
+    fn saydone_points_error_serializes_account_center_recovery() {
+        let payload = AgentStreamErrorData::classified(
+            "The SayDone account does not have enough points",
+            AgentErrorCode::SaydoneAccountPointsInsufficient,
+            AgentErrorOwnership::Aionui,
+            Some("Credit package points are insufficient".into()),
+            false,
+            false,
+            Some(AgentErrorResolution::new(
+                AgentErrorResolutionKind::OpenAccountCenter,
+                Some(AgentErrorResolutionTarget::AccountCenter),
+            )),
+        );
+
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json["code"], "SAYDONE_ACCOUNT_POINTS_INSUFFICIENT");
+        assert_eq!(json["ownership"], "aionui");
+        assert_eq!(json["resolution"]["kind"], "open_account_center");
+        assert_eq!(json["resolution"]["target"], "account_center");
     }
 
     #[test]

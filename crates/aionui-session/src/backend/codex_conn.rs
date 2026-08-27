@@ -23,6 +23,7 @@
 //! independently contract-tested via the `build_with_io` seam.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,13 +52,21 @@ const SAYDONE_MANAGED_AGENT_ENV: &str = "SAYDONE_MANAGED_AGENT";
 const SAYDONE_MANAGED_BACKEND_ENV: &str = "SAYDONE_MANAGED_BACKEND";
 const SAYDONE_MANAGED_PROTOCOL_ENV: &str = "SAYDONE_MANAGED_PROTOCOL";
 const SAYDONE_MANAGED_MODEL_ENV: &str = "SAYDONE_MANAGED_MODEL";
+const SAYDONE_MANAGED_BASE_URL_ENV: &str = "SAYDONE_MANAGED_BASE_URL";
+const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// 仅在完整的 SayDone 托管 Codex 上保留服务端已授权的模型。
 ///
 /// Codex CLI 的 `model/list` 只包含其原生目录；SayDone 通过 OpenAI
 /// 兼容运行时提供的模型不会出现在其中。四项标记和会话模型必须完全
 /// 一致，避免把普通用户的 Codex 配置误判为托管会话。
-fn saydone_managed_codex_model(config: &SessionConfig) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaydoneManagedCodexRuntime {
+    model: String,
+    base_url: String,
+}
+
+fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManagedCodexRuntime> {
     fn unique_env_value<'a>(entries: &'a [aionui_common::EnvVar], name: &str) -> Option<&'a str> {
         let mut values = entries
             .iter()
@@ -68,11 +77,46 @@ fn saydone_managed_codex_model(config: &SessionConfig) -> Option<String> {
     }
 
     let model = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_MODEL_ENV)?;
+    let base_url = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BASE_URL_ENV)?;
+    let api_key = unique_env_value(&config.spawn_env, OPENAI_API_KEY_ENV)?;
     (unique_env_value(&config.spawn_env, SAYDONE_MANAGED_AGENT_ENV) == Some("1")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BACKEND_ENV) == Some("codex")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_PROTOCOL_ENV) == Some("openai")
+        && !api_key.is_empty()
         && config.model.as_deref() == Some(model))
-    .then(|| model.to_owned())
+    .then(|| SaydoneManagedCodexRuntime {
+        model: model.to_owned(),
+        base_url: base_url.to_owned(),
+    })
+}
+
+fn write_saydone_managed_model_catalog(
+    runtime: &SaydoneManagedCodexRuntime,
+) -> Result<tempfile::TempPath, BackendError> {
+    let catalog = json!({
+        "models": [{
+            "slug": runtime.model,
+            "display_name": runtime.model,
+            "description": "SayDone managed model.",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                { "effort": "low", "description": "Low reasoning effort." },
+                { "effort": "medium", "description": "Balanced reasoning effort." },
+                { "effort": "high", "description": "High reasoning effort." }
+            ],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 1
+        }]
+    });
+    let body = serde_json::to_vec(&catalog).map_err(|error| BackendError::Transport(error.to_string()))?;
+    let mut file = tempfile::NamedTempFile::new()
+        .map_err(|error| BackendError::Transport(format!("codex managed model catalog: {error}")))?;
+    file.write_all(&body)
+        .and_then(|()| file.flush())
+        .map_err(|error| BackendError::Transport(format!("codex managed model catalog: {error}")))?;
+    Ok(file.into_temp_path())
 }
 
 /// Config overrides that make Codex command-execution children inherit the
@@ -89,9 +133,37 @@ pub fn codex_shell_environment_policy_args() -> [&'static str; 4] {
 /// Build the process-level app-server argv shared by initial open and idle
 /// wake. `codex app-server --help` documents the config override and uses
 /// `shell_environment_policy.inherit=all` as its example.
-fn codex_app_server_args(extra_args: &[String]) -> Vec<String> {
+fn codex_app_server_args(config: &SessionConfig, model_catalog_path: Option<&std::path::Path>) -> Vec<String> {
     let mut args = vec!["app-server".to_owned()];
-    args.extend(extra_args.iter().cloned());
+    args.extend(config.extra_args.iter().cloned());
+    if let Some(runtime) = saydone_managed_codex_runtime(config) {
+        // Managed sessions must never depend on Codex's persisted account auth
+        // or a model left by an earlier conversation. The lease is injected in
+        // this process only via OPENAI_API_KEY and is paired with this model.
+        for (key, value) in [
+            ("model_provider", "custom"),
+            ("model", runtime.model.as_str()),
+            ("model_providers.custom.name", "saydone-managed"),
+            ("model_providers.custom.wire_api", "responses"),
+            ("model_providers.custom.env_key", OPENAI_API_KEY_ENV),
+            ("model_providers.custom.base_url", runtime.base_url.as_str()),
+        ] {
+            args.push(CODEX_CONFIG_FLAG.to_owned());
+            args.push(format!(
+                "{key}={}",
+                serde_json::to_string(value).expect("string serializes")
+            ));
+        }
+        args.push(CODEX_CONFIG_FLAG.to_owned());
+        args.push("model_providers.custom.requires_openai_auth=false".to_owned());
+        if let Some(path) = model_catalog_path {
+            args.push(CODEX_CONFIG_FLAG.to_owned());
+            args.push(format!(
+                "model_catalog_json={}",
+                serde_json::to_string(&path.to_string_lossy()).expect("catalog path serializes")
+            ));
+        }
+    }
     // Append the compatibility policy after user/configured extras, matching
     // the former ACP launch policy and making these final overrides authoritative.
     args.extend(codex_shell_environment_policy_args().map(str::to_owned));
@@ -145,7 +217,12 @@ impl BackendConnection for CodexConnection {
             SessionSpec::Resume { session_id, .. } => session_id.clone(),
             SessionSpec::Fork { session_id, .. } => session_id.clone(),
         };
-        let args = codex_app_server_args(&config.extra_args);
+        let managed_runtime = saydone_managed_codex_runtime(&config);
+        let model_catalog = managed_runtime
+            .as_ref()
+            .map(write_saydone_managed_model_catalog)
+            .transpose()?;
+        let args = codex_app_server_args(&config, model_catalog.as_deref());
         log_codex_runtime_policy(&config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Orchestration-resolved bundled CLI (packaged app) or bare "codex"
@@ -172,6 +249,7 @@ impl BackendConnection for CodexConnection {
         let wake = CodexWakeRecipe {
             spawner: Some(self.spawner.clone()),
             config: config.clone(),
+            model_catalog,
         };
         // First-turn title latch: armed only for a Fresh open (a brand-new
         // conversation). Its runs go to a THROWAWAY process built from the same
@@ -182,7 +260,6 @@ impl BackendConnection for CodexConnection {
             Arc::new(SpawnedTitleIo::new(self.spawner.clone(), title_cmd)),
         ));
         title_gen.set_model(config.model.clone());
-        let managed_model = saydone_managed_codex_model(&config);
         let mut backend =
             CodexSessionBackend::spawn_with_wake(logical_id, io, wake, config.idle_ttl_ms, title_gen).await;
         // Report a codex whose version differs from the release AionUi verified.
@@ -285,18 +362,25 @@ impl BackendConnection for CodexConnection {
         // config → nothing to reconcile). The two are SEQUENCED (model first) only to keep
         // the two writes deterministic — SetMode no longer depends on current_model
         // (feature 012置换: permissions channel), but sequencing keeps the wire order stable.
+        let is_managed_runtime = managed_runtime.is_some();
+        let backend = Arc::new(backend);
+        if let Some(runtime) = managed_runtime {
+            // A resumed Codex thread retains its previous model. Unlike the
+            // native catalog, SayDone's authorized models are not returned by
+            // model/list, so apply the server-authorized model directly before
+            // the first turn instead of dropping it during catalog validation.
+            backend.dispatch(Command::SetModel { model: runtime.model }).await?;
+        }
         if matches!(spec, SessionSpec::Fresh { .. }) && (config.model.is_some() || config.mode.is_some()) {
-            let backend = Arc::new(backend);
             spawn_codex_reconcile(
                 backend.clone(),
-                config.model.clone(),
+                (!is_managed_runtime).then(|| config.model.clone()).flatten(),
                 config.mode.clone(),
-                managed_model,
             );
             return Ok(backend);
         }
 
-        Ok(Arc::new(backend))
+        Ok(backend)
     }
 
     async fn close_session(&self, _session_id: &str) -> Result<(), BackendError> {
@@ -330,20 +414,10 @@ const CODEX_RECONCILE_POLLS: u32 = 100;
 /// model MUST settle first because `SetMode` builds a `collaborationMode` around the
 /// tracked `current_model`; running them concurrently could fire `SetMode` while
 /// `current_model` is still the (possibly-invalid) optimistic seed or already cleared.
-fn spawn_codex_reconcile(
-    backend: Arc<CodexSessionBackend>,
-    model: Option<String>,
-    mode: Option<String>,
-    managed_model: Option<String>,
-) {
+fn spawn_codex_reconcile(backend: Arc<CodexSessionBackend>, model: Option<String>, mode: Option<String>) {
     tokio::spawn(async move {
         if let Some(model) = model {
-            reconcile_codex_model(
-                &backend,
-                model.clone(),
-                managed_model.as_deref() == Some(model.as_str()),
-            )
-            .await;
+            reconcile_codex_model(&backend, model).await;
         }
         if let Some(mode) = mode {
             reconcile_codex_mode(&backend, mode).await;
@@ -380,13 +454,7 @@ async fn await_codex_catalog(
 ///     model was applied only after `clear_invalid_desired_model` validated it against
 ///     the session/new catalog), adapted to codex's `model/list`-after-`thread/start`
 ///     ordering.
-async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String, is_saydone_managed: bool) {
-    if is_saydone_managed {
-        // SayDone 的模型由 OPENAI_MODEL 与该模型专属租约决定；Codex 原生目录
-        // 不会包含它，不能再向 CLI 下发一次模型设置。
-        tracing::info!(model = %requested, "codex managed runtime: preserving SayDone model");
-        return;
-    }
+async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String) {
     let catalog = await_codex_catalog(backend, |d| d.models.iter().map(|m| m.id.clone()).collect()).await;
 
     if catalog.is_empty() {
@@ -982,6 +1050,7 @@ struct Discovered {
 struct CodexWakeRecipe {
     spawner: Option<Arc<dyn Spawner>>,
     config: SessionConfig,
+    model_catalog: Option<tempfile::TempPath>,
 }
 
 impl CodexWakeRecipe {
@@ -992,6 +1061,7 @@ impl CodexWakeRecipe {
         Self {
             spawner: None,
             config: SessionConfig::default(),
+            model_catalog: None,
         }
     }
 }
@@ -1154,6 +1224,7 @@ impl CodexSessionBackend {
         let wake = CodexWakeRecipe {
             spawner: Some(spawner),
             config: SessionConfig::default(),
+            model_catalog: None,
         };
         Self::spawn_with_wake(
             session_id.into(),
@@ -1268,7 +1339,7 @@ impl CodexSessionBackend {
         let resume_poison = Arc::new(Mutex::new(None));
         let pending_fork = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
-        let managed_model = saydone_managed_codex_model(&wake.config);
+        let managed_model = saydone_managed_codex_runtime(&wake.config).map(|runtime| runtime.model);
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -1521,7 +1592,7 @@ impl CodexSessionBackend {
             .spawner
             .as_ref()
             .ok_or_else(|| BackendError::Transport("codex wake: no spawner (suspension not enabled)".into()))?;
-        let args = codex_app_server_args(&self.wake.config.extra_args);
+        let args = codex_app_server_args(&self.wake.config, self.wake.model_catalog.as_deref());
         log_codex_runtime_policy(&self.wake.config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Same bundled-CLI resolution + spawn env as the initial spawn
@@ -7171,7 +7242,7 @@ mod tests {
     }
 
     #[test]
-    fn saydone_managed_codex_model_requires_complete_matching_context() {
+    fn saydone_managed_codex_runtime_requires_complete_matching_context() {
         let mut config = SessionConfig {
             model: Some("deepseek-v4-flash".into()),
             spawn_env: vec![
@@ -7191,16 +7262,73 @@ mod tests {
                     name: SAYDONE_MANAGED_MODEL_ENV.into(),
                     value: "deepseek-v4-flash".into(),
                 },
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_BASE_URL_ENV.into(),
+                    value: "https://admin.saydone.ai/openai/v1".into(),
+                },
+                aionui_common::EnvVar {
+                    name: OPENAI_API_KEY_ENV.into(),
+                    value: "lease-token".into(),
+                },
             ],
             ..SessionConfig::default()
         };
         assert_eq!(
-            saydone_managed_codex_model(&config).as_deref(),
-            Some("deepseek-v4-flash")
+            saydone_managed_codex_runtime(&config),
+            Some(SaydoneManagedCodexRuntime {
+                model: "deepseek-v4-flash".into(),
+                base_url: "https://admin.saydone.ai/openai/v1".into(),
+            })
         );
 
         config.model = Some("gpt-5.6-sol".into());
-        assert_eq!(saydone_managed_codex_model(&config), None);
+        assert_eq!(saydone_managed_codex_runtime(&config), None);
+    }
+
+    #[test]
+    fn managed_codex_app_server_args_use_only_the_injected_runtime_lease() {
+        let config = SessionConfig {
+            model: Some("deepseek-v4-flash".into()),
+            spawn_env: vec![
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_AGENT_ENV.into(),
+                    value: "1".into(),
+                },
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_BACKEND_ENV.into(),
+                    value: "codex".into(),
+                },
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_PROTOCOL_ENV.into(),
+                    value: "openai".into(),
+                },
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_MODEL_ENV.into(),
+                    value: "deepseek-v4-flash".into(),
+                },
+                aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_BASE_URL_ENV.into(),
+                    value: "https://admin.saydone.ai/openai/v1".into(),
+                },
+                aionui_common::EnvVar {
+                    name: OPENAI_API_KEY_ENV.into(),
+                    value: "lease-token".into(),
+                },
+            ],
+            ..SessionConfig::default()
+        };
+
+        let catalog = write_saydone_managed_model_catalog(
+            &saydone_managed_codex_runtime(&config).expect("managed config has runtime"),
+        )
+        .expect("catalog writes");
+        let args = codex_app_server_args(&config, Some(catalog.as_ref()));
+
+        assert!(args.contains(&"model=\"deepseek-v4-flash\"".into()));
+        assert!(args.contains(&"model_providers.custom.env_key=\"OPENAI_API_KEY\"".into()));
+        assert!(args.contains(&"model_providers.custom.requires_openai_auth=false".into()));
+        assert!(args.contains(&"model_providers.custom.base_url=\"https://admin.saydone.ai/openai/v1\"".into()));
+        assert!(args.iter().any(|arg| arg.starts_with("model_catalog_json=")));
     }
 
     #[test]
@@ -8650,7 +8778,7 @@ mod tests {
     #[tokio::test]
     async fn codex_model_reconcile_applies_valid_model() {
         let (backend, captured) = backend_with_catalog_and_binding().await;
-        reconcile_codex_model(&backend, "openai.gpt-5.4".into(), false).await;
+        reconcile_codex_model(&backend, "openai.gpt-5.4".into()).await;
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""method":"thread/settings/update""#),
@@ -8674,7 +8802,7 @@ mod tests {
         // Optimistic open-time seed (open_session sets this from config.model).
         *backend.current_model.lock().await = Some("gpt-5.5-that-local-codex-lacks".into());
         // Run the reconcile inline (awaited directly — no detached task).
-        reconcile_codex_model(&backend, "gpt-5.5-that-local-codex-lacks".into(), false).await;
+        reconcile_codex_model(&backend, "gpt-5.5-that-local-codex-lacks".into()).await;
         assert!(
             backend.current_model.lock().await.is_none(),
             "an invalid requested model must clear the optimistic current_model seed"
@@ -8687,21 +8815,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_codex_model_reconcile_keeps_non_catalog_model_without_cli_update() {
+    async fn managed_codex_model_is_sent_to_the_cli_before_the_first_turn() {
         let (backend, captured) = backend_with_catalog_and_binding().await;
-        *backend.current_model.lock().await = Some("deepseek-v4-flash".into());
-
-        reconcile_codex_model(&backend, "deepseek-v4-flash".into(), true).await;
-
-        assert_eq!(
-            backend.current_model.lock().await.as_deref(),
-            Some("deepseek-v4-flash"),
-            "the SayDone-authorized model remains the session model"
-        );
-        let written = captured_str_allow_empty(&captured).await;
+        backend
+            .dispatch(Command::SetModel {
+                model: "deepseek-v4-flash".into(),
+            })
+            .await
+            .unwrap();
+        let written = captured_str(&captured).await;
         assert!(
-            !written.contains(r#""method":"thread/settings/update""#),
-            "a SayDone-only model must not be sent to Codex's native model setter, got: {written}"
+            written.contains(r#""method":"thread/settings/update""#)
+                && written.contains(r#""model":"deepseek-v4-flash""#),
+            "the SayDone-authorized model must be applied before the turn, got: {written}"
         );
     }
 

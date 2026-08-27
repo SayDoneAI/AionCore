@@ -20,6 +20,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
+tempfile.workspace = true
 # claude's `--session-id`/`--resume` require a bare valid UUID; the seam mints
 # one when the logical id is not a UUID (claude_conn::claude_session_id_for).
 uuid = { workspace = true, features = ["v4"] }

@@ -22,6 +22,24 @@ static DB_MIGRATOR: Migrator = sqlx::migrate!();
 // Historical special-case for the MCP schema reconciliation fallback.
 // Keep this pinned to migration version 7 even as newer migrations land.
 const MCP_SCHEMA_RECONCILIATION_MIGRATION_VERSION: i64 = 7;
+const INITIAL_SCHEMA_MIGRATION_VERSION: i64 = 1;
+const LEGACY_NORMALIZE_SCHEMA_MIGRATION_VERSION: i64 = 2;
+// Checksum emitted by the legacy consolidated 001 migration used by existing
+// SayDoneAI installations. This is the checksum found in the affected
+// Windows database; it must stay explicit so unknown tampering still fails.
+const LEGACY_INITIAL_SCHEMA_CHECKSUM: &[u8] = &[
+    0xe1, 0x8a, 0x43, 0x94, 0x62, 0x74, 0x89, 0xc0, 0x83, 0x77, 0x81, 0x38, 0xa6, 0x95, 0xaa, 0xf9, 0x4d, 0xf3, 0xa8,
+    0x75, 0x4f, 0x34, 0xca, 0x0a, 0xab, 0x07, 0x9b, 0x4e, 0xc9, 0x27, 0x79, 0xdd, 0x70, 0xa8, 0x1f, 0xcf, 0x67, 0x47,
+    0x2c, 0x53, 0xe1, 0x8f, 0xc8, 0xbe, 0xc2, 0x51, 0x2c, 0x54,
+];
+// Checksum from the same legacy migration set for the next historical
+// migration. This also lets startup recover if an earlier build already
+// aligned migration 001 before being replaced by this broader repair.
+const LEGACY_NORMALIZE_SCHEMA_CHECKSUM: &[u8] = &[
+    0x52, 0x0e, 0x39, 0x8d, 0x27, 0xbc, 0xcd, 0xdd, 0x27, 0xbc, 0x98, 0xb2, 0xe9, 0x0b, 0x1f, 0xbf, 0x90, 0x34, 0x75,
+    0x7a, 0x41, 0xb1, 0x28, 0x93, 0xac, 0xf5, 0x1e, 0xc4, 0x00, 0xfd, 0xef, 0xaa, 0xd8, 0x8e, 0x76, 0x9a, 0x08, 0xd1,
+    0x15, 0xf8, 0x35, 0x8f, 0xdf, 0xc3, 0x31, 0xa0, 0xc4, 0x44,
+];
 const RECOVERABLE_DATABASE_CORRUPTION_STAGE: &str = "database.recoverable_corruption";
 /// Stage reported when the database was created by a NEWER app version than
 /// this binary: `_sqlx_migrations` contains a version the embedded migrator
@@ -361,6 +379,24 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
                 )))
             }
         }
+        Err(sqlx::migrate::MigrateError::VersionMismatch(version))
+            if matches!(
+                version,
+                INITIAL_SCHEMA_MIGRATION_VERSION | LEGACY_NORMALIZE_SCHEMA_MIGRATION_VERSION
+            ) =>
+        {
+            if align_legacy_initial_schema_checksum(&mut *conn).await? {
+                warn!(
+                    "Aligned checksum for legacy initial schema migration {}; retrying",
+                    INITIAL_SCHEMA_MIGRATION_VERSION
+                );
+                DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
+            } else {
+                Err(DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(
+                    version,
+                )))
+            }
+        }
         Err(e) => Err(DbError::Migration(e)),
     }
 }
@@ -373,6 +409,87 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
 fn is_migrations_table_unique_conflict(err: &sqlx::migrate::MigrateError) -> bool {
     let msg = err.to_string();
     msg.contains("UNIQUE constraint failed: _sqlx_migrations.version")
+}
+
+/// Accept the known legacy checksum for migration 001 only when the database
+/// already has the consolidated baseline schema. Older releases rewrote the
+/// contents of several historical migration files, so align every already
+/// applied migration row in one locked pass before SQLx retries normally.
+async fn align_legacy_initial_schema_checksum(conn: &mut sqlx::SqliteConnection) -> Result<bool, DbError> {
+    let checksum: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ? AND success = 1")
+            .bind(INITIAL_SCHEMA_MIGRATION_VERSION)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+    let legacy_partial_repair = if checksum.as_deref() == Some(LEGACY_INITIAL_SCHEMA_CHECKSUM) {
+        true
+    } else if let Some(migration) = DB_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == INITIAL_SCHEMA_MIGRATION_VERSION)
+    {
+        let next_checksum: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ? AND success = 1")
+                .bind(LEGACY_NORMALIZE_SCHEMA_MIGRATION_VERSION)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(DbError::Query)?;
+        checksum.as_deref() == Some(&*migration.checksum)
+            && next_checksum.as_deref() == Some(LEGACY_NORMALIZE_SCHEMA_CHECKSUM)
+    } else {
+        false
+    };
+    if !legacy_partial_repair {
+        return Ok(false);
+    }
+
+    const REQUIRED_TABLES: &[&str] = &[
+        "users",
+        "system_settings",
+        "client_preferences",
+        "providers",
+        "conversations",
+        "messages",
+        "projects",
+        "assistants",
+    ];
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(REQUIRED_TABLES[0])
+    .bind(REQUIRED_TABLES[1])
+    .bind(REQUIRED_TABLES[2])
+    .bind(REQUIRED_TABLES[3])
+    .bind(REQUIRED_TABLES[4])
+    .bind(REQUIRED_TABLES[5])
+    .bind(REQUIRED_TABLES[6])
+    .bind(REQUIRED_TABLES[7])
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(DbError::Query)?;
+    if table_count != REQUIRED_TABLES.len() as i64 {
+        return Ok(false);
+    }
+
+    let applied_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = 1 ORDER BY version")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+    let mut updated_rows = 0;
+    for version in applied_versions {
+        let Some(migration) = DB_MIGRATOR.iter().find(|m| m.version == version) else {
+            continue;
+        };
+        let updated = sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ? AND success = 1")
+            .bind(&*migration.checksum)
+            .bind(version)
+            .execute(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+        updated_rows += updated.rows_affected();
+    }
+    Ok(updated_rows > 0)
 }
 
 /// RAII guard that holds an exclusive file lock for the lifetime of the
