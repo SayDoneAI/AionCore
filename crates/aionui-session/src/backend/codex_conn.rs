@@ -107,6 +107,10 @@ fn write_saydone_managed_model_catalog(
             "shell_type": "shell_command",
             "visibility": "list",
             "supported_in_api": true,
+            // Codex 0.147.0 requires this capability flag when parsing a
+            // model catalog. SayDone's managed endpoint does not expose a
+            // user-selectable verbosity parameter.
+            "support_verbosity": false,
             "priority": 1
         }]
     });
@@ -7329,6 +7333,21 @@ mod tests {
         assert!(args.contains(&"model_providers.custom.requires_openai_auth=false".into()));
         assert!(args.contains(&"model_providers.custom.base_url=\"https://admin.saydone.ai/openai/v1\"".into()));
         assert!(args.iter().any(|arg| arg.starts_with("model_catalog_json=")));
+    }
+
+    #[test]
+    fn managed_codex_model_catalog_declares_verbosity_capability() {
+        let runtime = SaydoneManagedCodexRuntime {
+            model: "deepseek-v4-flash".into(),
+            base_url: "https://admin.saydone.ai/openai/v1".into(),
+        };
+        let path = write_saydone_managed_model_catalog(&runtime).expect("catalog writes");
+        let body = std::fs::read_to_string(&*path).expect("catalog reads");
+        let catalog: Value = serde_json::from_str(&body).expect("catalog is valid JSON");
+        let model = &catalog["models"][0];
+        assert_eq!(model["slug"], "deepseek-v4-flash");
+        assert_eq!(model["support_verbosity"], false);
+        assert_eq!(model["supported_in_api"], true);
     }
 
     #[test]
