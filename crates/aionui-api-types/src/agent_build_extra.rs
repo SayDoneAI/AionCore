@@ -119,6 +119,8 @@ pub struct AionrsBuildExtra {
     #[serde(default)]
     pub session_mode: Option<String>,
     #[serde(default)]
+    pub thought_level: Option<String>,
+    #[serde(default)]
     pub team_mcp_stdio_config: Option<TeamMcpStdioConfig>,
     #[serde(default)]
     pub mcp_server_ids: Option<Vec<String>>,

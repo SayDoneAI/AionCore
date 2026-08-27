@@ -659,6 +659,7 @@ mod aionrs_config_option_tests {
             compat_overrides: Default::default(),
             session_directory: std::env::temp_dir().join("aionrs-agent-task-test-sessions"),
             session_mode: None,
+            thought_level: None,
             skills: Vec::new(),
             extra_mcp_servers: std::collections::HashMap::new(),
             bedrock_config: None,
@@ -737,6 +738,44 @@ mod aionrs_config_option_tests {
             matches!(&error, AgentError::BadRequest(message) if message == "Config option 'thought_level' is not available"),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn aionrs_exposes_and_updates_reasoning_effort_for_openai() {
+        let mut config = make_test_config();
+        config.provider = "openai".into();
+        config.model = "gpt-5.6".into();
+        config.thought_level = Some("high".into());
+        let manager = AionrsAgentManager::new("conv-aionrs-effort".into(), "/project".into(), config, None)
+            .await
+            .expect("aionrs openai manager should start in tests");
+        let instance = AgentInstance::Aionrs(Arc::new(manager));
+
+        let initial = instance.get_config_options().await.unwrap();
+        let effort = initial
+            .config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("thought_level"))
+            .expect("openai aionrs should expose a thought-level option");
+        assert_eq!(effort.current_value.as_deref(), Some("high"));
+        assert_eq!(
+            effort
+                .options
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"]
+        );
+
+        let response = instance.set_config_option("reasoning_effort", "low").await.unwrap();
+        assert_eq!(response.confirmation, ConfigOptionConfirmation::Observed);
+        let updated = response
+            .config_options
+            .unwrap()
+            .into_iter()
+            .find(|option| option.id == "reasoning_effort")
+            .expect("response should include thought level");
+        assert_eq!(updated.current_value.as_deref(), Some("low"));
     }
 }
 

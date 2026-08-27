@@ -182,6 +182,7 @@ pub(super) async fn build(
         compat_overrides,
         session_directory,
         session_mode: overrides.session_mode,
+        thought_level: overrides.thought_level,
         skills: resolved_skills,
         extra_mcp_servers,
         bedrock_config,
@@ -728,8 +729,9 @@ async fn session_server_to_mcp_server_config(
                 return Err("stdio: missing command".to_owned());
             }
             let entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let launch_command = normalize_builtin_image_mcp_command(&server.name, command);
             let (command, args, env) =
-                ensure_stdio_launch(command, args, &entries, user_id, conversation_id, broadcaster).await?;
+                ensure_stdio_launch(launch_command, args, &entries, user_id, conversation_id, broadcaster).await?;
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
                 command: Some(command),
@@ -787,6 +789,24 @@ async fn session_server_to_mcp_server_config(
             })
         }
     }
+}
+
+/// Normalize stale SayDone image MCP session snapshots that were created when
+/// Electron itself was used as the JavaScript runtime. User-configured MCP
+/// commands are deliberately not changed.
+fn normalize_builtin_image_mcp_command<'a>(server_name: &str, command: &'a str) -> &'a str {
+    if server_name == SAYDONE_IMAGE_MCP_SERVER_NAME && is_legacy_electron_command(command) {
+        "node"
+    } else {
+        command
+    }
+}
+
+fn is_legacy_electron_command(command: &str) -> bool {
+    let normalized = command.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/node_modules/electron/")
+        || normalized.ends_with("/electron.app/contents/macos/electron")
+        || normalized.ends_with("/electron.exe")
 }
 
 async fn merge_session_snapshot_mcp_servers(
@@ -1163,6 +1183,20 @@ mod tests {
         assert_eq!(
             servers["other"].env.as_ref().and_then(|env| env.get("EXISTING")),
             Some(&"value".to_owned())
+        );
+    }
+
+    #[test]
+    fn normalizes_only_the_legacy_builtin_image_electron_command() {
+        let electron = "/app/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron";
+        assert_eq!(
+            normalize_builtin_image_mcp_command(SAYDONE_IMAGE_MCP_SERVER_NAME, electron),
+            "node"
+        );
+        assert_eq!(normalize_builtin_image_mcp_command("custom-image", electron), electron);
+        assert_eq!(
+            normalize_builtin_image_mcp_command(SAYDONE_IMAGE_MCP_SERVER_NAME, "/usr/local/bin/node"),
+            "/usr/local/bin/node"
         );
     }
 

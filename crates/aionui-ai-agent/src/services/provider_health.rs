@@ -100,6 +100,7 @@ impl ProviderHealthCheckService {
             compat_overrides,
             session_directory: self.data_dir.join("aionrs-health-check-sessions"),
             session_mode: None,
+            thought_level: None,
             skills: Vec::new(),
             extra_mcp_servers: HashMap::new(),
             bedrock_config,

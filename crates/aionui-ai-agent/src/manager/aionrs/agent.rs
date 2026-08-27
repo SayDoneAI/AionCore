@@ -106,6 +106,8 @@ fn build_aionrs_final_input_dump_value(
 pub struct AionrsAgentManager {
     runtime: AgentRuntime,
     engine: Mutex<AgentEngine>,
+    reasoning_effort: RwLock<Option<String>>,
+    reasoning_effort_levels: Vec<String>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
     slash_commands: Vec<SlashCommandItem>,
@@ -236,6 +238,14 @@ impl AionrsAgentManager {
             .map_err(|e| AgentError::internal(format!("Agent bootstrap failed: {e}")))?;
 
         let mut engine = result.engine;
+        let reasoning_effort_levels = if engine.compat().supports_effort() {
+            engine.compat().effort_levels().to_vec()
+        } else {
+            Vec::new()
+        };
+        let reasoning_effort =
+            initial_reasoning_effort(config_extra.thought_level.as_deref(), &reasoning_effort_levels);
+        engine.set_initial_reasoning_effort(reasoning_effort.clone());
         if !is_resume && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id)) {
             error!(
                 conversation_id = %conversation_id,
@@ -277,6 +287,8 @@ impl AionrsAgentManager {
         Ok(Self {
             runtime,
             engine: Mutex::new(engine),
+            reasoning_effort: RwLock::new(reasoning_effort),
+            reasoning_effort_levels,
             slash_commands,
             mcp_managers: result.mcp_managers,
             approval_manager,
@@ -586,27 +598,49 @@ impl AionrsAgentManager {
     }
 
     pub async fn config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
-        Ok(GetConfigOptionsResponse {
-            config_options: vec![aionrs_mode_config_option(self.approval_manager.current_mode())],
-        })
+        let mut config_options = vec![aionrs_mode_config_option(self.approval_manager.current_mode())];
+        if self.reasoning_effort_levels.len() > 1 {
+            let current_value = self.reasoning_effort.read().ok().and_then(|value| value.clone());
+            config_options.push(aionrs_thought_level_config_option(
+                current_value,
+                &self.reasoning_effort_levels,
+            ));
+        }
+        Ok(GetConfigOptionsResponse { config_options })
     }
 
     pub async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
         let option_id = option_id.trim();
         let value = value.trim();
 
-        if option_id != AIONRS_MODE_OPTION_ID {
-            return Err(AgentError::bad_request(format!(
-                "Config option '{option_id}' is not available"
-            )));
+        match option_id {
+            AIONRS_MODE_OPTION_ID => {
+                if !is_aionrs_session_mode(value) {
+                    return Err(AgentError::bad_request(format!(
+                        "Value '{value}' is not selectable for config option '{option_id}'"
+                    )));
+                }
+                self.set_mode(value).await?;
+            }
+            AIONRS_THOUGHT_LEVEL_OPTION_ID if self.reasoning_effort_levels.len() > 1 => {
+                if !self.reasoning_effort_levels.iter().any(|level| level == value) {
+                    return Err(AgentError::bad_request(format!(
+                        "Value '{value}' is not selectable for config option '{option_id}'"
+                    )));
+                }
+                let mut engine = self.engine.lock().await;
+                engine.apply_config_update(None, None, None, None, Some(value.to_owned()), None);
+                drop(engine);
+                if let Ok(mut current) = self.reasoning_effort.write() {
+                    *current = Some(value.to_owned());
+                }
+            }
+            _ => {
+                return Err(AgentError::bad_request(format!(
+                    "Config option '{option_id}' is not available"
+                )));
+            }
         }
-        if !is_aionrs_session_mode(value) {
-            return Err(AgentError::bad_request(format!(
-                "Value '{value}' is not selectable for config option '{option_id}'"
-            )));
-        }
-
-        self.set_mode(value).await?;
         Ok(SetConfigOptionResponse {
             confirmation: ConfigOptionConfirmation::Observed,
             config_options: Some(self.config_options().await?.config_options),
@@ -619,6 +653,18 @@ impl AionrsAgentManager {
 }
 
 const AIONRS_MODE_OPTION_ID: &str = "mode";
+const AIONRS_THOUGHT_LEVEL_OPTION_ID: &str = "reasoning_effort";
+
+fn initial_reasoning_effort(requested: Option<&str>, levels: &[String]) -> Option<String> {
+    if levels.len() <= 1 {
+        return None;
+    }
+    requested
+        .filter(|value| levels.iter().any(|level| level == value))
+        .map(ToOwned::to_owned)
+        .or_else(|| levels.iter().find(|level| level.as_str() == "medium").cloned())
+        .or_else(|| levels.first().cloned())
+}
 
 fn is_aionrs_session_mode(s: &str) -> bool {
     matches!(s, "default" | "auto_edit" | "yolo")
@@ -647,6 +693,30 @@ fn aionrs_mode_select_option(value: &str, name: &str) -> AcpConfigSelectOptionDt
         name: Some(name.to_owned()),
         label: None,
         description: None,
+    }
+}
+
+fn aionrs_thought_level_config_option(current_value: Option<String>, levels: &[String]) -> AcpConfigOptionDto {
+    AcpConfigOptionDto {
+        id: AIONRS_THOUGHT_LEVEL_OPTION_ID.to_owned(),
+        name: Some("Thinking Level".to_owned()),
+        label: None,
+        description: None,
+        category: Some("thought_level".to_owned()),
+        option_type: "select".to_owned(),
+        current_value,
+        options: levels
+            .iter()
+            .map(|level| aionrs_mode_select_option(level, &title_case_option_label(level)))
+            .collect(),
+    }
+}
+
+fn title_case_option_label(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
 }
 

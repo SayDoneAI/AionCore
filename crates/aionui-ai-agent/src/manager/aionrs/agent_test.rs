@@ -36,6 +36,7 @@ fn make_test_config() -> AionrsResolvedConfig {
         compat_overrides: Default::default(),
         session_directory: env::temp_dir().join("aionrs-test-sessions"),
         session_mode: None,
+        thought_level: None,
         skills: Vec::new(),
         extra_mcp_servers: HashMap::new(),
         bedrock_config: None,

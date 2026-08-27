@@ -20,6 +20,7 @@ use aionui_session::{
 };
 use futures_util::stream::BoxStream;
 use tokio::sync::broadcast;
+use tracing::warn;
 
 use crate::agent_task::IAgentTask;
 use crate::error::AgentError;
@@ -53,6 +54,7 @@ const PERM_REJECT: &str = "reject";
 /// control_request). The three accepted incoming option ids (`effort`/`reasoning_effort`/
 /// `thought_level`) all normalize to this one storage key.
 const EFFORT_CONFIG_KEY: &str = "effort";
+const SAYDONE_IMAGE_MCP_SERVER_NAME: &str = "saydone-image-generation";
 
 /// Resolve the reasoning-effort catalog to surface for the effort picker, mirroring the
 /// backend's `effort_is_supported` current-model precedence: the efforts of the resolved
@@ -1834,13 +1836,13 @@ pub async fn build_session_instance(
         None => Vec::new(),
     };
     neutral.retain(|server| server.name != TEAM_MCP_SERVER_NAME);
-    neutral.extend(
-        config
-            .session_mcp_servers
-            .iter()
-            .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
-            .cloned(),
-    );
+    for server in config
+        .session_mcp_servers
+        .iter()
+        .filter(|server| server.name != TEAM_MCP_SERVER_NAME)
+    {
+        neutral.push(normalize_builtin_image_mcp_server(server.clone()).await);
+    }
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         // Team-MCP is PREPENDED before the user's servers (clean-slate + legacy
@@ -2228,6 +2230,54 @@ fn session_server_to_spec(server: &aionui_api_types::SessionMcpServer) -> aionui
         name: server.name.clone(),
         transport,
     }
+}
+
+/// Old session snapshots may preserve Electron as the image MCP command from
+/// before the desktop migration to bundled Node. Only the app-owned image MCP
+/// is normalized; user-configured MCP commands remain untouched.
+async fn normalize_builtin_image_mcp_server(
+    mut server: aionui_api_types::SessionMcpServer,
+) -> aionui_api_types::SessionMcpServer {
+    use aionui_api_types::SessionMcpTransport;
+
+    let SessionMcpTransport::Stdio { command, args, env } = &mut server.transport else {
+        return server;
+    };
+    if server.name != SAYDONE_IMAGE_MCP_SERVER_NAME || !is_legacy_electron_command(command) {
+        return server;
+    }
+
+    match aionui_runtime::ensure_runtime_command("node").await {
+        Ok(resolved) => {
+            let mut resolved_args = resolved
+                .args_prefix
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            resolved_args.append(args);
+            *command = resolved.program.to_string_lossy().into_owned();
+            *args = resolved_args;
+            for (key, value) in resolved.env {
+                env.insert(key.to_string_lossy().into_owned(), value.to_string_lossy().into_owned());
+            }
+        }
+        Err(error) => {
+            warn!(
+                server = %server.name,
+                error = %error,
+                "image MCP legacy Electron command could not resolve bundled Node"
+            );
+            *command = "node".to_owned();
+        }
+    }
+    server
+}
+
+fn is_legacy_electron_command(command: &str) -> bool {
+    let normalized = command.replace('\\', "/").to_ascii_lowercase();
+    normalized.contains("/node_modules/electron/")
+        || normalized.ends_with("/electron.app/contents/macos/electron")
+        || normalized.ends_with("/electron.exe")
 }
 
 /// The team coordination MCP server as a neutral stdio spec. Verbatim port of
@@ -5285,6 +5335,18 @@ mod build_mapping_tests {
                 "Http+StreamableHttp → Http"
             );
         }
+    }
+
+    #[test]
+    fn identifies_only_legacy_electron_launchers() {
+        assert!(is_legacy_electron_command(
+            "/app/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron"
+        ));
+        assert!(is_legacy_electron_command(
+            r"C:\\app\\node_modules\\electron\\dist\\electron.exe"
+        ));
+        assert!(!is_legacy_electron_command("node"));
+        assert!(!is_legacy_electron_command("/usr/local/bin/custom-mcp"));
     }
 }
 
