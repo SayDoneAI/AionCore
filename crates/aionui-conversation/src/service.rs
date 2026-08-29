@@ -120,7 +120,7 @@ fn should_clear_managed_acp_anchor(
     requested_model: &str,
     persisted_anchor: Option<&str>,
 ) -> bool {
-    if !persisted_anchor.is_some_and(|anchor| !anchor.trim().is_empty()) {
+    if persisted_anchor.is_none_or(|anchor| anchor.trim().is_empty()) {
         return false;
     }
 
