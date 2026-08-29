@@ -81,6 +81,7 @@ struct ManagedConversationRuntime {
     protocol: String,
     base_url: String,
     api_key: String,
+    supports_vision: Option<bool>,
 }
 
 fn managed_runtime_matches(
@@ -91,6 +92,7 @@ fn managed_runtime_matches(
     protocol: &str,
     base_url: &str,
     api_key: &str,
+    supports_vision: Option<bool>,
 ) -> bool {
     runtime.user_id == user_id
         && runtime.model == model
@@ -98,6 +100,34 @@ fn managed_runtime_matches(
         && runtime.protocol == protocol
         && runtime.base_url == base_url
         && runtime.api_key == api_key
+        && runtime.supports_vision == supports_vision
+}
+
+fn managed_runtime_native_vision_env(backend: &str, supports_vision: Option<bool>) -> Option<(String, String)> {
+    (matches!(backend, "claude" | "codex") && supports_vision == Some(true)).then(|| {
+        (
+            aionui_ai_agent::types::SAYDONE_IMAGE_NATIVE_VISION_ENV.to_owned(),
+            "1".to_owned(),
+        )
+    })
+}
+
+/// A managed-runtime request is also used to rehydrate credentials after the
+/// desktop process restarts. Rehydration must not discard a persisted ACP
+/// backend session; only an actual model change is a context reset.
+fn should_clear_managed_acp_anchor(
+    persisted_model: Option<&str>,
+    requested_model: &str,
+    persisted_anchor: Option<&str>,
+) -> bool {
+    if !persisted_anchor.is_some_and(|anchor| !anchor.trim().is_empty()) {
+        return false;
+    }
+
+    persisted_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .is_some_and(|model| model != requested_model.trim())
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -2604,6 +2634,36 @@ impl ConversationService {
             .map_err(|error| ConversationError::internal(format!("Failed to clear ACP session anchor: {error}")))
     }
 
+    async fn restore_acp_context_anchor_on_failure(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        session_id: Option<&str>,
+    ) {
+        let Some(session_id) = session_id.filter(|session_id| !session_id.trim().is_empty()) else {
+            return;
+        };
+
+        match self
+            .acp_session_repo
+            .update_session_id_for_user(user_id, conversation_id, session_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => warn!(
+                user_id,
+                conversation_id,
+                "Failed to restore ACP session anchor after managed runtime switch failure: session row missing"
+            ),
+            Err(error) => warn!(
+                user_id,
+                conversation_id,
+                error = %error,
+                "Failed to restore ACP session anchor after managed runtime switch failure"
+            ),
+        }
+    }
+
     /// Delete a conversation (messages cascade via FK).
     ///
     /// Broadcasts `conversation.listChanged(deleted)`.
@@ -4743,7 +4803,16 @@ impl ConversationService {
             .ok()
             .and_then(|runtimes| runtimes.get(conversation_id).cloned())
             .is_some_and(|runtime| {
-                managed_runtime_matches(&runtime, user_id, model, &backend, &protocol, base_url, api_key)
+                managed_runtime_matches(
+                    &runtime,
+                    user_id,
+                    model,
+                    &backend,
+                    &protocol,
+                    base_url,
+                    api_key,
+                    request.supports_vision,
+                )
             });
         if already_active {
             let (agent, recovered) = self
@@ -4761,6 +4830,26 @@ impl ConversationService {
             });
         }
 
+        // This endpoint is called while a conversation is re-opened so the
+        // process-local managed credentials can be restored. Do not interpret
+        // that first call after an app restart as a model switch: the
+        // persisted ACP session anchor is still valid and must remain usable
+        // for Claude/Codex resume. A reset is warranted only when the
+        // requested model differs from the model confirmed in conversation
+        // state.
+        let persisted_model = self.confirmed_model_id(user_id, conversation_id).await?;
+        let persisted_anchor = self
+            .acp_session_repo
+            .get_for_user(user_id, conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to inspect ACP session anchor: {error}")))?
+            .and_then(|session| session.session_id);
+        let clear_acp_anchor =
+            should_clear_managed_acp_anchor(persisted_model.as_deref(), model, persisted_anchor.as_deref());
+        let has_persisted_anchor = persisted_anchor
+            .as_deref()
+            .is_some_and(|anchor| !anchor.trim().is_empty());
+
         self.runtime_state.begin_restart(conversation_id)?;
         let previous = match self.managed_runtimes.lock() {
             Ok(mut runtimes) => runtimes.insert(
@@ -4772,6 +4861,7 @@ impl ConversationService {
                     protocol: protocol.clone(),
                     base_url: base_url.to_owned(),
                     api_key: api_key.to_owned(),
+                    supports_vision: request.supports_vision,
                 },
             ),
             Err(_) => {
@@ -4799,10 +4889,20 @@ impl ConversationService {
                     .await;
                 self.runtime_state.clear_turn_state_for_restart(conversation_id);
             }
-            // A model switch starts a fresh ACP backend session. The old
-            // provider-owned resume id may belong to the previous process and
-            // must not be handed to the newly launched CLI.
-            self.clear_acp_context_anchor(user_id, conversation_id).await?;
+            if clear_acp_anchor {
+                // A model switch starts a fresh ACP backend session. The old
+                // provider-owned resume id may belong to the previous model
+                // and must not be handed to the newly launched CLI.
+                self.clear_acp_context_anchor(user_id, conversation_id).await?;
+            } else {
+                info!(
+                    conversation_id,
+                    requested_model = model,
+                    persisted_model = persisted_model.as_deref().unwrap_or("unknown"),
+                    has_persisted_anchor,
+                    "Preserving ACP session anchor while rehydrating managed runtime"
+                );
+            }
             let (agent, recovered) = self
                 .ensure_runtime_agent(user_id, conversation_id, task_manager, "managed_runtime_switch")
                 .await?;
@@ -4818,6 +4918,10 @@ impl ConversationService {
         let (recovered, config_options) = match switch_result {
             Ok(result) => result,
             Err(error) => {
+                if clear_acp_anchor {
+                    self.restore_acp_context_anchor_on_failure(user_id, conversation_id, persisted_anchor.as_deref())
+                        .await;
+                }
                 if let Ok(mut runtimes) = self.managed_runtimes.lock() {
                     match previous {
                         Some(runtime) => {
@@ -4836,6 +4940,10 @@ impl ConversationService {
                 .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))
                 .await;
             self.runtime_state.clear_turn_state_for_restart(conversation_id);
+            if clear_acp_anchor {
+                self.restore_acp_context_anchor_on_failure(user_id, conversation_id, persisted_anchor.as_deref())
+                    .await;
+            }
             if let Ok(mut runtimes) = self.managed_runtimes.lock() {
                 match previous {
                     Some(runtime) => {
@@ -5131,8 +5239,9 @@ impl ConversationService {
 
     fn apply_managed_runtime_context(&self, build_opts: &mut BuildTaskOptions, conversation_id: &str) {
         use aionui_ai_agent::types::{
-            SAYDONE_MANAGED_AGENT_ENV, SAYDONE_MANAGED_API_KEY_ENV, SAYDONE_MANAGED_BACKEND_ENV,
-            SAYDONE_MANAGED_BASE_URL_ENV, SAYDONE_MANAGED_MODEL_ENV, SAYDONE_MANAGED_PROTOCOL_ENV,
+            SAYDONE_IMAGE_NATIVE_VISION_ENV, SAYDONE_MANAGED_AGENT_ENV, SAYDONE_MANAGED_API_KEY_ENV,
+            SAYDONE_MANAGED_BACKEND_ENV, SAYDONE_MANAGED_BASE_URL_ENV, SAYDONE_MANAGED_MODEL_ENV,
+            SAYDONE_MANAGED_PROTOCOL_ENV,
         };
         let Some(runtime) = self
             .managed_runtimes
@@ -5149,6 +5258,7 @@ impl ConversationService {
             SAYDONE_MANAGED_BASE_URL_ENV,
             SAYDONE_MANAGED_MODEL_ENV,
             SAYDONE_MANAGED_PROTOCOL_ENV,
+            SAYDONE_IMAGE_NATIVE_VISION_ENV,
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
@@ -5182,6 +5292,9 @@ impl ConversationService {
             (SAYDONE_MANAGED_BASE_URL_ENV.to_owned(), runtime.base_url.clone()),
             (SAYDONE_MANAGED_API_KEY_ENV.to_owned(), runtime.api_key.clone()),
         ];
+        if let Some(vision_env) = managed_runtime_native_vision_env(&runtime.backend, runtime.supports_vision) {
+            env.push(vision_env);
+        }
         match runtime.protocol.as_str() {
             "anthropic" => {
                 env.extend([
@@ -6574,6 +6687,7 @@ mod tests {
             protocol: "anthropic".into(),
             base_url: "https://admin.saydone.ai/proxy".into(),
             api_key: "token-1".into(),
+            supports_vision: Some(true),
         };
 
         assert!(managed_runtime_matches(
@@ -6584,6 +6698,7 @@ mod tests {
             "anthropic",
             "https://admin.saydone.ai/proxy",
             "token-1",
+            Some(true),
         ));
         assert!(!managed_runtime_matches(
             &runtime,
@@ -6593,6 +6708,64 @@ mod tests {
             "anthropic",
             "https://admin.saydone.ai/proxy",
             "token-2",
+            Some(true),
+        ));
+    }
+
+    #[test]
+    fn managed_runtime_native_vision_env_only_exists_when_admin_declares_support() {
+        assert_eq!(
+            managed_runtime_native_vision_env("claude", Some(true)),
+            Some(("SAYDONE_IMAGE_NATIVE_VISION".into(), "1".into()))
+        );
+        assert_eq!(managed_runtime_native_vision_env("codex", Some(false)), None);
+        assert_eq!(managed_runtime_native_vision_env("claude", None), None);
+        assert_eq!(managed_runtime_native_vision_env("saydone", Some(true)), None);
+    }
+
+    #[test]
+    fn managed_runtime_rehydration_without_anchor_never_clears_context() {
+        assert!(!should_clear_managed_acp_anchor(Some("model-a"), "model-b", None));
+    }
+
+    #[test]
+    fn managed_runtime_rehydration_with_same_model_preserves_context() {
+        assert!(!should_clear_managed_acp_anchor(
+            Some(" model-a "),
+            "model-a",
+            Some("session-a")
+        ));
+    }
+
+    #[test]
+    fn managed_runtime_model_change_clears_existing_context() {
+        assert!(should_clear_managed_acp_anchor(
+            Some("model-a"),
+            "model-b",
+            Some("session-a")
+        ));
+    }
+
+    #[test]
+    fn managed_runtime_missing_persisted_model_preserves_existing_context() {
+        assert!(!should_clear_managed_acp_anchor(None, "model-a", Some("session-a")));
+    }
+
+    #[test]
+    fn managed_runtime_blank_persisted_model_preserves_existing_context() {
+        assert!(!should_clear_managed_acp_anchor(
+            Some("   "),
+            "model-a",
+            Some("session-a")
+        ));
+    }
+
+    #[test]
+    fn managed_runtime_blank_anchor_is_treated_as_missing() {
+        assert!(!should_clear_managed_acp_anchor(
+            Some("model-a"),
+            "model-b",
+            Some("   ")
         ));
     }
 

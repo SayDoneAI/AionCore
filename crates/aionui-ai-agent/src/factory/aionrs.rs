@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 use tracing::{debug, info, warn};
 
 use crate::agent_task::AgentInstance;
+use crate::capability::image_input::resolve_image_input_capability;
 use crate::error::AgentError;
 use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
@@ -32,6 +33,7 @@ use crate::types::{
 
 const SAYDONE_IMAGE_MCP_SERVER_NAME: &str = "saydone-image-generation";
 const SAYDONE_IMAGE_WORKSPACE_ENV: &str = "SAYDONE_IMAGE_WORKSPACE";
+const SAYDONE_IMAGE_NATIVE_VISION_ENV: &str = "SAYDONE_IMAGE_NATIVE_VISION";
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -78,8 +80,6 @@ pub(super) async fn build(
         deps.broadcaster.clone(),
     )
     .await;
-    inject_saydone_image_workspace(&mut extra_mcp_servers, &ctx.workspace);
-
     if !extra_mcp_servers.is_empty() {
         info!(
             conversation_id = %ctx.conversation_id,
@@ -140,6 +140,14 @@ pub(super) async fn build(
         )
     };
     compat_overrides.image_input = model_overrides.image_input;
+    let image_input_capability = compat_overrides
+        .image_input
+        .unwrap_or_else(|| resolve_image_input_capability(&provider, base_url.as_deref(), &model_id));
+    inject_saydone_image_workspace(
+        &mut extra_mcp_servers,
+        &ctx.workspace,
+        image_input_capability.supports_images(),
+    );
 
     if provider == "openai" {
         info!(
@@ -851,17 +859,24 @@ async fn merge_session_snapshot_mcp_servers(
     }
 }
 
-fn inject_saydone_image_workspace(servers: &mut HashMap<String, McpServerConfig>, workspace: &str) {
+fn inject_saydone_image_workspace(
+    servers: &mut HashMap<String, McpServerConfig>,
+    workspace: &str,
+    native_vision: bool,
+) {
     let Some(server) = servers.get_mut(SAYDONE_IMAGE_MCP_SERVER_NAME) else {
         return;
     };
     if server.transport != TransportType::Stdio {
         return;
     }
-    server
-        .env
-        .get_or_insert_with(HashMap::new)
-        .insert(SAYDONE_IMAGE_WORKSPACE_ENV.to_owned(), workspace.to_owned());
+    let env = server.env.get_or_insert_with(HashMap::new);
+    env.insert(SAYDONE_IMAGE_WORKSPACE_ENV.to_owned(), workspace.to_owned());
+    if native_vision {
+        env.insert(SAYDONE_IMAGE_NATIVE_VISION_ENV.to_owned(), "1".to_owned());
+    } else {
+        env.remove(SAYDONE_IMAGE_NATIVE_VISION_ENV);
+    }
 }
 
 async fn ensure_stdio_launch(
@@ -1164,7 +1179,7 @@ mod tests {
             ),
         ]);
 
-        inject_saydone_image_workspace(&mut servers, "/workspace/conversation");
+        inject_saydone_image_workspace(&mut servers, "/workspace/conversation", true);
 
         assert_eq!(
             servers[SAYDONE_IMAGE_MCP_SERVER_NAME]
@@ -1172,6 +1187,13 @@ mod tests {
                 .as_ref()
                 .and_then(|env| env.get(SAYDONE_IMAGE_WORKSPACE_ENV)),
             Some(&"/workspace/conversation".to_owned())
+        );
+        assert_eq!(
+            servers[SAYDONE_IMAGE_MCP_SERVER_NAME]
+                .env
+                .as_ref()
+                .and_then(|env| env.get(SAYDONE_IMAGE_NATIVE_VISION_ENV)),
+            Some(&"1".to_owned())
         );
         assert_eq!(
             servers["other"]
@@ -1183,6 +1205,36 @@ mod tests {
         assert_eq!(
             servers["other"].env.as_ref().and_then(|env| env.get("EXISTING")),
             Some(&"value".to_owned())
+        );
+    }
+
+    #[test]
+    fn removes_native_vision_flag_for_text_only_models() {
+        let mut servers = HashMap::from([(
+            SAYDONE_IMAGE_MCP_SERVER_NAME.to_owned(),
+            McpServerConfig {
+                transport: TransportType::Stdio,
+                command: Some("node".into()),
+                args: Some(vec!["builtin-mcp-image-gen.js".into()]),
+                env: Some(HashMap::from([(
+                    SAYDONE_IMAGE_NATIVE_VISION_ENV.to_owned(),
+                    "1".to_owned(),
+                )])),
+                url: None,
+                headers: None,
+                deferred: Some(false),
+                startup_timeout_ms: None,
+            },
+        )]);
+
+        inject_saydone_image_workspace(&mut servers, "/workspace/conversation", false);
+
+        assert_eq!(
+            servers[SAYDONE_IMAGE_MCP_SERVER_NAME]
+                .env
+                .as_ref()
+                .and_then(|env| env.get(SAYDONE_IMAGE_NATIVE_VISION_ENV)),
+            None
         );
     }
 

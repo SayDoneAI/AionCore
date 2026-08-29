@@ -262,6 +262,9 @@ pub struct SwitchManagedConversationRuntimeRequest {
     pub protocol: String,
     pub base_url: String,
     pub api_key: String,
+    /// Admin-declared native image input support for the selected model.
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

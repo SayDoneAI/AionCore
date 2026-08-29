@@ -4649,6 +4649,53 @@ async fn ensure_runtime_uses_existing_agent_snapshot_without_recovery() {
 }
 
 #[tokio::test]
+async fn failed_managed_runtime_switch_restores_previous_acp_session_anchor() {
+    let acp_session_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-previous"));
+    let task_manager = Arc::new(FailingBuildTaskManager::new("runtime build failed"));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_manager_dyn.clone(),
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        acp_session_repo.clone(),
+    );
+    let conversation = service
+        .create("user_1", make_create_req_with_backend("claude"))
+        .await
+        .unwrap();
+
+    let error = service
+        .switch_managed_runtime(
+            "user_1",
+            &conversation.id,
+            aionui_api_types::SwitchManagedConversationRuntimeRequest {
+                model: "claude-3-7-sonnet".to_owned(),
+                backend: "claude".to_owned(),
+                protocol: "anthropic".to_owned(),
+                base_url: "https://example.test".to_owned(),
+                api_key: "test-key".to_owned(),
+                supports_vision: None,
+            },
+            &task_manager_dyn,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ConversationError::BadGateway { .. }),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(
+        acp_session_repo.session_id.lock().unwrap().as_deref(),
+        Some("sess-previous"),
+        "a failed model switch must not destroy the previous resume anchor"
+    );
+}
+
+#[tokio::test]
 async fn restart_runtime_without_existing_task_is_rejected() {
     let task_mgr = Arc::new(MockTaskManager::new());
     let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());

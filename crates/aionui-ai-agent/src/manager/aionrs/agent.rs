@@ -406,8 +406,8 @@ impl IAgentTask for AionrsAgentManager {
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
         self.dump_aionrs_final_input(&data);
 
-        // Keep attachment paths in the provider-independent history. Images
-        // are loaded on demand by aionrs's ViewImage tool.
+        // Keep attachment paths in the provider-independent history while also
+        // adding validated image bytes as native blocks for vision-capable models.
         debug!(
             attachment_count = data.files.len(),
             "Building structured Aionrs content blocks"
