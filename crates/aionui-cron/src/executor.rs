@@ -1265,6 +1265,8 @@ fn default_temp_workspace_path(
 ) -> std::path::PathBuf {
     let label = if *agent_type == AgentType::Acp {
         "acp".to_owned()
+    } else if *agent_type == AgentType::Aionrs {
+        "saydone".to_owned()
     } else {
         agent_type.serde_name().to_owned()
     };
@@ -1328,6 +1330,21 @@ mod tests {
         let workspace = std::env::temp_dir().join(name);
         std::fs::create_dir_all(&workspace).unwrap();
         workspace.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn default_temp_workspace_path_uses_saydone_label_for_aionrs() {
+        let path = default_temp_workspace_path(
+            std::path::Path::new("/tmp/saydone-cron-test"),
+            &AgentType::Aionrs,
+            &sample_job(),
+            "conversation-1",
+        );
+
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/saydone-cron-test/conversations/saydone-temp-conversation-1")
+        );
     }
 
     fn sample_job() -> CronJob {
