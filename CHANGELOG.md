@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.73](https://github.com/SayDoneAI/AionCore/compare/v0.1.72...v0.1.73) (2026-09-03)
+
+
+### Features
+
+* **core:** sync selected upstream worktree and archive fixes ([b44de5a](https://github.com/SayDoneAI/AionCore/commit/b44de5aeb5083d00023d2f8297e0c03e465cf7ea))
+* **托管模型:** 完善Codex推理能力目录 ([8a986b3](https://github.com/SayDoneAI/AionCore/commit/8a986b3f47025357f1c1eb6bd0c9fb6c77eb3b7e))
+
+
+### Bug Fixes
+
+* **stream:** bound and coalesce live tool output previews ([235bd97](https://github.com/SayDoneAI/AionCore/commit/235bd9729c46079ebbc0a9442eb84f449dc68a57))
+* 修复托管会话路由并注入生图工作目录 ([56a8302](https://github.com/SayDoneAI/AionCore/commit/56a8302f2c5c9c5174fe6b4f74e64eea136c409b))
+* **托管模型:** 声明Codex模型详细度能力 ([a44fd23](https://github.com/SayDoneAI/AionCore/commit/a44fd23e287cb26ec46f37756977715a856e648c))
+* **托管模型:** 限制Codex模型截断策略 ([be21cfd](https://github.com/SayDoneAI/AionCore/commit/be21cfd1d03d131b91e43a075c665cb4fd37575c))
+* **托管运行时:** 持久化会话思考强度与内置 Node ([b8db7b0](https://github.com/SayDoneAI/AionCore/commit/b8db7b0074e99e99f3b126974d337162d856c941))
+* 按模型能力处理图片视觉输入 ([3fd4a24](https://github.com/SayDoneAI/AionCore/commit/3fd4a2437cf0e62783d54c0674783348fc65a443))
+* 统一 SayDone 临时工作区标识 ([c1db1b8](https://github.com/SayDoneAI/AionCore/commit/c1db1b8f21a02989617f5ffa751cacf6c0c11e63))
+* **运行时:** 修复托管会话与历史数据库迁移兼容性 ([5445441](https://github.com/SayDoneAI/AionCore/commit/54454411e265874f85b9752db1c8e1f4f71cf01b))
+
 ## [0.1.72](https://github.com/SayDoneAI/AionCore/compare/v0.1.71...v0.1.72) (2026-08-22)
 
 
