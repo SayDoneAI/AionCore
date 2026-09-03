@@ -431,6 +431,7 @@ impl SidebarService {
         for team in &teams {
             match self.sidebar.set_team_archived(user_id, &team.id, Some(now)).await {
                 Ok(true) => {
+                    self.stop_team_best_effort(user_id, &team.id).await;
                     if let Err(err) = self.unpin_item(user_id, OrderItemType::Team, &team.id).await {
                         tracing::warn!(team_id = %team.id, error = %err, "archive_project: team unpin failed")
                     }
@@ -447,6 +448,7 @@ impl SidebarService {
                 .await
             {
                 Ok(true) => {
+                    self.stop_conversation_best_effort(user_id, &conv.id).await;
                     if let Err(err) = self.unpin_item(user_id, OrderItemType::Conversation, &conv.id).await {
                         tracing::warn!(conversation_id = %conv.id, error = %err, "archive_project: conversation unpin failed")
                     }

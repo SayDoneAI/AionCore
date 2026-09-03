@@ -1604,6 +1604,30 @@ async fn archive_project_archives_the_visible_construct_and_unpins() {
     assert_eq!(team_ids(&proj.items), vec!["T1"], "team under archived project");
 }
 
+/// Project archive must drive the same runtime teardown as direct archive
+/// operations. Team teardown owns its members, so only independent
+/// conversations are stopped by the sidebar.
+#[tokio::test]
+async fn archive_project_tears_down_each_archived_runtime() {
+    let fx = fixture().await;
+    seed_project_construct(&fx).await;
+    let teardown = FakeTeardownPorts::new(&[]);
+    fx.service.set_archive_teardown_ports(teardown.clone());
+
+    fx.service.archive_project(USER, "proj-std").await.unwrap();
+
+    assert_eq!(
+        *teardown.stopped_teams.lock().unwrap(),
+        vec!["T1"],
+        "team archive triggers one team teardown"
+    );
+    assert_eq!(
+        *teardown.stopped_convs.lock().unwrap(),
+        vec!["c1", "c3"],
+        "only independent project conversations are torn down"
+    );
+}
+
 /// A different user's standard project, and a temp project, are both `ScopeGone`
 /// for `archive_project` — nothing is touched.
 #[tokio::test]
