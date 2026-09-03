@@ -84,6 +84,7 @@ struct ManagedConversationRuntime {
     supports_vision: Option<bool>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn managed_runtime_matches(
     runtime: &ManagedConversationRuntime,
     user_id: &str,
