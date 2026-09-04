@@ -2856,6 +2856,76 @@ mod tests {
         }
     }
 
+    /// pi-acp advertises `thought_level` in `session/new` and maps the standard
+    /// ACP `session/set_config_option` request to its native `set_thinking_level`
+    /// RPC. Keep the AionCore side pinned to that standard wire contract.
+    #[tokio::test]
+    async fn pi_thought_level_is_advertised_and_uses_standard_config_option_wire() {
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = AcpSessionBackend::build_with_io("s", Box::new(fake)).await;
+        let turn_gen = Arc::new(AtomicU64::new(1));
+        let event_tx = broadcast::channel::<SessionEnvelope>(16).0;
+        let acp_session_id = Arc::new(Mutex::new(None::<String>));
+        let pending_resume_sid = Arc::new(Mutex::new(None::<String>));
+        let discovered = backend.discovered.clone();
+
+        handle_open_response(
+            &json!({
+                "sessionId": "pi-sid",
+                "configOptions": [{
+                    "id": "thought_level",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "medium",
+                    "options": [
+                        {"value": "off", "name": "Off"},
+                        {"value": "low", "name": "Low"},
+                        {"value": "medium", "name": "Medium"},
+                        {"value": "high", "name": "High"}
+                    ]
+                }]
+            }),
+            "s",
+            &turn_gen,
+            &event_tx,
+            &acp_session_id,
+            &pending_resume_sid,
+            &discovered,
+        )
+        .await;
+
+        assert_eq!(
+            discovered.lock().unwrap().config_options,
+            vec!["thought_level"],
+            "Pi's thought_level option must gate generic config dispatch"
+        );
+
+        backend.bind_for_test("pi-sid").await;
+        backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "thought_level".into(),
+                value: "high".into(),
+            })
+            .await
+            .expect("advertised Pi thought_level should dispatch");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let raw = String::from_utf8(captured.lock().await.clone()).unwrap();
+        let frame = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|frame| frame["method"] == "session/set_config_option")
+            .expect("Pi config change must use the ACP config-option method");
+        assert_eq!(frame["params"]["sessionId"], "pi-sid");
+        assert_eq!(frame["params"]["optionId"], "thought_level");
+        assert_eq!(frame["params"]["value"], "high");
+        assert!(
+            raw.lines().all(|line| !line.contains("set_thinking_level")),
+            "native Pi RPC stays behind pi-acp; AionCore emits ACP only"
+        );
+    }
+
     #[tokio::test]
     async fn set_config_option_writes_frame_only_for_advertised_generic_option() {
         let fake = FakeAgentIo::never_exits(Vec::new());
