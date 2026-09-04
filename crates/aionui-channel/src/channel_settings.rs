@@ -14,7 +14,8 @@ use tracing::debug;
 use crate::error::ChannelError;
 use crate::types::PluginType;
 
-const DEFAULT_AGENT_TYPE: &str = "aionrs";
+const DEFAULT_AGENT_TYPE: &str = "acp";
+const DEFAULT_AGENT_BACKEND: &str = "pi";
 
 /// Per-plugin agent/model configuration read from `client_preferences`.
 ///
@@ -99,7 +100,8 @@ impl ChannelSettingsService {
     /// - **New:** `{"agent_type":"acp","backend":"claude","name":"Claude"}`
     /// - **Legacy:** `{"backend":"claude","name":"Claude"}` (no agent_type field)
     ///
-    /// Falls back to `agent_type=aionrs, backend=None` when no config exists.
+    /// Falls back to the bundled Pi runtime (`agent_type=acp, backend=pi`)
+    /// when no channel config exists.
     pub async fn get_agent_config(
         &self,
         user_id: &str,
@@ -432,19 +434,19 @@ impl ChannelSettingsService {
         let overlays = overlay_repo.list_for_user(user_id).await?;
 
         for definition in definitions.iter().filter(|definition| definition.source == "generated") {
-            if self.effective_assistant_backend(user_id, definition, &overlays).await? == DEFAULT_AGENT_TYPE {
+            if self.effective_assistant_backend(user_id, definition, &overlays).await? == DEFAULT_AGENT_BACKEND {
                 return Ok(Some(definition.assistant_id.clone()));
             }
         }
 
-        let mut any_aionrs = None;
+        let mut any_pi = None;
         for definition in &definitions {
-            if self.effective_assistant_backend(user_id, definition, &overlays).await? == DEFAULT_AGENT_TYPE {
-                any_aionrs = Some(definition);
+            if self.effective_assistant_backend(user_id, definition, &overlays).await? == DEFAULT_AGENT_BACKEND {
+                any_pi = Some(definition);
                 break;
             }
         }
-        if let Some(definition) = any_aionrs {
+        if let Some(definition) = any_pi {
             return Ok(Some(definition.assistant_id.clone()));
         }
 
@@ -487,7 +489,7 @@ fn model_key(platform: PluginType) -> String {
 fn default_agent_config() -> ResolvedAgentConfig {
     ResolvedAgentConfig {
         agent_type: DEFAULT_AGENT_TYPE.to_owned(),
-        backend: None,
+        backend: Some(DEFAULT_AGENT_BACKEND.to_owned()),
     }
 }
 
@@ -923,13 +925,13 @@ mod tests {
     // ── get_agent_config ──────────────────────────────────────────────
 
     #[tokio::test]
-    async fn agent_config_returns_default_when_no_pref() {
+    async fn agent_config_returns_bundled_pi_when_no_pref() {
         let repo = Arc::new(MockPrefRepo::new());
         let svc = ChannelSettingsService::new(repo);
 
         let config = svc.get_agent_config(TEST_USER_ID, PluginType::Telegram).await.unwrap();
-        assert_eq!(config.agent_type, "aionrs");
-        assert!(config.backend.is_none());
+        assert_eq!(config.agent_type, "acp");
+        assert_eq!(config.backend.as_deref(), Some("pi"));
     }
 
     #[tokio::test]
@@ -1175,12 +1177,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_assistant_setting_defaults_to_generated_aionrs_assistant() {
+    async fn get_assistant_setting_defaults_to_generated_pi_assistant() {
         let repo = Arc::new(MockPrefRepo::new());
         let definition_repo = Arc::new(MockAssistantDefinitionRepo {
             rows: vec![
                 make_definition("bare-claude", "claude"),
-                make_definition("bare-aionrs", "aionrs"),
+                make_definition("bare-pi", "pi"),
             ],
         });
         let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
@@ -1192,7 +1194,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(setting.assistant_id.as_deref(), Some("bare-aionrs"));
+        assert_eq!(setting.assistant_id.as_deref(), Some("bare-pi"));
         assert!(setting.custom_agent_id.is_none());
         assert!(setting.backend.is_none());
         assert!(setting.agent_type.is_none());
@@ -1267,12 +1269,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_platform_settings_defaults_to_generated_aionrs_assistant() {
+    async fn get_platform_settings_defaults_to_generated_pi_assistant() {
         let repo = Arc::new(MockPrefRepo::new());
         let definition_repo = Arc::new(MockAssistantDefinitionRepo {
             rows: vec![
                 make_definition("bare-claude", "claude"),
-                make_definition("bare-aionrs", "aionrs"),
+                make_definition("bare-pi", "pi"),
             ],
         });
         let overlay_repo = Arc::new(MockAssistantOverlayRepo { rows: vec![] });
@@ -1284,7 +1286,7 @@ mod tests {
             .unwrap();
         let assistant = settings.assistant.expect("assistant settings");
 
-        assert_eq!(assistant.assistant_id.as_deref(), Some("bare-aionrs"));
+        assert_eq!(assistant.assistant_id.as_deref(), Some("bare-pi"));
         assert!(assistant.custom_agent_id.is_none());
         assert!(assistant.backend.is_none());
         assert!(assistant.agent_type.is_none());

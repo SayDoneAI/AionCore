@@ -1027,8 +1027,8 @@ mod tests {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
                 assert!(text.contains("New session"));
-                // With no client_preferences configured, defaults to "aionrs"
-                assert!(text.contains("aionrs"));
+                // With no client_preferences configured, channels use bundled Pi.
+                assert!(text.contains("acp"));
             }
             _ => panic!("Expected Action result"),
         }
