@@ -1260,11 +1260,15 @@ fn schedule_description_text(schedule: &crate::types::CronSchedule) -> String {
 fn default_temp_workspace_path(
     data_dir: &std::path::Path,
     agent_type: &AgentType,
-    _job: &CronJob,
+    job: &CronJob,
     conversation_id: &str,
 ) -> std::path::PathBuf {
     let label = if *agent_type == AgentType::Acp {
-        "acp".to_owned()
+        if job.agent_type.trim().eq_ignore_ascii_case("pi") {
+            "saydone".to_owned()
+        } else {
+            "acp".to_owned()
+        }
     } else if *agent_type == AgentType::Aionrs {
         "saydone".to_owned()
     } else {
@@ -1338,6 +1342,24 @@ mod tests {
             std::path::Path::new("/tmp/saydone-cron-test"),
             &AgentType::Aionrs,
             &sample_job(),
+            "conversation-1",
+        );
+
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/saydone-cron-test/conversations/saydone-temp-conversation-1")
+        );
+    }
+
+    #[test]
+    fn default_temp_workspace_path_uses_saydone_label_for_pi() {
+        let mut job = sample_job();
+        job.agent_type = "pi".into();
+
+        let path = default_temp_workspace_path(
+            std::path::Path::new("/tmp/saydone-cron-test"),
+            &AgentType::Acp,
+            &job,
             "conversation-1",
         );
 

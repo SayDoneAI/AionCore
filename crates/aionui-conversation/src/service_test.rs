@@ -2009,6 +2009,24 @@ async fn create_auto_provisions_workspace_under_date_partition() {
 }
 
 #[tokio::test]
+async fn create_auto_provisions_pi_workspace_with_saydone_label() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace_root = temp.path().join("aionui-data");
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "backend": "pi" }
+    }))
+    .unwrap();
+
+    let conv = svc.create("user_1", req).await.unwrap();
+    let workspace = Path::new(conv.extra["workspace"].as_str().unwrap());
+
+    assert_dated_workspace_path(&workspace_root, workspace, &format!("saydone-temp-{}", conv.id));
+    assert!(workspace.is_dir());
+}
+
+#[tokio::test]
 async fn create_auto_provisions_aionrs_workspace_with_saydone_label() {
     let temp = tempfile::tempdir().unwrap();
     let workspace_root = temp.path().join("aionui-data");

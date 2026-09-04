@@ -4947,7 +4947,7 @@ impl ConversationService {
         }
         let expected_protocol = match backend.as_str() {
             "claude" => "anthropic",
-            "codex" | "saydone" => "openai",
+            "codex" | "pi" | "saydone" => "openai",
             _ => {
                 return Err(ConversationError::BadRequest {
                     reason: format!("unsupported managed runtime backend '{backend}'"),
@@ -5840,8 +5840,9 @@ fn map_create_workspace_validation_error(error: WorkspacePathValidationError) ->
 /// Compute the label used in auto-provisioned workspace directory names.
 ///
 /// For ACP conversations the label is the vendor string from
-/// `extra.backend` (e.g. `"claude"`); Aionrs conversations use the
-/// product label `saydone`; other agent types use their serde name.
+/// `extra.backend` (e.g. `"claude"`), except the bundled Pi runtime uses
+/// the product label `saydone`; Aionrs conversations also use `saydone`;
+/// other agent types use their serde name.
 /// Falls back to the agent type's serde name when the backend field is
 /// missing or not a string.
 fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
@@ -5849,6 +5850,9 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
         && let Some(serde_json::Value::String(s)) = backend
         && !s.is_empty()
     {
+        if s.eq_ignore_ascii_case("pi") {
+            return "saydone".to_owned();
+        }
         return s.clone();
     }
     if *agent_type == AgentType::Aionrs {
@@ -6069,7 +6073,7 @@ fn build_options_backend(options: &BuildTaskOptions) -> Option<&str> {
     }
 }
 
-/// Keep the managed credential boundary limited to the three built-in
+/// Keep the managed credential boundary limited to the four built-in
 /// SayDone agents. The HTTP route is authenticated, but its request body is
 /// still untrusted input and must not be able to attach SayDone credentials to
 /// a custom ACP agent or an arbitrary provider row.
@@ -6078,7 +6082,7 @@ fn validate_managed_runtime_target(row: &ConversationRow, backend: &str) -> Resu
         reason: format!("Invalid conversation runtime metadata: {error}"),
     })?;
     match backend {
-        "claude" | "codex" => {
+        "claude" | "codex" | "pi" => {
             let is_builtin = extra
                 .get("agent_source")
                 .and_then(serde_json::Value::as_str)
@@ -7000,6 +7004,31 @@ mod tests {
         let row = managed_target_row("acp", r#"{"backend":"codex","agent_source":"builtin"}"#, None);
 
         validate_managed_runtime_target(&row, "codex").unwrap();
+    }
+
+    #[test]
+    fn managed_runtime_target_accepts_matching_builtin_pi_agent() {
+        let row = managed_target_row("acp", r#"{"backend":"pi","agent_source":"builtin"}"#, None);
+
+        validate_managed_runtime_target(&row, "pi").unwrap();
+    }
+
+    #[test]
+    fn managed_runtime_target_rejects_non_builtin_pi_agent() {
+        let row = managed_target_row("acp", r#"{"backend":"pi","agent_source":"custom"}"#, None);
+
+        let error = validate_managed_runtime_target(&row, "pi").unwrap_err();
+
+        assert!(matches!(error, ConversationError::Forbidden { .. }));
+    }
+
+    #[test]
+    fn managed_runtime_target_rejects_pi_with_wrong_backend() {
+        let row = managed_target_row("acp", r#"{"backend":"codex","agent_source":"builtin"}"#, None);
+
+        let error = validate_managed_runtime_target(&row, "pi").unwrap_err();
+
+        assert!(matches!(error, ConversationError::Forbidden { .. }));
     }
 
     #[test]

@@ -670,6 +670,9 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
         && let Some(serde_json::Value::String(s)) = backend
         && !s.is_empty()
     {
+        if s.eq_ignore_ascii_case("pi") {
+            return "saydone".to_owned();
+        }
         return s.clone();
     }
     if *agent_type == AgentType::Aionrs {
@@ -1245,6 +1248,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pi_workspace_uses_saydone_label_and_is_not_custom() {
+        let repos = setup().await;
+        let row = row("acp", serde_json::json!({ "backend": "pi" }), None);
+
+        let context = repos.builder().build(&row).await.unwrap();
+        assert!(!context.workspace.is_custom);
+        assert!(context.workspace.stored_path.is_empty());
+        assert!(context.workspace.path.ends_with("saydone-temp-conv-1"));
+    }
+
+    #[tokio::test]
     async fn workspace_existing_path_is_custom() {
         let repos = setup().await;
         let custom = repos.workspace_root.join("custom-workspace");
@@ -1327,6 +1341,22 @@ mod tests {
 
         // A genuinely custom path is not auto.
         assert!(!auto(&root.join("somewhere-else")));
+    }
+
+    #[test]
+    fn pi_auto_workspace_matches_by_structure() {
+        let root = std::path::Path::new("/w");
+        let backend = serde_json::json!("pi");
+        let candidate = expected_auto_workspace_path(root, "user-1", "conv-1", &AgentType::Acp, Some(&backend));
+
+        assert!(candidate.ends_with("saydone-temp-conv-1"));
+        assert!(is_auto_workspace(
+            root,
+            "conv-1",
+            &AgentType::Acp,
+            Some(&backend),
+            &candidate,
+        ));
     }
 
     #[test]
