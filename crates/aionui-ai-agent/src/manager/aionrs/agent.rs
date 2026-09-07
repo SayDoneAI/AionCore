@@ -540,32 +540,26 @@ impl AionrsAgentManager {
             confs.retain(|c| c.call_id != call_id);
         }
 
-        let value = data.get("value").and_then(|v| v.as_str()).unwrap_or("cancel");
-
-        let is_cancel = value == "cancel";
+        let value = aionrs_confirmation_value(&data);
+        let scope = aionrs_confirmation_scope(value, always_allow);
 
         debug!(
             conversation_id = %self.runtime.conversation_id(),
             call_id,
-            value,
+            value = value.unwrap_or("<invalid>"),
             always_allow,
             "Aionrs confirm"
         );
 
-        if is_cancel {
+        if let Some(scope) = scope {
+            self.approval_manager.approve(call_id, scope);
+        } else {
             self.approval_manager.resolve(
                 call_id,
                 ToolApprovalResult::Denied {
                     reason: "User denied the tool request".into(),
                 },
             );
-        } else {
-            let scope = if always_allow {
-                ApprovalScope::Always
-            } else {
-                ApprovalScope::Once
-            };
-            self.approval_manager.approve(call_id, scope);
         }
         Ok(())
     }
@@ -649,6 +643,26 @@ impl AionrsAgentManager {
 
     pub async fn get_slash_commands(&self) -> Result<Vec<SlashCommandItem>, AgentError> {
         Ok(self.slash_commands.clone())
+    }
+}
+
+/// Confirmation responses originate from both the chat card and the desktop
+/// pet window. The card sends `{ value }`; the pet sends the selected value
+/// directly. Normalize both forms before deciding whether to approve.
+fn aionrs_confirmation_value(data: &Value) -> Option<&str> {
+    match data {
+        Value::String(value) => Some(value),
+        Value::Object(values) => values.get("value").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn aionrs_confirmation_scope(value: Option<&str>, always_allow: bool) -> Option<ApprovalScope> {
+    match value {
+        Some("proceed_always") => Some(ApprovalScope::Always),
+        Some("proceed_once") if always_allow => Some(ApprovalScope::Always),
+        Some("proceed_once") => Some(ApprovalScope::Once),
+        _ => None,
     }
 }
 

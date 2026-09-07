@@ -11,8 +11,8 @@ use aionui_api_types::{
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SwitchManagedConversationRuntimeRequest,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, RefreshWealthMcpRuntimeRequest,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SwitchManagedConversationRuntimeRequest,
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
@@ -139,6 +139,14 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route(
             "/api/conversations/{id}/runtime/saydone-switch",
             post(switch_managed_runtime),
+        )
+        .route(
+            "/api/conversations/{id}/runtime/saydone-wealth-refresh",
+            post(refresh_wealth_mcp_runtime),
+        )
+        .route(
+            "/api/conversations/runtime/saydone-wealth-clear",
+            post(clear_wealth_mcp_runtimes),
         )
         .route("/api/conversations/runtime/saydone-clear", post(clear_managed_runtimes))
         .route("/api/conversations/{id}/active-lease", post(active_lease))
@@ -433,6 +441,21 @@ async fn switch_managed_runtime(
     Ok(Json(ApiResponse::ok(response)))
 }
 
+async fn refresh_wealth_mcp_runtime(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<RefreshWealthMcpRuntimeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<EnsureConversationRuntimeResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .refresh_wealth_mcp_runtime(&user.id, &id, req, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
 async fn clear_managed_runtimes(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -440,6 +463,18 @@ async fn clear_managed_runtimes(
     state
         .service
         .clear_managed_runtimes(&user.id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::success()))
+}
+
+async fn clear_wealth_mcp_runtimes(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    state
+        .service
+        .clear_wealth_mcp_runtimes(&user.id, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))

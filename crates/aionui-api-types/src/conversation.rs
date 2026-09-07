@@ -267,6 +267,17 @@ pub struct SwitchManagedConversationRuntimeRequest {
     pub supports_vision: Option<bool>,
 }
 
+/// Short-lived Wealth MCP credential for one conversation runtime.
+///
+/// This value is accepted only over the authenticated local runtime boundary.
+/// It is retained in memory by Core and must never be written to a conversation
+/// snapshot or MCP repository record.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RefreshWealthMcpRuntimeRequest {
+    pub access_token: String,
+    pub tenant_id: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationAssistantIdentityResponse {
     pub id: String,

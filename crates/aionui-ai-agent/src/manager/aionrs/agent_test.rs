@@ -65,6 +65,56 @@ fn make_cli_args(project_dir: PathBuf, provider: &str, model: &str) -> CliArgs {
 }
 
 #[test]
+fn aionrs_confirmation_accepts_pet_once_response() {
+    assert_eq!(
+        aionrs_confirmation_scope(aionrs_confirmation_value(&serde_json::json!("proceed_once")), false),
+        Some(ApprovalScope::Once)
+    );
+}
+
+#[test]
+fn aionrs_confirmation_accepts_pet_always_response() {
+    assert_eq!(
+        aionrs_confirmation_scope(aionrs_confirmation_value(&serde_json::json!("proceed_always")), false),
+        Some(ApprovalScope::Always)
+    );
+}
+
+#[test]
+fn aionrs_confirmation_keeps_chat_card_response_compatible() {
+    assert_eq!(
+        aionrs_confirmation_scope(
+            aionrs_confirmation_value(&serde_json::json!({ "value": "proceed_once" })),
+            false
+        ),
+        Some(ApprovalScope::Once)
+    );
+}
+
+#[test]
+fn aionrs_confirmation_legacy_always_flag_keeps_once_response_always_approved() {
+    assert_eq!(
+        aionrs_confirmation_scope(
+            aionrs_confirmation_value(&serde_json::json!({ "value": "proceed_once" })),
+            true
+        ),
+        Some(ApprovalScope::Always)
+    );
+}
+
+#[test]
+fn aionrs_confirmation_rejects_cancel_and_unknown_values() {
+    assert_eq!(
+        aionrs_confirmation_scope(aionrs_confirmation_value(&serde_json::json!("cancel")), false),
+        None
+    );
+    assert_eq!(
+        aionrs_confirmation_scope(aionrs_confirmation_value(&serde_json::json!("unexpected")), false),
+        None
+    );
+}
+
+#[test]
 fn resolve_aionui_config_discards_standalone_max_token_settings() {
     let project = tempfile::tempdir().unwrap();
     fs::write(

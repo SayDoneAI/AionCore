@@ -22,9 +22,9 @@ use aionui_api_types::{
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
     ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    PromptCapabilityView, RefreshWealthMcpRuntimeRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, SessionRef};
@@ -82,6 +82,62 @@ struct ManagedConversationRuntime {
     base_url: String,
     api_key: String,
     supports_vision: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct WealthMcpRuntimeCredential {
+    user_id: String,
+    access_token: String,
+    tenant_id: i64,
+}
+
+const SAYDONE_WEALTH_MCP_SERVER_NAME: &str = "saydone-wealth";
+const SAYDONE_WEALTH_ACCESS_TOKEN_ENV: &str = "SAYDONE_WEALTH_ACCESS_TOKEN";
+const SAYDONE_WEALTH_TENANT_ID_ENV: &str = "SAYDONE_WEALTH_TENANT_ID";
+const SAYDONE_WEALTH_API_BASE_URL_ENV: &str = "SAYDONE_WEALTH_API_BASE_URL";
+const SAYDONE_WEALTH_API_BASE_URL: &str = "https://wisdom-huiyu.com/app-api";
+
+fn is_valid_wealth_access_token(value: &str) -> bool {
+    (16..=4096).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'+' | b'/' | b'-'))
+}
+
+fn is_valid_wealth_tenant_id(value: i64) -> bool {
+    value > 0
+}
+
+fn apply_wealth_mcp_credential_to_servers(
+    session_mcp_servers: &mut [SessionMcpServer],
+    credential: Option<&WealthMcpRuntimeCredential>,
+) {
+    for server in session_mcp_servers {
+        if server.name != SAYDONE_WEALTH_MCP_SERVER_NAME {
+            continue;
+        }
+        let SessionMcpTransport::Stdio { env, .. } = &mut server.transport else {
+            continue;
+        };
+        // Erase a token left by a legacy snapshot before conditionally placing
+        // the transient process-local token into this build-only clone.
+        env.remove(SAYDONE_WEALTH_ACCESS_TOKEN_ENV);
+        env.remove(SAYDONE_WEALTH_TENANT_ID_ENV);
+        if let Some(credential) = credential {
+            env.insert(
+                SAYDONE_WEALTH_ACCESS_TOKEN_ENV.to_owned(),
+                credential.access_token.clone(),
+            );
+            env.insert(
+                SAYDONE_WEALTH_API_BASE_URL_ENV.to_owned(),
+                SAYDONE_WEALTH_API_BASE_URL.to_owned(),
+            );
+            env.insert(
+                SAYDONE_WEALTH_TENANT_ID_ENV.to_owned(),
+                credential.tenant_id.to_string(),
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -399,6 +455,10 @@ pub struct ConversationService {
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
     managed_runtimes: Arc<Mutex<HashMap<String, ManagedConversationRuntime>>>,
+    /// Per-conversation Wealth credential. This is deliberately process-local:
+    /// MCP repository rows and persisted conversation snapshots must not hold
+    /// user access tokens.
+    wealth_mcp_credentials: Arc<Mutex<HashMap<String, WealthMcpRuntimeCredential>>>,
 
     /// One background-stream watcher per LIVE Session instance (keyed by
     /// conversation id; value remembers the instance pointer so a rebuilt
@@ -483,6 +543,7 @@ impl ConversationService {
             runtime_base_url: None,
             runtime_token_service: None,
             managed_runtimes: Arc::new(Mutex::new(HashMap::new())),
+            wealth_mcp_credentials: Arc::new(Mutex::new(HashMap::new())),
             background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             conversation_repo,
@@ -4736,6 +4797,123 @@ impl ConversationService {
         })
     }
 
+    /// Rebuild one conversation runtime after the desktop process has obtained
+    /// a Wealth OAuth credential. The credential remains process-local and is
+    /// applied only to the task build input, never to an MCP row or snapshot.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn refresh_wealth_mcp_runtime(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        request: RefreshWealthMcpRuntimeRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if let Some(team_id) = team_id_from_extra(&row.extra) {
+            return Err(ConversationError::TeamRuntimeRequired {
+                conversation_id: conversation_id.to_owned(),
+                team_id,
+            });
+        }
+
+        let access_token = request.access_token.trim();
+        if !is_valid_wealth_access_token(access_token) {
+            return Err(ConversationError::BadRequest {
+                reason: "invalid Wealth access token".into(),
+            });
+        }
+        if !is_valid_wealth_tenant_id(request.tenant_id) {
+            return Err(ConversationError::BadRequest {
+                reason: "invalid Wealth tenant ID".into(),
+            });
+        }
+        if self.runtime_state.is_restarting(conversation_id) {
+            return Err(ConversationError::RuntimeRestarting {
+                conversation_id: conversation_id.to_owned(),
+            });
+        }
+
+        self.runtime_state.begin_restart(conversation_id)?;
+        let previous = match self.wealth_mcp_credentials.lock() {
+            Ok(mut credentials) => credentials.insert(
+                conversation_id.to_owned(),
+                WealthMcpRuntimeCredential {
+                    user_id: user_id.to_owned(),
+                    access_token: access_token.to_owned(),
+                    tenant_id: request.tenant_id,
+                },
+            ),
+            Err(_) => {
+                self.runtime_state.clear_restarting(conversation_id);
+                return Err(ConversationError::internal(
+                    "Wealth runtime credential state is unavailable",
+                ));
+            }
+        };
+
+        let refresh_result = async {
+            if let Some(turn_id) = self.runtime_state.active_turn_id_for(conversation_id) {
+                self.cancel_with_cause(
+                    user_id,
+                    conversation_id,
+                    &turn_id,
+                    task_manager,
+                    TurnCancelCause::RuntimeRestart,
+                )
+                .await?;
+            }
+            if task_manager.get_task(conversation_id).is_some() {
+                task_manager
+                    .kill_and_wait(conversation_id, Some(AgentKillReason::RuntimeRestart))
+                    .await;
+                self.runtime_state.clear_turn_state_for_restart(conversation_id);
+            }
+
+            // Do not clear the ACP anchor: this is an MCP credential refresh,
+            // not a model change. Claude/Codex must resume the same session.
+            let (agent, recovered) = self
+                .ensure_runtime_agent(user_id, conversation_id, task_manager, "wealth_mcp_refresh")
+                .await?;
+            let config_options = agent
+                .get_config_options()
+                .await
+                .map_err(ConversationError::from)?
+                .config_options;
+            Ok::<_, ConversationError>((recovered, config_options))
+        }
+        .await;
+        self.runtime_state.clear_restarting(conversation_id);
+
+        let (recovered, config_options) = match refresh_result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Ok(mut credentials) = self.wealth_mcp_credentials.lock() {
+                    match previous {
+                        Some(credential) => {
+                            credentials.insert(conversation_id.to_owned(), credential);
+                        }
+                        None => {
+                            credentials.remove(conversation_id);
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        };
+
+        Ok(EnsureConversationRuntimeResponse {
+            recovered,
+            config_options,
+            runtime: self.runtime_summary_for(conversation_id).await,
+        })
+    }
+
     pub async fn switch_managed_runtime(
         &self,
         user_id: &str,
@@ -4972,7 +5150,7 @@ impl ConversationService {
         user_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
-        let conversation_ids = self
+        let mut conversation_ids = self
             .managed_runtimes
             .lock()
             .map_err(|_| ConversationError::internal("managed runtime state is unavailable"))?
@@ -4983,11 +5161,53 @@ impl ConversationService {
         if let Ok(mut runtimes) = self.managed_runtimes.lock() {
             runtimes.retain(|_, runtime| runtime.user_id != user_id);
         }
+        if let Ok(mut credentials) = self.wealth_mcp_credentials.lock() {
+            conversation_ids.extend(
+                credentials
+                    .iter()
+                    .filter(|&(_conversation_id, credential)| credential.user_id == user_id)
+                    .map(|(conversation_id, _credential)| conversation_id.to_owned()),
+            );
+            credentials.retain(|_, credential| credential.user_id != user_id);
+        }
+        conversation_ids.sort_unstable();
+        conversation_ids.dedup();
         for conversation_id in conversation_ids {
             task_manager
                 .kill_and_wait(&conversation_id, Some(AgentKillReason::RuntimeRestart))
                 .await;
             self.runtime_state.clear_turn_state_for_restart(&conversation_id);
+        }
+        Ok(())
+    }
+
+    /// Remove process-local Wealth credentials after an account unbind or
+    /// remote revocation. Rebuilding those conversations later keeps their
+    /// persisted CLI session anchors, but no longer starts the Wealth MCP with
+    /// a stale credential.
+    pub async fn clear_wealth_mcp_runtimes(
+        &self,
+        user_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), ConversationError> {
+        let conversation_ids = self
+            .wealth_mcp_credentials
+            .lock()
+            .map_err(|_| ConversationError::internal("Wealth runtime credential state is unavailable"))?
+            .iter()
+            .filter(|&(_conversation_id, credential)| credential.user_id == user_id)
+            .map(|(conversation_id, _credential)| conversation_id.to_owned())
+            .collect::<Vec<_>>();
+        if let Ok(mut credentials) = self.wealth_mcp_credentials.lock() {
+            credentials.retain(|_, credential| credential.user_id != user_id);
+        }
+        for conversation_id in conversation_ids {
+            if task_manager.get_task(&conversation_id).is_some() {
+                task_manager
+                    .kill_and_wait(&conversation_id, Some(AgentKillReason::RuntimeRestart))
+                    .await;
+                self.runtime_state.clear_turn_state_for_restart(&conversation_id);
+            }
         }
         Ok(())
     }
@@ -5236,6 +5456,28 @@ impl ConversationService {
             runtime_token.as_deref(),
         );
         self.apply_managed_runtime_context(build_opts, conversation_id);
+        self.apply_wealth_mcp_runtime_credential(build_opts, user_id, conversation_id);
+    }
+
+    fn apply_wealth_mcp_runtime_credential(
+        &self,
+        build_opts: &mut BuildTaskOptions,
+        user_id: &str,
+        conversation_id: &str,
+    ) {
+        let credential = self
+            .wealth_mcp_credentials
+            .lock()
+            .ok()
+            .and_then(|credentials| credentials.get(conversation_id).cloned())
+            .filter(|credential| credential.user_id == user_id);
+
+        let session_mcp_servers = match &mut build_opts.context.kind {
+            AgentSessionKind::Acp(context) => &mut context.config.session_mcp_servers,
+            AgentSessionKind::Aionrs(context) => &mut context.config.session_mcp_servers,
+            AgentSessionKind::Antigravity(context) => &mut context.config.session_mcp_servers,
+        };
+        apply_wealth_mcp_credential_to_servers(session_mcp_servers, credential.as_ref());
     }
 
     fn apply_managed_runtime_context(&self, build_opts: &mut BuildTaskOptions, conversation_id: &str) {
@@ -6632,6 +6874,96 @@ pub(crate) async fn apply_agent_title(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
+
+    fn wealth_mcp_server(env: HashMap<String, String>) -> SessionMcpServer {
+        SessionMcpServer {
+            id: "wealth-1".into(),
+            name: SAYDONE_WEALTH_MCP_SERVER_NAME.into(),
+            transport: SessionMcpTransport::Stdio {
+                command: "saydone-wealth".into(),
+                args: Vec::new(),
+                env,
+            },
+        }
+    }
+
+    #[test]
+    fn wealth_runtime_credential_replaces_legacy_snapshot_token_without_touching_other_servers() {
+        let mut servers = vec![
+            wealth_mcp_server(HashMap::from([
+                (SAYDONE_WEALTH_ACCESS_TOKEN_ENV.into(), "legacy-token".into()),
+                ("UNCHANGED".into(), "true".into()),
+            ])),
+            SessionMcpServer {
+                id: "other-1".into(),
+                name: "other".into(),
+                transport: SessionMcpTransport::Stdio {
+                    command: "other-mcp".into(),
+                    args: Vec::new(),
+                    env: HashMap::from([(SAYDONE_WEALTH_ACCESS_TOKEN_ENV.into(), "other-token".into())]),
+                },
+            },
+        ];
+        let credential = WealthMcpRuntimeCredential {
+            user_id: "user-1".into(),
+            access_token: "fresh-token-123456".into(),
+            tenant_id: 42,
+        };
+
+        apply_wealth_mcp_credential_to_servers(&mut servers, Some(&credential));
+
+        let SessionMcpTransport::Stdio { env, .. } = &servers[0].transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(env.get(SAYDONE_WEALTH_ACCESS_TOKEN_ENV), Some(&credential.access_token));
+        assert_eq!(
+            env.get(SAYDONE_WEALTH_API_BASE_URL_ENV),
+            Some(&SAYDONE_WEALTH_API_BASE_URL.to_owned())
+        );
+        assert_eq!(
+            env.get(SAYDONE_WEALTH_TENANT_ID_ENV),
+            Some(&credential.tenant_id.to_string())
+        );
+        assert_eq!(env.get("UNCHANGED"), Some(&"true".to_owned()));
+        let SessionMcpTransport::Stdio { env, .. } = &servers[1].transport else {
+            panic!("expected stdio transport");
+        };
+        assert_eq!(
+            env.get(SAYDONE_WEALTH_ACCESS_TOKEN_ENV),
+            Some(&"other-token".to_owned())
+        );
+    }
+
+    #[test]
+    fn wealth_runtime_without_credential_removes_legacy_snapshot_token() {
+        let mut servers = vec![wealth_mcp_server(HashMap::from([
+            (SAYDONE_WEALTH_ACCESS_TOKEN_ENV.into(), "legacy-token".into()),
+            (SAYDONE_WEALTH_TENANT_ID_ENV.into(), "42".into()),
+        ]))];
+
+        apply_wealth_mcp_credential_to_servers(&mut servers, None);
+
+        let SessionMcpTransport::Stdio { env, .. } = &servers[0].transport else {
+            panic!("expected stdio transport");
+        };
+        assert!(!env.contains_key(SAYDONE_WEALTH_ACCESS_TOKEN_ENV));
+        assert!(!env.contains_key(SAYDONE_WEALTH_TENANT_ID_ENV));
+    }
+
+    #[test]
+    fn wealth_access_token_validation_rejects_invalid_values() {
+        assert!(is_valid_wealth_access_token("token-1234567890"));
+        assert!(!is_valid_wealth_access_token("too-short"));
+        assert!(!is_valid_wealth_access_token("token with spaces-123456"));
+    }
+
+    #[test]
+    fn wealth_tenant_id_validation_rejects_non_positive_values() {
+        assert!(is_valid_wealth_tenant_id(1));
+        assert!(!is_valid_wealth_tenant_id(0));
+        assert!(!is_valid_wealth_tenant_id(-1));
+    }
 
     fn managed_target_row(agent_type: &str, extra: &str, model: Option<&str>) -> ConversationRow {
         ConversationRow {
