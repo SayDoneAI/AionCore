@@ -1672,7 +1672,7 @@ mod tests {
     #[tokio::test]
     async fn parse_agent_type_rejects_deprecated_runtime_types() {
         let registry = hydrated_registry().await;
-        for agent_type in ["aionrs", "openclaw-gateway", "nanobot", "remote", "gemini", "codex"] {
+        for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini", "codex"] {
             let err = parse_agent_type(&registry, "user1", agent_type).await.unwrap_err();
             assert!(matches!(err, CronError::InvalidAgentConfig(_)));
             assert!(
