@@ -419,7 +419,7 @@ async fn send_to_agent_rejects_unresolvable_channel_assistant_binding() {
 }
 
 #[tokio::test]
-async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant() {
+async fn send_to_agent_without_saved_binding_defaults_to_bundled_pi_runtime() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
 
@@ -475,18 +475,20 @@ async fn send_to_agent_without_saved_binding_defaults_to_bare_aionrs_assistant()
     let snapshot = conversation_repo
         .get_assistant_snapshot(TEST_OWNER_USER_ID, &result.conversation_id)
         .await
-        .unwrap()
-        .expect("channel-created conversation should default to a bare assistant snapshot");
+        .unwrap();
     let conversation = conversation_repo
         .get(TEST_OWNER_USER_ID, &result.conversation_id)
         .await
         .unwrap()
         .unwrap();
 
-    assert_eq!(snapshot.assistant_id, "bare-aionrs");
-    assert_eq!(snapshot.agent_id, "632f31d2");
-    assert_eq!(conversation.r#type, AgentType::Aionrs.serde_name());
-    assert_eq!(conversation.name, "tg-aionrs-70880480");
+    // A stale generated AionRS definition must not override the current
+    // bundled Pi default. With no saved binding, the channel creates a
+    // runtime-backed conversation and leaves assistant snapshot materialization
+    // to the generated-assistant availability path.
+    assert!(snapshot.is_none());
+    assert_eq!(conversation.r#type, AgentType::Acp.serde_name());
+    assert_eq!(conversation.name, "tg-acp-pi-70880480");
 }
 
 #[tokio::test]
