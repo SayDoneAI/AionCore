@@ -106,6 +106,12 @@ pub const SAYDONE_MANAGED_PROTOCOL_ENV: &str = "SAYDONE_MANAGED_PROTOCOL";
 pub const SAYDONE_MANAGED_MODEL_ENV: &str = "SAYDONE_MANAGED_MODEL";
 pub const SAYDONE_MANAGED_BASE_URL_ENV: &str = "SAYDONE_MANAGED_BASE_URL";
 pub const SAYDONE_MANAGED_API_KEY_ENV: &str = "SAYDONE_MANAGED_API_KEY";
+/// Pi resolves the API key from this dedicated environment variable. Keep it
+/// separate from the generic managed key so Pi's models.json can reference it
+/// without exposing the host runtime contract to other CLIs.
+pub const SAYDONE_PI_API_KEY_ENV: &str = "SAYDONE_PI_API_KEY";
+/// Managed Pi's ACP shim command, selected by the host runtime.
+pub const SAYDONE_PI_ACP_COMMAND_ENV: &str = "SAYDONE_PI_ACP_COMMAND";
 pub const SAYDONE_IMAGE_NATIVE_VISION_ENV: &str = "SAYDONE_IMAGE_NATIVE_VISION";
 pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
 

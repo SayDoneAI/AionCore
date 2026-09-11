@@ -21,6 +21,7 @@ use aionui_runtime::{ensure_runtime_command, ensure_runtime_command_with_reporte
 use tracing::{info, warn};
 
 use crate::runtime_status::conversation_runtime_reporter;
+use crate::types::{SAYDONE_MANAGED_AGENT_ENV, SAYDONE_PI_ACP_COMMAND_ENV};
 
 /// Where a conversation that arrived on the ACP factory actually has to run.
 ///
@@ -166,6 +167,7 @@ pub(super) async fn build(
         &ctx.user_id,
         &ctx.workspace,
         &ctx.conversation_id,
+        &ctx.runtime_env,
         deps.broadcaster.clone(),
     )
     .await?;
@@ -327,6 +329,7 @@ async fn resolve_agent_command_spec(
     user_id: &str,
     workspace: &str,
     conversation_id: &str,
+    runtime_env: &[(String, String)],
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<CommandSpec, AgentError> {
     let command = meta
@@ -339,12 +342,40 @@ async fn resolve_agent_command_spec(
         .await
         .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
 
-    let mut args: Vec<String> = resolved
-        .args_prefix
+    let managed_agent = meta
+        .env
         .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let launch_args = if meta.agent_source == aionui_api_types::AgentSource::Builtin
+        .any(|entry| entry.name == SAYDONE_MANAGED_AGENT_ENV && entry.value == "1")
+        || runtime_env
+            .iter()
+            .any(|(name, value)| name == SAYDONE_MANAGED_AGENT_ENV && value == "1");
+    let managed_pi_command = (meta.backend.as_deref() == Some("pi") && managed_agent)
+        .then(|| {
+            runtime_env
+                .iter()
+                .map(|(name, value)| (name, value))
+                .chain(meta.env.iter().map(|entry| (&entry.name, &entry.value)))
+                .find(|(name, _)| name.as_str() == SAYDONE_PI_ACP_COMMAND_ENV)
+                .map(|(_, value)| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .flatten();
+    let mut args: Vec<String> = if managed_pi_command.is_some() {
+        Vec::new()
+    } else {
+        resolved
+            .args_prefix
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    };
+    let command = managed_pi_command
+        .as_ref()
+        .map(|value| value.clone().into())
+        .unwrap_or_else(|| resolved.program.clone());
+    let launch_args = if managed_pi_command.is_some() {
+        Vec::new()
+    } else if meta.agent_source == aionui_api_types::AgentSource::Builtin
         && meta.agent_source_info.bridge_binary.as_deref() == Some("npx")
         && let Some(backend) = meta.backend.as_deref()
     {
@@ -369,7 +400,7 @@ async fn resolve_agent_command_spec(
     }));
 
     Ok(CommandSpec {
-        command: resolved.program,
+        command,
         args,
         env,
         cwd: Some(workspace.to_owned()),
@@ -919,6 +950,7 @@ mod tests {
             "user-acp",
             "/tmp/workspace",
             "conv-acp",
+            &[],
             Arc::new(BroadcastEventBus::new(16)),
         )
         .await
@@ -941,6 +973,7 @@ mod tests {
             "user-acp",
             "/tmp/workspace",
             "conv-acp",
+            &[],
             Arc::new(BroadcastEventBus::new(16)),
         )
         .await
