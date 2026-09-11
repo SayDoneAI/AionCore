@@ -17,6 +17,10 @@ pub struct SetAgentOverridesRequest {
     pub command_override: Option<String>,
     #[serde(default)]
     pub env_override: Option<Vec<AgentEnvEntry>>,
+    /// Managed startup can configure a runtime before credentials are available.
+    /// Omission preserves the explicit-edit behavior of running a health check.
+    #[serde(default)]
+    pub run_health_check: Option<bool>,
 }
 
 /// Response body for `GET /api/agents/{id}/overrides`.

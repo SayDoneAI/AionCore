@@ -2,6 +2,52 @@ use crate::error::AgentError;
 #[cfg(any(unix, windows))]
 use tracing::{debug, error};
 
+#[cfg(target_os = "macos")]
+fn group_has_only_exited_members(group_id: u32) -> bool {
+    let Ok(group_id) = libc::pid_t::try_from(group_id) else {
+        return false;
+    };
+    if group_id <= 1 {
+        return false;
+    }
+    let mut members = [0 as libc::pid_t; 1024];
+    // proc_listpgrppids returns a PID count, not a byte count. A full buffer
+    // cannot prove the group is exhausted, so retain the original error.
+    let count = unsafe {
+        libc::proc_listpgrppids(
+            group_id,
+            members.as_mut_ptr().cast(),
+            std::mem::size_of_val(&members) as libc::c_int,
+        )
+    };
+    if count <= 0 || count as usize >= members.len() {
+        return false;
+    }
+    members[..count as usize].iter().all(|&pid| {
+        if pid <= 1 {
+            return false;
+        }
+        // SAFETY: the buffer size matches the initialized struct; fields are
+        // inspected only when the kernel returns the complete struct.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as libc::c_int;
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                std::ptr::addr_of_mut!(info).cast(),
+                size,
+            )
+        };
+        if got == size {
+            info.pbi_pgid == group_id as u32 && info.pbi_status == libc::SZOMB
+        } else {
+            got == 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    })
+}
+
 /// Force-kill a process by PID, plus any descendants.
 ///
 /// Uses platform-native shell commands:
@@ -42,6 +88,15 @@ pub(super) fn force_kill(pid: u32, process_group_id: Option<u32>) -> Result<(), 
             }
 
             let err = io::Error::last_os_error();
+            #[cfg(target_os = "macos")]
+            if err.raw_os_error() == Some(libc::EPERM) && group_has_only_exited_members(group_id) {
+                debug!(
+                    pid,
+                    process_group = group_id,
+                    "Process group contains only exited members"
+                );
+                return Ok(());
+            }
             if err.raw_os_error() == Some(libc::ESRCH) {
                 debug!(
                     pid,
@@ -181,6 +236,34 @@ mod force_kill_tests {
         // unix `kill` non-zero exit and Windows `taskkill` rc=128 are mapped to
         // Ok in `force_kill`, so this should not produce an error.
         force_kill(pid, Some(pid)).expect("force_kill on dead pid must not error");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn force_kill_unreaped_exited_group_is_ok() {
+        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        let pid = child.id();
+        let mut status = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        // WNOWAIT observes exit without reaping, matching cleanup racing the waiter.
+        let observed = unsafe { libc::waitid(libc::P_PID, pid, status.as_mut_ptr(), libc::WEXITED | libc::WNOWAIT) };
+        let result = force_kill(pid, Some(pid));
+        child.wait().unwrap();
+        assert_eq!(observed, 0);
+        result.expect("an exited, unreaped group has no live process left to kill");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exited_group_check_rejects_live_and_unverifiable_groups() {
+        let mut child = spawn_blocker();
+        let pid = child.id();
+        let live_is_exited = super::group_has_only_exited_members(pid);
+        force_kill(pid, Some(pid)).unwrap();
+        child.wait().unwrap();
+        assert!(!live_is_exited, "a live group must retain permission failures");
+        for group_id in [0, 1, u32::MAX] {
+            assert!(!super::group_has_only_exited_members(group_id));
+        }
     }
 
     #[cfg(unix)]

@@ -120,6 +120,7 @@ impl AgentService {
         id: &str,
         req: aionui_api_types::SetAgentOverridesRequest,
     ) -> Result<AgentManagementRow, AgentError> {
+        let run_health_check = req.run_health_check.unwrap_or(true);
         let repo = self.registry.repo_handle();
         let row = repo
             .get_for_user(user_id, id)
@@ -165,7 +166,24 @@ impl AgentService {
             .await
             .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides_for_user: {e}")))?;
 
-        self.availability.run_manual_health_check(user_id, id).await
+        if run_health_check {
+            self.availability.run_manual_health_check(user_id, id).await
+        } else {
+            // Invalidate the verdict for the old configuration, retaining historical
+            // success/failure timestamps. The next real session supplies fresh evidence.
+            repo.update_availability_snapshot_for_user(
+                user_id,
+                id,
+                &aionui_db::UpdateAgentAvailabilitySnapshotParams::default(),
+            )
+            .await
+            .map_err(|error| AgentError::internal(format!("clear availability verdict: {error}")))?;
+            self.registry.reload_one(id).await?;
+            self.availability
+                .management_row_by_id(user_id, id)
+                .await?
+                .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))
+        }
     }
 
     pub async fn get_agent_overrides(

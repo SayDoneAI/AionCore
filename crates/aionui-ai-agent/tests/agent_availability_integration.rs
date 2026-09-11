@@ -10,6 +10,50 @@ use aionui_realtime::EventBroadcaster;
 
 const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 
+#[tokio::test]
+#[cfg(unix)]
+async fn managed_override_opt_out_does_not_probe_but_default_still_does() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("probe-started");
+    let args = serde_json::to_string(&["-c", "printf probe >> \"$1\"", "probe", marker.to_str().unwrap()]).unwrap();
+    let mut params = custom_params("opt-out", "Opt out", "sh", r#"{"binary_name":"sh"}"#);
+    params.args = Some(&args);
+    repo.upsert(&params).await.unwrap();
+    let registry = AgentRegistry::new(repo.clone());
+    registry.hydrate().await.unwrap();
+    let service = agent_service(registry, provider_repo, directory.path().to_path_buf());
+    let request = serde_json::from_value(serde_json::json!({"run_health_check": false})).unwrap();
+    let row = service
+        .set_agent_overrides(SYSTEM_DEFAULT_USER_ID, "opt-out", request)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.last_check_kind, None,
+        "managed startup must not launch a manual ACP probe"
+    );
+    assert!(!marker.exists(), "opt-out must not execute the agent command");
+    let request = serde_json::from_value(serde_json::json!({})).unwrap();
+    let row = service
+        .set_agent_overrides(SYSTEM_DEFAULT_USER_ID, "opt-out", request)
+        .await
+        .unwrap();
+    assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Manual));
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe");
+    let request = serde_json::from_value(serde_json::json!({"run_health_check": false})).unwrap();
+    let row = service
+        .set_agent_overrides(SYSTEM_DEFAULT_USER_ID, "opt-out", request)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.last_check_status, None,
+        "configuration invalidates the stale probe verdict"
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "probe");
+}
+
 struct NoopBroadcaster;
 
 impl EventBroadcaster for NoopBroadcaster {
