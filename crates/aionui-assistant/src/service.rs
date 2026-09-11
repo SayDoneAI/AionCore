@@ -549,9 +549,15 @@ impl AssistantService {
                 row.enabled
                     && row.installed
                     && row.agent_type.supports_new_conversation()
+                    // Installed agents remain selectable even when the last
+                    // health check reports authentication or a transient
+                    // runtime error. The projected row keeps that offline
+                    // status so the UI can explain the problem.
                     && matches!(
                         row.status,
-                        AgentManagementStatus::Online | AgentManagementStatus::Unchecked
+                        AgentManagementStatus::Online
+                            | AgentManagementStatus::Offline
+                            | AgentManagementStatus::Unchecked
                     )
             })
             .collect();
@@ -4352,6 +4358,29 @@ mod tests {
         assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Unchecked);
         assert!(bare.team_selectable);
         assert!(bare.agent_status_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_materializes_generated_assistant_from_installed_offline_agent() {
+        let mut offline_row = mk_agent_row("agent-pi", "pi", aionui_api_types::AgentManagementStatus::Offline);
+        offline_row.last_check_error_code = Some("auth_required".into());
+        offline_row.last_check_error_message = Some("Authentication required".into());
+
+        let fx = fixture_with_options(FixtureOpts {
+            agent_rows: vec![offline_row],
+            ..Default::default()
+        })
+        .await;
+
+        let list = fx.service.list().await.unwrap();
+        let bare = list
+            .iter()
+            .find(|assistant| assistant.id == "bare:agent-pi")
+            .expect("installed offline agent should remain visible as a generated assistant");
+        assert_eq!(bare.source, AssistantSource::Generated);
+        assert_eq!(bare.agent_status, aionui_api_types::AgentManagementStatus::Offline);
+        assert_eq!(bare.agent_status_message.as_deref(), Some("Authentication required"));
+        assert!(!bare.team_selectable);
     }
 
     #[tokio::test]

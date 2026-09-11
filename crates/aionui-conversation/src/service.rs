@@ -169,6 +169,14 @@ fn managed_runtime_native_vision_env(backend: &str, supports_vision: Option<bool
     })
 }
 
+fn managed_runtime_acp_model_id(backend: &str, model: &str) -> String {
+    if backend == "pi" {
+        format!("saydone/{model}")
+    } else {
+        model.to_owned()
+    }
+}
+
 /// A managed-runtime request is also used to rehydrate credentials after the
 /// desktop process restarts. Rehydration must not discard a persisted ACP
 /// backend session; only an actual model change is a context reset.
@@ -5484,7 +5492,7 @@ impl ConversationService {
         use aionui_ai_agent::types::{
             SAYDONE_IMAGE_NATIVE_VISION_ENV, SAYDONE_MANAGED_AGENT_ENV, SAYDONE_MANAGED_API_KEY_ENV,
             SAYDONE_MANAGED_BACKEND_ENV, SAYDONE_MANAGED_BASE_URL_ENV, SAYDONE_MANAGED_MODEL_ENV,
-            SAYDONE_MANAGED_PROTOCOL_ENV,
+            SAYDONE_MANAGED_PROTOCOL_ENV, SAYDONE_PI_API_KEY_ENV,
         };
         let Some(runtime) = self
             .managed_runtimes
@@ -5497,6 +5505,7 @@ impl ConversationService {
         let managed_keys = [
             SAYDONE_MANAGED_AGENT_ENV,
             SAYDONE_MANAGED_API_KEY_ENV,
+            SAYDONE_PI_API_KEY_ENV,
             SAYDONE_MANAGED_BACKEND_ENV,
             SAYDONE_MANAGED_BASE_URL_ENV,
             SAYDONE_MANAGED_MODEL_ENV,
@@ -5516,10 +5525,10 @@ impl ConversationService {
             .retain(|(key, _)| !managed_keys.contains(&key.as_str()));
         match &mut build_opts.context.kind {
             AgentSessionKind::Acp(context) => {
-                context.config.current_model_id = Some(runtime.model.clone());
+                let wire_model = managed_runtime_acp_model_id(&runtime.backend, &runtime.model);
+                context.config.current_model_id = Some(wire_model.clone());
                 if let Some(snapshot) = context.session_snapshot.as_mut() {
-                    snapshot.current_model_id =
-                        Some(aionui_ai_agent::shared_kernel::ModelId::new(runtime.model.clone()));
+                    snapshot.current_model_id = Some(aionui_ai_agent::shared_kernel::ModelId::new(wire_model));
                 }
             }
             AgentSessionKind::Aionrs(_) => {
@@ -5534,6 +5543,7 @@ impl ConversationService {
             (SAYDONE_MANAGED_MODEL_ENV.to_owned(), runtime.model.clone()),
             (SAYDONE_MANAGED_BASE_URL_ENV.to_owned(), runtime.base_url.clone()),
             (SAYDONE_MANAGED_API_KEY_ENV.to_owned(), runtime.api_key.clone()),
+            (SAYDONE_PI_API_KEY_ENV.to_owned(), runtime.api_key.clone()),
         ];
         if let Some(vision_env) = managed_runtime_native_vision_env(&runtime.backend, runtime.supports_vision) {
             env.push(vision_env);
@@ -7007,7 +7017,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_runtime_target_accepts_matching_builtin_pi_agent() {
+    fn managed_runtime_target_accepts_matching_builtin_pi_acp_agent() {
         let row = managed_target_row("acp", r#"{"backend":"pi","agent_source":"builtin"}"#, None);
 
         validate_managed_runtime_target(&row, "pi").unwrap();
@@ -7087,6 +7097,22 @@ mod tests {
         assert_eq!(managed_runtime_native_vision_env("codex", Some(false)), None);
         assert_eq!(managed_runtime_native_vision_env("claude", None), None);
         assert_eq!(managed_runtime_native_vision_env("saydone", Some(true)), None);
+    }
+
+    #[test]
+    fn managed_pi_projects_the_app_model_to_its_acp_provider_id() {
+        assert_eq!(
+            managed_runtime_acp_model_id("pi", "deepseek-v4-pro"),
+            "saydone/deepseek-v4-pro"
+        );
+        assert_eq!(
+            managed_runtime_acp_model_id("claude", "deepseek-v4-pro"),
+            "deepseek-v4-pro"
+        );
+        assert_eq!(
+            managed_runtime_acp_model_id("codex", "deepseek-v4-pro"),
+            "deepseek-v4-pro"
+        );
     }
 
     #[test]
