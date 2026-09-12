@@ -171,7 +171,54 @@ impl ConversationService {
             });
         }
         let agent = self.task(conversation_id)?;
-        let response = match agent.set_config_option(option_id, &req.value).await {
+        let policy = self.managed_reasoning_policy(conversation_id)?;
+        let ensure_current = || {
+            if policy.is_some()
+                && (self.runtime_state().is_restarting(conversation_id)
+                    || !self
+                        .task_manager()
+                        .get_task(conversation_id)
+                        .is_some_and(|current| std::ptr::addr_eq(current.as_task(), agent.as_task())))
+            {
+                return Err(AgentError::conflict("runtime changed while configuring agent"));
+            }
+            Ok(())
+        };
+        let result = async {
+            if let Some(policy) = &policy {
+                let snapshot = agent.get_config_options().await;
+                // A delayed snapshot belongs to the original task, including its errors.
+                ensure_current()?;
+                let snapshot = snapshot?;
+                let option = snapshot.config_options.iter().find(|option| option.id == option_id);
+                let is_reasoning = matches!(option_id, "thought_level" | "reasoning_effort" | "effort")
+                    || option.is_some_and(|option| {
+                        matches!(option.category.as_deref(), Some("thought_level" | "reasoning_effort"))
+                    });
+                if is_reasoning
+                    && (!policy
+                        .get("efforts")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|efforts| {
+                            efforts.iter().any(|effort| effort.as_str() == Some(req.value.as_str()))
+                        })
+                        || !option.is_some_and(|option| {
+                            option.option_type == "select" && option.options.iter().any(|item| item.value == req.value)
+                        }))
+                {
+                    return Err(AgentError::bad_request(
+                        "reasoning effort is not allowed by the managed policy and runtime",
+                    ));
+                }
+                if option.is_none() {
+                    return Err(AgentError::bad_request("managed runtime config option is unknown"));
+                }
+            }
+            agent.set_config_option(option_id, &req.value).await
+        }
+        .await;
+        ensure_current().map_err(ConversationError::from)?;
+        let response = match result {
             Ok(response) => response,
             Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
                 warn!(

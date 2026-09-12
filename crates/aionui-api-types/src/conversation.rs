@@ -265,6 +265,13 @@ pub struct SwitchManagedConversationRuntimeRequest {
     /// Admin-declared native image input support for the selected model.
     #[serde(default)]
     pub supports_vision: Option<bool>,
+    /// Backend-owned token budgets; no local fallback is allowed for managed sessions.
+    pub context_window: u32,
+    pub max_output_tokens: u32,
+    pub default_output_tokens: u32,
+    /// Admin-declared CLI reasoning policy, forwarded only to the managed child.
+    #[serde(default)]
+    pub reasoning_policy: Option<serde_json::Value>,
 }
 
 /// Short-lived Wealth MCP credential for one conversation runtime.
@@ -1179,5 +1186,24 @@ mod tests {
         assert_eq!(raw["kind"], "skill_suggest");
         assert_eq!(raw["status"], "active");
         assert_eq!(raw["payload"]["name"], "daily-report");
+    }
+
+    #[test]
+    fn managed_runtime_requires_each_backend_budget() {
+        let payload = json!({
+            "model": "managed-test", "backend": "pi", "protocol": "openai",
+            "base_url": "https://example.invalid", "api_key": "test-key",
+            "supports_vision": false, "reasoning_policy": { "efforts": [] },
+            "context_window": 32768, "max_output_tokens": 8192, "default_output_tokens": 4096
+        });
+        assert!(serde_json::from_value::<SwitchManagedConversationRuntimeRequest>(payload.clone()).is_ok());
+        for field in ["context_window", "max_output_tokens", "default_output_tokens"] {
+            let mut incomplete = payload.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<SwitchManagedConversationRuntimeRequest>(incomplete).is_err(),
+                "accepted missing {field}"
+            );
+        }
     }
 }

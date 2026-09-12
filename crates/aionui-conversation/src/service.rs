@@ -82,6 +82,10 @@ struct ManagedConversationRuntime {
     base_url: String,
     api_key: String,
     supports_vision: Option<bool>,
+    context_window: u32,
+    max_output_tokens: u32,
+    default_output_tokens: u32,
+    reasoning_policy: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +154,8 @@ fn managed_runtime_matches(
     base_url: &str,
     api_key: &str,
     supports_vision: Option<bool>,
+    reasoning_policy: Option<&serde_json::Value>,
+    token_budgets: [u32; 3],
 ) -> bool {
     runtime.user_id == user_id
         && runtime.model == model
@@ -158,6 +164,28 @@ fn managed_runtime_matches(
         && runtime.base_url == base_url
         && runtime.api_key == api_key
         && runtime.supports_vision == supports_vision
+        && runtime.reasoning_policy.as_ref() == reasoning_policy
+        && [
+            runtime.context_window,
+            runtime.max_output_tokens,
+            runtime.default_output_tokens,
+        ] == token_budgets
+}
+
+fn validate_managed_token_budgets(context: u32, max_output: u32, default_output: u32) -> Result<(), ConversationError> {
+    if context == 0
+        || context > i32::MAX as u32
+        || max_output == 0
+        || max_output > i32::MAX as u32
+        || default_output == 0
+        || default_output > context
+        || default_output > max_output
+    {
+        return Err(ConversationError::BadRequest {
+            reason: "managed runtime token budgets are invalid".into(),
+        });
+    }
+    Ok(())
 }
 
 fn managed_runtime_native_vision_env(backend: &str, supports_vision: Option<bool>) -> Option<(String, String)> {
@@ -167,6 +195,82 @@ fn managed_runtime_native_vision_env(backend: &str, supports_vision: Option<bool
             "1".to_owned(),
         )
     })
+}
+
+fn validate_managed_reasoning_policy(
+    backend: &str,
+    policy: Option<&serde_json::Value>,
+) -> Result<(), ConversationError> {
+    let invalid = || ConversationError::BadRequest {
+        reason: "Managed CLI reasoning policy is missing or invalid".into(),
+    };
+    // The legacy managed SayDone runtime does not consume per-CLI reasoning policy.
+    if backend == "saydone" && policy.is_none() {
+        return Ok(());
+    }
+    let config = policy.and_then(serde_json::Value::as_object).ok_or_else(invalid)?;
+    if config.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "efforts" | "default_effort" | "wire_protocol" | "off_value"
+        )
+    }) {
+        return Err(invalid());
+    }
+    let efforts = config
+        .get("efforts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(invalid)?;
+    if efforts.len() > 16 {
+        return Err(invalid());
+    }
+    for (index, effort) in efforts.iter().enumerate() {
+        let value = effort.as_str().ok_or_else(invalid)?;
+        if value.is_empty()
+            || value.len() > 32
+            || !value.as_bytes()[0].is_ascii_lowercase()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'))
+            || efforts[..index].contains(effort)
+        {
+            return Err(invalid());
+        }
+    }
+    if let Some(default) = config.get("default_effort")
+        && (!default.is_string() || !efforts.contains(default))
+    {
+        return Err(invalid());
+    }
+    if let Some(protocol) = config.get("wire_protocol")
+        && !matches!(
+            protocol.as_str(),
+            Some("openai_reasoning_effort" | "acp_reasoning_effort" | "pi_thinking_level_map")
+        )
+    {
+        return Err(invalid());
+    }
+    if let Some(off) = config.get("off_value")
+        && (!off.is_string() || !efforts.iter().any(|value| value.as_str() == Some("off")))
+    {
+        return Err(invalid());
+    }
+    if backend == "pi" {
+        let protocol = config.get("wire_protocol").and_then(serde_json::Value::as_str);
+        if protocol.is_some() && protocol != Some("pi_thinking_level_map") {
+            return Err(invalid());
+        }
+        if efforts.iter().any(|value| value.as_str() == Some("off"))
+            && (protocol != Some("pi_thinking_level_map")
+                || config
+                    .get("off_value")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty()))
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }
 
 fn managed_runtime_acp_model_id(backend: &str, model: &str) -> String {
@@ -4968,6 +5072,17 @@ impl ConversationService {
             });
         }
         validate_managed_runtime_target(&row, &backend)?;
+        validate_managed_token_budgets(
+            request.context_window,
+            request.max_output_tokens,
+            request.default_output_tokens,
+        )?;
+        if request.supports_vision.is_none() {
+            return Err(ConversationError::BadRequest {
+                reason: "managed runtime vision capability is required".into(),
+            });
+        }
+        validate_managed_reasoning_policy(&backend, request.reasoning_policy.as_ref())?;
         if !base_url.starts_with("https://") {
             return Err(ConversationError::BadRequest {
                 reason: "managed runtime base_url must use HTTPS".into(),
@@ -4999,6 +5114,12 @@ impl ConversationService {
                     base_url,
                     api_key,
                     request.supports_vision,
+                    request.reasoning_policy.as_ref(),
+                    [
+                        request.context_window,
+                        request.max_output_tokens,
+                        request.default_output_tokens,
+                    ],
                 )
             });
         if already_active {
@@ -5049,6 +5170,10 @@ impl ConversationService {
                     base_url: base_url.to_owned(),
                     api_key: api_key.to_owned(),
                     supports_vision: request.supports_vision,
+                    context_window: request.context_window,
+                    max_output_tokens: request.max_output_tokens,
+                    default_output_tokens: request.default_output_tokens,
+                    reasoning_policy: request.reasoning_policy.clone(),
                 },
             ),
             Err(_) => {
@@ -5148,6 +5273,18 @@ impl ConversationService {
             config_options,
             runtime: self.runtime_summary_for(conversation_id).await,
         })
+    }
+
+    pub(crate) fn managed_reasoning_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<serde_json::Value>, ConversationError> {
+        let runtimes = self.managed_runtimes.lock().map_err(|_| ConversationError::Internal {
+            reason: "managed runtime state is unavailable".into(),
+        })?;
+        Ok(runtimes
+            .get(conversation_id)
+            .and_then(|runtime| runtime.reasoning_policy.clone()))
     }
 
     /// Remove every in-memory managed credential owned by a desktop account.
@@ -5518,6 +5655,11 @@ impl ConversationService {
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "OPENAI_MODEL",
+            "SAYDONE_MANAGED_REASONING_POLICY",
+            "SAYDONE_MANAGED_CONTEXT_WINDOW",
+            "SAYDONE_MANAGED_MAX_OUTPUT_TOKENS",
+            "SAYDONE_MANAGED_DEFAULT_OUTPUT_TOKENS",
+            "SAYDONE_MANAGED_SUPPORTS_VISION",
         ];
         build_opts
             .context
@@ -5527,6 +5669,33 @@ impl ConversationService {
             AgentSessionKind::Acp(context) => {
                 let wire_model = managed_runtime_acp_model_id(&runtime.backend, &runtime.model);
                 context.config.current_model_id = Some(wire_model.clone());
+                if let Some(efforts) = runtime
+                    .reasoning_policy
+                    .as_ref()
+                    .and_then(|policy| policy.get("efforts"))
+                    .and_then(serde_json::Value::as_array)
+                {
+                    let allowed = |value: &str| efforts.iter().any(|effort| effort.as_str() == Some(value));
+                    if !context.config.thought_level.as_deref().is_some_and(allowed) {
+                        context.config.thought_level = runtime
+                            .reasoning_policy
+                            .as_ref()
+                            .and_then(|policy| policy.get("default_effort"))
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| allowed(value))
+                            .map(str::to_owned);
+                    }
+                    // Filter only the launch snapshot; failed switches must not rewrite user state.
+                    // These categories match ACP startup preference restoration.
+                    if let Some(snapshot) = context.session_snapshot.as_mut() {
+                        snapshot.config_selections.retain(|key, value| {
+                            !matches!(
+                                key.as_str(),
+                                "thought_level" | "reasoning_effort" | "effort" | "thinking_budget" | "thinking"
+                            ) || allowed(value.as_str())
+                        });
+                    }
+                }
                 if let Some(snapshot) = context.session_snapshot.as_mut() {
                     snapshot.current_model_id = Some(aionui_ai_agent::shared_kernel::ModelId::new(wire_model));
                 }
@@ -5544,7 +5713,30 @@ impl ConversationService {
             (SAYDONE_MANAGED_BASE_URL_ENV.to_owned(), runtime.base_url.clone()),
             (SAYDONE_MANAGED_API_KEY_ENV.to_owned(), runtime.api_key.clone()),
             (SAYDONE_PI_API_KEY_ENV.to_owned(), runtime.api_key.clone()),
+            (
+                "SAYDONE_MANAGED_CONTEXT_WINDOW".to_owned(),
+                runtime.context_window.to_string(),
+            ),
+            (
+                "SAYDONE_MANAGED_MAX_OUTPUT_TOKENS".to_owned(),
+                runtime.max_output_tokens.to_string(),
+            ),
+            (
+                "SAYDONE_MANAGED_DEFAULT_OUTPUT_TOKENS".to_owned(),
+                runtime.default_output_tokens.to_string(),
+            ),
         ];
+        if let Some(supports_vision) = runtime.supports_vision {
+            env.push((
+                "SAYDONE_MANAGED_SUPPORTS_VISION".to_owned(),
+                supports_vision.to_string(),
+            ));
+        }
+        if let Some(policy) = runtime.reasoning_policy.as_ref()
+            && let Ok(value) = serde_json::to_string(policy)
+        {
+            env.push(("SAYDONE_MANAGED_REASONING_POLICY".to_owned(), value));
+        }
         if let Some(vision_env) = managed_runtime_native_vision_env(&runtime.backend, runtime.supports_vision) {
             env.push(vision_env);
         }
@@ -7064,6 +7256,10 @@ mod tests {
             base_url: "https://admin.saydone.ai/proxy".into(),
             api_key: "token-1".into(),
             supports_vision: Some(true),
+            context_window: 32768,
+            max_output_tokens: 8192,
+            default_output_tokens: 4096,
+            reasoning_policy: None,
         };
 
         assert!(managed_runtime_matches(
@@ -7075,6 +7271,8 @@ mod tests {
             "https://admin.saydone.ai/proxy",
             "token-1",
             Some(true),
+            None,
+            [32768, 8192, 4096],
         ));
         assert!(!managed_runtime_matches(
             &runtime,
@@ -7085,7 +7283,86 @@ mod tests {
             "https://admin.saydone.ai/proxy",
             "token-2",
             Some(true),
+            None,
+            [32768, 8192, 4096],
         ));
+        for budgets in [[65536, 8192, 4096], [32768, 16384, 4096], [32768, 8192, 2048]] {
+            assert!(!managed_runtime_matches(
+                &runtime,
+                "user-1",
+                "deepseek-v4-flash",
+                "claude",
+                "anthropic",
+                "https://admin.saydone.ai/proxy",
+                "token-1",
+                Some(true),
+                None,
+                budgets,
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_runtime_token_budgets_reject_invalid_values_without_clamping() {
+        validate_managed_token_budgets(32768, 8192, 4096).unwrap();
+        for [context, max_output, default_output] in [
+            [0, 8192, 4096],
+            [32768, 0, 4096],
+            [32768, 8192, 0],
+            [32768, 8192, 16384],
+            [2048, 8192, 4096],
+            [u32::MAX, 8192, 4096],
+        ] {
+            let error = validate_managed_token_budgets(context, max_output, default_output).unwrap_err();
+            assert!(
+                matches!(error, ConversationError::BadRequest { reason } if reason == "managed runtime token budgets are invalid")
+            );
+        }
+    }
+
+    #[test]
+    fn managed_runtime_reasoning_policy_accepts_empty_choices_and_backend_defaults() {
+        for policy in [
+            serde_json::json!({ "efforts": [] }),
+            serde_json::json!({ "efforts": ["low", "high"], "default_effort": "low" }),
+            serde_json::json!({ "efforts": ["off"], "wire_protocol": "pi_thinking_level_map", "off_value": "none" }),
+        ] {
+            validate_managed_reasoning_policy("pi", Some(&policy)).unwrap();
+        }
+        validate_managed_reasoning_policy("saydone", None).unwrap();
+    }
+
+    #[test]
+    fn managed_runtime_reasoning_policy_rejects_missing_and_malformed_configuration() {
+        for backend in ["pi", "codex", "claude"] {
+            assert!(matches!(
+                validate_managed_reasoning_policy(backend, None),
+                Err(ConversationError::BadRequest { .. })
+            ));
+        }
+        for policy in [
+            serde_json::json!({}),
+            serde_json::json!({ "efforts": "low" }),
+            serde_json::json!({ "efforts": [null] }),
+            serde_json::json!({ "efforts": ["low", "low"] }),
+            serde_json::json!({ "efforts": [" low"] }),
+            serde_json::json!({ "efforts": ["low"], "default_effort": "high" }),
+            serde_json::json!({ "efforts": ["low"], "wire_protocol": "unknown" }),
+            serde_json::json!({ "efforts": ["low"], "off_value": "none" }),
+            serde_json::json!({ "efforts": ["off"] }),
+            serde_json::json!({ "efforts": ["off"], "wire_protocol": "pi_thinking_level_map" }),
+            serde_json::json!({ "efforts": ["off"], "wire_protocol": "pi_thinking_level_map", "off_value": " " }),
+            serde_json::json!({ "efforts": ["off"], "wire_protocol": "acp_reasoning_effort", "off_value": "none" }),
+            serde_json::json!({ "efforts": [], "fallback": "high" }),
+        ] {
+            assert!(
+                matches!(
+                    validate_managed_reasoning_policy("pi", Some(&policy)),
+                    Err(ConversationError::BadRequest { .. })
+                ),
+                "{policy}"
+            );
+        }
     }
 
     #[test]

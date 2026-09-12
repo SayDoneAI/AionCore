@@ -57,6 +57,22 @@ Enforced behaviors:
 
 See also the standing discipline in the root `AGENTS.md` / memory `aioncore-verification-blindspot-g6`: self-consistent-all-green ≠ correct — verify outward (against a real agent) AND against the old/reference implementation, not just against your own happy path.
 
+### Preserve backend authority for managed model configuration
+
+- Treat the hosted backend's managed model catalog, token limits, capabilities, and per-CLI reasoning
+  policies as authoritative. Core validates and serializes this data; it must not infer policy from
+  model names or introduce local capability tables, budget defaults, or reasoning-off fallbacks.
+- Reject missing, invalid, or unsupported required managed configuration before the affected CLI
+  request. Keep backend policy, user selection, and runtime-confirmed state distinct.
+- Apply the same policy on managed startup, switching, restart, and resume. Detect policy changes
+  even when model identity is unchanged; failed operations must not mutate persisted selection.
+- Keep external, user-configured CLI sessions independent of managed policy.
+- Require regression evidence for changed backend values, invalid configuration, denied selections,
+  policy refresh, restart/resume, failed-operation state preservation, and external CLI isolation.
+  Mock CLI tests are not evidence that a real CLI or provider accepts the resulting request.
+- Obtain explicit user approval before changing this ownership rule. Compatibility or emergency
+  fixes are not permission to restore a second source of model configuration.
+
 ## Logging
 
 When planning or changing a critical path or hard-to-observe flow, evaluate whether logging needs to change. In implementation plans for such changes, briefly state whether logs will be added, existing observability is sufficient, or logs are intentionally unnecessary. Do not add logs for simple refactors, test-only changes, UI copy/style changes, or when existing tests, errors, metrics, or logs already provide enough observability.

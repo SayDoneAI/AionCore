@@ -3069,6 +3069,9 @@ struct MockAgent {
     mode: Mutex<String>,
     model_id: Mutex<String>,
     config_options: Arc<Mutex<Vec<AcpConfigOptionDto>>>,
+    config_query_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    config_query_error: Mutex<Option<AgentError>>,
+    config_set_gate: Option<(Arc<Notify>, Arc<Notify>)>,
     set_config_option_calls: Arc<Mutex<Vec<(String, String)>>>,
     set_config_option_error: Arc<Mutex<Option<AgentError>>>,
     set_config_option_response: Arc<Mutex<Option<SetConfigOptionResponse>>>,
@@ -3108,6 +3111,9 @@ impl MockAgent {
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
             config_options: Arc::new(Mutex::new(Vec::new())),
+            config_query_gate: None,
+            config_query_error: Mutex::new(None),
+            config_set_gate: None,
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
@@ -3127,6 +3133,9 @@ impl MockAgent {
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
             config_options: Arc::new(Mutex::new(Vec::new())),
+            config_query_gate: None,
+            config_query_error: Mutex::new(None),
+            config_set_gate: None,
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
@@ -3146,6 +3155,9 @@ impl MockAgent {
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
             config_options: Arc::new(Mutex::new(Vec::new())),
+            config_query_gate: None,
+            config_query_error: Mutex::new(None),
+            config_set_gate: None,
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
@@ -3262,6 +3274,13 @@ impl IMockAgent for MockAgent {
     }
 
     async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        if let Some((started, release)) = &self.config_query_gate {
+            started.notify_one();
+            release.notified().await;
+        }
+        if let Some(error) = self.config_query_error.lock().unwrap().take() {
+            return Err(error);
+        }
         Ok(GetConfigOptionsResponse {
             config_options: self.config_options.lock().unwrap().clone(),
         })
@@ -3272,6 +3291,10 @@ impl IMockAgent for MockAgent {
             .lock()
             .unwrap()
             .push((option_id.to_owned(), value.to_owned()));
+        if let Some((started, release)) = &self.config_set_gate {
+            started.notify_one();
+            release.notified().await;
+        }
         if option_id == "mode" {
             *self.mode.lock().unwrap() = value.to_owned();
         }
@@ -4713,7 +4736,11 @@ async fn failed_managed_runtime_switch_restores_previous_acp_session_anchor() {
                 protocol: "anthropic".to_owned(),
                 base_url: "https://example.test".to_owned(),
                 api_key: "test-key".to_owned(),
-                supports_vision: None,
+                supports_vision: Some(false),
+                context_window: 32768,
+                max_output_tokens: 8192,
+                default_output_tokens: 4096,
+                reasoning_policy: Some(serde_json::json!({ "efforts": [] })),
             },
             &task_manager_dyn,
         )
@@ -4729,6 +4756,325 @@ async fn failed_managed_runtime_switch_restores_previous_acp_session_anchor() {
         Some("sess-previous"),
         "a failed model switch must not destroy the previous resume anchor"
     );
+}
+
+#[tokio::test]
+async fn managed_runtime_switch_rejects_budget_above_configured_limits() {
+    let task_manager = Arc::new(MockTaskManager::new());
+    let (service, _, _) = make_service_with_mock_task_manager(task_manager.clone());
+    let conversation = service
+        .create("user_1", make_create_req_with_backend("claude"))
+        .await
+        .unwrap();
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    for (context_window, max_output_tokens) in [(4096, 16384), (16384, 4096)] {
+        let err = service
+            .switch_managed_runtime(
+                "user_1",
+                &conversation.id,
+                aionui_api_types::SwitchManagedConversationRuntimeRequest {
+                    model: "test-model".to_owned(),
+                    backend: "claude".to_owned(),
+                    protocol: "anthropic".to_owned(),
+                    base_url: "https://example.test".to_owned(),
+                    api_key: "test-key".to_owned(),
+                    supports_vision: Some(false),
+                    context_window,
+                    max_output_tokens,
+                    default_output_tokens: 8192,
+                    reasoning_policy: Some(json!({"efforts": []})),
+                },
+                &task_manager_dyn,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConversationError::BadRequest { reason }
+            if reason == "managed runtime token budgets are invalid"));
+    }
+    assert!(task_manager.get_task(&conversation.id).is_none());
+}
+
+#[tokio::test]
+async fn managed_runtime_switch_replaces_and_clears_model_capabilities() {
+    let workspace = tempfile::tempdir().unwrap();
+    let task_manager = Arc::new(RebuildingScriptedTaskManager::new(
+        (0..5)
+            .map(|_| {
+                let mut agent = MockAgent::new("managed-test");
+                agent.workspace_override = Some(workspace.path().to_string_lossy().into_owned());
+                AgentInstance::Mock(Arc::new(agent))
+            })
+            .collect(),
+    ));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_manager_dyn.clone(),
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::with_session_id("sess-previous")),
+    );
+    let conversation = service
+        .create("user_1", make_create_req_with_backend("claude"))
+        .await
+        .unwrap();
+
+    for (context_window, max_output_tokens, default_output_tokens, supports_vision, reasoning_policy) in [
+        (
+            Some(262144),
+            Some(8192),
+            Some(4096),
+            Some(false),
+            Some(serde_json::json!({"efforts": ["low", "high"], "default_effort": "low"})),
+        ),
+        (
+            Some(1000000),
+            Some(131072),
+            Some(32768),
+            Some(true),
+            Some(serde_json::json!({"efforts": ["high"]})),
+        ),
+        (
+            Some(1000000),
+            Some(131072),
+            Some(65536),
+            Some(true),
+            Some(serde_json::json!({"efforts": ["high"]})),
+        ),
+        (
+            Some(1000000),
+            Some(131072),
+            Some(65536),
+            Some(true),
+            Some(serde_json::json!({"efforts": []})),
+        ),
+        (
+            Some(32768),
+            Some(8192),
+            Some(4096),
+            Some(false),
+            Some(json!({"efforts": []})),
+        ),
+    ] {
+        service
+            .switch_managed_runtime(
+                "user_1",
+                &conversation.id,
+                serde_json::from_value(serde_json::json!({
+                    "model": "test-model", "backend": "claude", "protocol": "anthropic",
+                    "base_url": "https://example.test", "api_key": "test-key",
+                    "supports_vision": supports_vision, "context_window": context_window,
+                    "max_output_tokens": max_output_tokens, "default_output_tokens": default_output_tokens,
+                    "reasoning_policy": reasoning_policy,
+                }))
+                .unwrap(),
+                &task_manager_dyn,
+            )
+            .await
+            .unwrap();
+        let options = task_manager.captured_options();
+        let env = &options.last().unwrap().context.runtime_env;
+        let policy_values: Vec<serde_json::Value> = env
+            .iter()
+            .filter(|(key, _)| key == "SAYDONE_MANAGED_REASONING_POLICY")
+            .map(|(_, value)| serde_json::from_str(value).unwrap())
+            .collect();
+        assert_eq!(policy_values, reasoning_policy.into_iter().collect::<Vec<_>>());
+        for (key, expected) in [
+            ("SAYDONE_MANAGED_CONTEXT_WINDOW", context_window.map(|v| v.to_string())),
+            (
+                "SAYDONE_MANAGED_MAX_OUTPUT_TOKENS",
+                max_output_tokens.map(|v| v.to_string()),
+            ),
+            (
+                "SAYDONE_MANAGED_DEFAULT_OUTPUT_TOKENS",
+                default_output_tokens.map(|v| v.to_string()),
+            ),
+            (
+                "SAYDONE_MANAGED_SUPPORTS_VISION",
+                supports_vision.map(|v| v.to_string()),
+            ),
+        ] {
+            let values: Vec<_> = env
+                .iter()
+                .filter(|(name, _)| name == key)
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert_eq!(values, expected.into_iter().collect::<Vec<_>>(), "{key}");
+        }
+    }
+    assert_eq!(task_manager.build_count(), 5);
+}
+
+#[tokio::test]
+async fn managed_runtime_switch_rejects_invalid_reasoning_before_restart() {
+    let task_manager = Arc::new(MockTaskManager::new());
+    let (service, _, _) = make_service_with_mock_task_manager(task_manager.clone());
+    let conversation = service
+        .create("user_1", make_create_req_with_backend("claude"))
+        .await
+        .unwrap();
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    for policy in [
+        serde_json::json!({"efforts": ["high", "high"]}),
+        serde_json::json!({"efforts": ["high"], "default_effort": "low"}),
+        serde_json::json!({"efforts": [], "default_effort": "high"}),
+        serde_json::json!({"efforts": ["high\n"]}),
+        serde_json::json!({"efforts": ["High"]}),
+        serde_json::json!({"efforts": [""]}),
+        serde_json::json!({"efforts": ["a".repeat(33)]}),
+        serde_json::json!({"efforts": (0..17).map(|i| format!("level{i}")).collect::<Vec<_>>()}),
+    ] {
+        let request = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "backend": "claude", "protocol": "anthropic",
+            "base_url": "https://example.test", "api_key": "test-key", "reasoning_policy": policy,
+            "supports_vision": false, "context_window": 32768,
+            "max_output_tokens": 8192, "default_output_tokens": 4096,
+        }))
+        .unwrap();
+        let error = service
+            .switch_managed_runtime("user_1", &conversation.id, request, &task_manager_dyn)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ConversationError::BadRequest { reason } if reason == "Managed CLI reasoning policy is missing or invalid")
+        );
+    }
+    assert_eq!(task_manager.kill_count(), 0);
+    assert!(task_manager.get_task(&conversation.id).is_none());
+}
+
+#[tokio::test]
+async fn managed_runtime_restore_filters_preferences_without_confirming_defaults() {
+    use aionui_ai_agent::session_context::AgentSessionKind;
+    use aionui_ai_agent::shared_kernel::ConfigKey;
+
+    for backend in ["claude", "codex", "pi"] {
+        for (policy, seed, saved, expected_seed, expected_saved) in [
+            (
+                json!({"efforts": ["low"], "default_effort": "low"}),
+                Some("high"),
+                Some("high"),
+                Some("low"),
+                None,
+            ),
+            (
+                json!({"efforts": ["low", "high"], "default_effort": "low"}),
+                Some("high"),
+                Some("high"),
+                Some("high"),
+                Some("high"),
+            ),
+            (
+                json!({"efforts": ["low"], "default_effort": "low"}),
+                None,
+                None,
+                Some("low"),
+                None,
+            ),
+            (
+                json!({"efforts": ["low", "high"], "default_effort": "low"}),
+                Some("low"),
+                Some("high"),
+                Some("low"),
+                Some("high"),
+            ),
+            (
+                json!({"efforts": ["low", "high"], "default_effort": "low"}),
+                None,
+                Some("high"),
+                Some("low"),
+                Some("high"),
+            ),
+            (
+                json!({"efforts": ["low", "high"], "default_effort": "low"}),
+                Some("high"),
+                Some("invalid-effort"),
+                Some("high"),
+                None,
+            ),
+            (json!({"efforts": ["low"]}), Some("high"), Some("high"), None, None),
+            (json!({"efforts": []}), Some("high"), Some("high"), None, None),
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let mut agent = MockAgent::new("managed-restore");
+            agent.workspace_override = Some(workspace.path().to_string_lossy().into_owned());
+            let builder = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+                agent,
+            ))]));
+            let builder_dyn: Arc<dyn IWorkerTaskManager> = builder.clone();
+            let session_repo = Arc::new(StubAcpSessionRepo::with_session_id("sess-previous"));
+            let service = ConversationService::new(
+                std::env::temp_dir(),
+                Arc::new(MockBroadcaster::new()),
+                Arc::new(FixedSkillResolver { names: vec![] }),
+                builder_dyn.clone(),
+                Arc::new(MockRepo::new()),
+                Arc::new(StubAgentMetadataRepo),
+                session_repo.clone(),
+            );
+            let mut request = make_create_req_with_backend(backend);
+            request.extra["thought_level"] = json!(seed);
+            let conversation = service.create("user_1", request).await.unwrap();
+            let keys = [
+                "effort",
+                "thought_level",
+                "reasoning_effort",
+                "thinking_budget",
+                "thinking",
+            ];
+            let mut selections = json!({"mode": "read-only"});
+            if let Some(value) = saved {
+                for key in keys {
+                    selections[key] = json!(value);
+                }
+            }
+            *session_repo.runtime_state.lock().unwrap() = Some(PersistedSessionState {
+                current_model_id: Some("managed-model".into()),
+                config_selections_json: Some(selections.to_string()),
+                ..Default::default()
+            });
+            service
+                .switch_managed_runtime(
+                    "user_1",
+                    &conversation.id,
+                    serde_json::from_value(json!({
+                        "model": "managed-model", "backend": backend,
+                        "protocol": if backend == "claude" { "anthropic" } else { "openai" },
+                        "base_url": "https://example.test", "api_key": "test-key", "reasoning_policy": policy,
+                        "supports_vision": false, "context_window": 32768,
+                        "max_output_tokens": 8192, "default_output_tokens": 4096,
+                    }))
+                    .unwrap(),
+                    &builder_dyn,
+                )
+                .await
+                .unwrap();
+            let options = builder.captured_options().pop().unwrap();
+            let AgentSessionKind::Acp(context) = &options.context.kind else {
+                panic!("expected ACP context")
+            };
+            assert_eq!(
+                context.config.thought_level.as_deref(),
+                expected_seed,
+                "{backend}/{policy}"
+            );
+            let selections = &context.session_snapshot.as_ref().unwrap().config_selections;
+            for key in keys {
+                assert_eq!(
+                    selections.get(&ConfigKey::new(key)).map(|value| value.as_str()),
+                    expected_saved,
+                    "{backend}/{key}/{policy}"
+                );
+            }
+            assert_eq!(
+                selections.get(&ConfigKey::new("mode")).map(|value| value.as_str()),
+                Some("read-only")
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -4948,6 +5294,317 @@ async fn restart_runtime_rejects_cross_user_access_without_eviction() {
     assert!(matches!(error, ConversationError::NotFound { .. }));
     assert_eq!(task_mgr.kill_count(), 0);
     assert!(task_mgr.get_task(&conv.id).is_some());
+}
+
+#[tokio::test]
+async fn managed_reasoning_selection_requires_policy_and_runtime_support() {
+    for (policy, option_id, category, available, requested, allowed) in [
+        (
+            Some(json!({"efforts": ["low"]})),
+            "effort",
+            None,
+            vec!["low", "high"],
+            "high",
+            false,
+        ),
+        (
+            Some(json!({"efforts": ["low"]})),
+            "effort",
+            None,
+            vec!["low", "high"],
+            "low",
+            true,
+        ),
+        (
+            Some(json!({"efforts": ["low"]})),
+            "reasoning_effort",
+            Some("thought_level"),
+            vec!["low", "high"],
+            "high",
+            false,
+        ),
+        (
+            Some(json!({"efforts": ["low", "high"]})),
+            "reasoning_effort",
+            Some("thought_level"),
+            vec!["low"],
+            "high",
+            false,
+        ),
+        (
+            Some(json!({"efforts": []})),
+            "thinking",
+            Some("thought_level"),
+            vec!["high"],
+            "high",
+            false,
+        ),
+        (
+            Some(json!({"efforts": ["low"]})),
+            "thinking",
+            Some("thought_level"),
+            vec!["low", "high"],
+            "high",
+            false,
+        ),
+        (
+            Some(json!({"efforts": ["low"]})),
+            "reasoning_effort",
+            None,
+            vec!["high"],
+            "high",
+            false,
+        ),
+        (
+            Some(json!({"efforts": ["low"]})),
+            "reasoning_effort",
+            Some("thought_level"),
+            vec![],
+            "low",
+            false,
+        ),
+        (
+            Some(json!({"efforts": ["low"]})),
+            "thinking",
+            Some("thought_level"),
+            vec!["low"],
+            "low",
+            true,
+        ),
+        (
+            Some(json!({"efforts": []})),
+            "mode",
+            Some("mode"),
+            vec!["read-only"],
+            "read-only",
+            true,
+        ),
+        (
+            None,
+            "reasoning_effort",
+            Some("thought_level"),
+            vec!["high"],
+            "high",
+            true,
+        ),
+    ] {
+        let workspace = tempfile::tempdir().unwrap();
+        let agent = Arc::new(
+            MockAgent::new("managed-reasoning").with_config_options(vec![AcpConfigOptionDto {
+                id: option_id.into(),
+                name: None,
+                label: None,
+                description: None,
+                category: category.map(str::to_owned),
+                option_type: "select".into(),
+                current_value: available.first().map(|value| (*value).to_owned()),
+                options: available
+                    .into_iter()
+                    .map(|value| aionui_api_types::AcpConfigSelectOptionDto {
+                        value: value.into(),
+                        name: None,
+                        label: None,
+                        description: None,
+                    })
+                    .collect(),
+            }]),
+        );
+        let mut bootstrap = MockAgent::new("bootstrap");
+        bootstrap.workspace_override = Some(workspace.path().to_string_lossy().into_owned());
+        let task_manager = Arc::new(MockTaskManager::new());
+        let task_manager_dyn: Arc<dyn IWorkerTaskManager> =
+            Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+                bootstrap,
+            ))]));
+        let service = ConversationService::new(
+            std::env::temp_dir(),
+            Arc::new(MockBroadcaster::new()),
+            Arc::new(FixedSkillResolver { names: vec![] }),
+            task_manager.clone(),
+            Arc::new(MockRepo::new()),
+            Arc::new(StubAgentMetadataRepo),
+            Arc::new(StubAcpSessionRepo::with_session_id("sess-previous")),
+        );
+        let conversation = service
+            .create("user_1", make_create_req_with_backend("claude"))
+            .await
+            .unwrap();
+        if policy.is_some() {
+            service
+                .switch_managed_runtime(
+                    "user_1",
+                    &conversation.id,
+                    serde_json::from_value(json!({
+                        "model": "managed-model", "backend": "claude", "protocol": "anthropic",
+                        "base_url": "https://example.com", "api_key": "test-key", "reasoning_policy": policy,
+                        "supports_vision": false, "context_window": 32768,
+                        "max_output_tokens": 8192, "default_output_tokens": 4096,
+                    }))
+                    .unwrap(),
+                    &task_manager_dyn,
+                )
+                .await
+                .unwrap();
+        }
+        task_manager.insert_agent(&conversation.id, AgentInstance::Mock(agent.clone()));
+        let cross_user = service
+            .set_config_option(
+                "user_2",
+                &conversation.id,
+                option_id,
+                SetConfigOptionRequest {
+                    value: requested.into(),
+                },
+            )
+            .await;
+        assert!(matches!(cross_user, Err(ConversationError::NotFound { .. })));
+        assert!(agent.set_config_option_calls.lock().unwrap().is_empty());
+        if policy.is_some() {
+            let unknown = service
+                .set_config_option(
+                    "user_1",
+                    &conversation.id,
+                    "unknown",
+                    SetConfigOptionRequest {
+                        value: requested.into(),
+                    },
+                )
+                .await;
+            assert!(
+                matches!(unknown, Err(ConversationError::BadRequest { ref reason }) if reason == "managed runtime config option is unknown")
+            );
+            assert!(agent.set_config_option_calls.lock().unwrap().is_empty());
+        }
+        let result = service
+            .set_config_option(
+                "user_1",
+                &conversation.id,
+                option_id,
+                SetConfigOptionRequest {
+                    value: requested.into(),
+                },
+            )
+            .await;
+        if allowed {
+            assert_eq!(result.unwrap().confirmation, ConfigOptionConfirmation::Observed);
+            assert_eq!(
+                agent.set_config_option_calls.lock().unwrap().as_slice(),
+                &[(option_id.into(), requested.into())]
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ConversationError::BadRequest { ref reason }) if reason == "reasoning effort is not allowed by the managed policy and runtime"),
+                "{result:?}"
+            );
+            assert!(agent.set_config_option_calls.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn managed_reasoning_discards_results_from_replaced_agents() {
+    for (during_submit, disconnected) in [(false, false), (false, true), (true, false), (true, true)] {
+        let workspace = tempfile::tempdir().unwrap();
+        let tasks = Arc::new(MockTaskManager::new());
+        let builder: Arc<dyn IWorkerTaskManager> = Arc::new(RebuildingScriptedTaskManager::new(
+            (0..2)
+                .map(|_| {
+                    let mut agent = MockAgent::new("bootstrap");
+                    agent.workspace_override = Some(workspace.path().to_string_lossy().into_owned());
+                    AgentInstance::Mock(Arc::new(agent))
+                })
+                .collect(),
+        ));
+        let service = ConversationService::new(
+            std::env::temp_dir(),
+            Arc::new(MockBroadcaster::new()),
+            Arc::new(FixedSkillResolver { names: vec![] }),
+            tasks.clone(),
+            Arc::new(MockRepo::new()),
+            Arc::new(StubAgentMetadataRepo),
+            Arc::new(StubAcpSessionRepo::with_session_id("sess-previous")),
+        );
+        let conversation = service
+            .create("user_1", make_create_req_with_backend("claude"))
+            .await
+            .unwrap();
+        let request = |model| {
+            serde_json::from_value(json!({
+                "model": model, "backend": "claude", "protocol": "anthropic",
+                "base_url": "https://example.test", "api_key": "test-key",
+                "reasoning_policy": {"efforts": ["low"]},
+                "supports_vision": false, "context_window": 32768,
+                "max_output_tokens": 8192, "default_output_tokens": 4096,
+            }))
+            .unwrap()
+        };
+        service
+            .switch_managed_runtime("user_1", &conversation.id, request("first"), &builder)
+            .await
+            .unwrap();
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut old = MockAgent::new(&conversation.id).with_config_options(vec![AcpConfigOptionDto {
+            id: "reasoning_effort".into(),
+            name: None,
+            label: None,
+            description: None,
+            category: Some("thought_level".into()),
+            option_type: "select".into(),
+            current_value: Some("low".into()),
+            options: vec![aionui_api_types::AcpConfigSelectOptionDto {
+                value: "low".into(),
+                name: None,
+                label: None,
+                description: None,
+            }],
+        }]);
+        if during_submit {
+            old.config_set_gate = Some((started.clone(), release.clone()));
+            if disconnected {
+                *old.set_config_option_error.lock().unwrap() = Some(AgentError::Acp(AcpError::NotConnected));
+            }
+        } else {
+            old.config_query_gate = Some((started.clone(), release.clone()));
+            if disconnected {
+                *old.config_query_error.lock().unwrap() = Some(AgentError::Acp(AcpError::NotConnected));
+            }
+        }
+        let old = Arc::new(old);
+        tasks.insert_agent(&conversation.id, AgentInstance::Mock(old.clone()));
+        let pending = service.set_config_option(
+            "user_1",
+            &conversation.id,
+            "reasoning_effort",
+            SetConfigOptionRequest { value: "low".into() },
+        );
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => panic!("config operation did not wait: {result:?}"),
+            _ = started.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("config operation did not start"),
+        }
+        service
+            .switch_managed_runtime("user_1", &conversation.id, request("second"), &builder)
+            .await
+            .unwrap();
+        let replacement = Arc::new(MockAgent::new(&conversation.id));
+        tasks.insert_agent(&conversation.id, AgentInstance::Mock(replacement.clone()));
+        release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(2), pending).await.unwrap();
+        assert!(
+            matches!(result, Err(ConversationError::Busy { ref reason }) if reason == "runtime changed while configuring agent"),
+            "{result:?}"
+        );
+        assert_eq!(
+            old.set_config_option_calls.lock().unwrap().len(),
+            usize::from(during_submit)
+        );
+        assert_eq!(tasks.kill_count(), 0);
+        assert!(
+            matches!(tasks.get_task(&conversation.id), Some(AgentInstance::Mock(current)) if Arc::ptr_eq(&current, &(replacement as Arc<dyn IMockAgent>)))
+        );
+    }
 }
 
 #[tokio::test]
