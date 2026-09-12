@@ -30,6 +30,51 @@ pub struct ProjectService {
 }
 
 impl ProjectService {
+    /// Open a picker path or an owned explorer directory, without a conversation.
+    pub async fn open_folder(
+        &self,
+        user_id: &str,
+        folder: aionui_api_types::ChatFileRef,
+    ) -> Result<(ProjectDetail, String), ProjectError> {
+        let path = match folder {
+            aionui_api_types::ChatFileRef::Local { path } => {
+                if !Path::new(&path).is_absolute() {
+                    return Err(ProjectError::WorkspaceMissing);
+                }
+                path
+            }
+            aionui_api_types::ChatFileRef::Project { pe_id, relative_path } => {
+                let resolved = self
+                    .resolve_reference(
+                        user_id,
+                        ReferenceInput {
+                            pe_id,
+                            relative_path,
+                            op: crate::types::FileOp::Browse,
+                        },
+                    )
+                    .await?;
+                let root = canonical::uri_to_path(&resolved.root_resource_uri)?;
+                let path = resolved.absolute_path.ok_or(ProjectError::WorkspaceMissing)?;
+                let root = std::fs::canonicalize(root).map_err(|_| ProjectError::WorkspaceMissing)?;
+                let target = std::fs::canonicalize(&path).map_err(|_| ProjectError::WorkspaceMissing)?;
+                if !target.starts_with(root) {
+                    return Err(ProjectError::ResourceOutsideFolder {
+                        relative_path: resolved.relative_path,
+                    });
+                }
+                target.to_string_lossy().into_owned()
+            }
+            aionui_api_types::ChatFileRef::Upload { .. } => return Err(ProjectError::WorkspaceMissing),
+        };
+        let uri = canonical::to_file_uri(Path::new(&path))?;
+        let opened = self.create_standard(user_id, uri).await?;
+        let workspace = canonical::uri_to_path(&opened.folder.resource_uri)?
+            .to_string_lossy()
+            .into_owned();
+        Ok((self.get_project(user_id, &opened.project.project_id).await?, workspace))
+    }
+
     pub fn new(store: Arc<dyn IProjectStore>, temp_root: PathBuf) -> Self {
         Self {
             store,

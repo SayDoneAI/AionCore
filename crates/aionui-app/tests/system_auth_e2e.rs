@@ -9,6 +9,33 @@ use tower::ServiceExt;
 use common::{body_json, build_app, get_request};
 
 #[tokio::test]
+async fn open_project_requires_auth_and_csrf() {
+    let (mut app, services) = build_app().await;
+    let csrf = "project-open-csrf";
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/projects/open")
+        .header("x-csrf-token", csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["code"], "UNAUTHORIZED");
+
+    let (token, _) = common::setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/projects/open")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "CSRF_INVALID");
+}
+
+#[tokio::test]
 async fn auth_required_get_settings() {
     let (app, _) = build_app().await;
     let resp = app.oneshot(get_request("/api/settings")).await.unwrap();

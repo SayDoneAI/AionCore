@@ -78,6 +78,183 @@ fn folders_url(project_id: &str) -> String {
     format!("/api/projects/{project_id}/folders")
 }
 
+#[tokio::test]
+async fn open_folder_reuses_project_without_creating_conversations() {
+    let (router, project_id, pe_id, dir, db) = setup().await;
+    for _ in 0..2 {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/api/projects/open",
+            Some(json!({
+                "folder": {"kind": "local", "path": dir.path()}
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["data"]["project"]["project_id"], project_id);
+        assert_eq!(body["data"]["project"]["explorer"]["workspace_pe_id"], pe_id);
+        assert_eq!(body["data"]["workspace"], dir.path().to_string_lossy().as_ref());
+    }
+    use aionui_db::ISidebarStore;
+    let sidebar = aionui_db::SqliteSidebarStore::new(db.pool().clone());
+    let conversations = sidebar
+        .list_conversations_thin("system_default_user", aionui_db::ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert!(conversations.is_empty());
+}
+
+#[tokio::test]
+async fn open_folder_accepts_owned_subdirectory_reference() {
+    let (router, _, pe_id, dir, _db) = setup().await;
+    let child = dir.path().join("My Folder");
+    std::fs::create_dir(&child).unwrap();
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/projects/open",
+        Some(json!({
+            "folder": {"kind": "project", "pe_id": pe_id, "relative_path": "My Folder"}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["workspace"],
+        std::fs::canonicalize(child).unwrap().to_string_lossy().as_ref()
+    );
+}
+
+#[tokio::test]
+async fn open_folder_rejects_malformed_requests() {
+    let (router, _, _, _dir, _db) = setup().await;
+    for payload in [json!({}), json!({"folder": 42}), json!({"folder": {"kind": "unknown"}})] {
+        let (status, body) = send(&router, "POST", "/api/projects/open", Some(payload)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], "BAD_REQUEST");
+    }
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/projects/open")
+                .header("content-type", "application/json")
+                .body(Body::from(" ".repeat(2 * 1024 * 1024 + 1)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["code"], "PAYLOAD_TOO_LARGE");
+}
+
+#[tokio::test]
+async fn open_folder_rejects_non_directories_and_unsupported_refs() {
+    let (router, _, _, dir, _db) = setup().await;
+    let file = dir.path().join("readme.md");
+    std::fs::write(&file, "text").unwrap();
+    for (folder, expected_status, code) in [
+        (
+            json!({"kind": "local", "path": "relative"}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            json!({"kind": "local", "path": file}),
+            StatusCode::BAD_REQUEST,
+            "folder_not_directory",
+        ),
+        (
+            json!({"kind": "local", "path": dir.path().join("missing")}),
+            StatusCode::NOT_FOUND,
+            "folder_not_found",
+        ),
+        (
+            json!({"kind": "upload", "path": dir.path()}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+    ] {
+        let (status, body) = send(&router, "POST", "/api/projects/open", Some(json!({"folder": folder}))).await;
+        assert_eq!(status, expected_status);
+        assert_eq!(body["code"], code);
+    }
+}
+
+#[tokio::test]
+async fn open_folder_rejects_unowned_entry_and_parent_traversal() {
+    let (router, _, pe_id, _dir, _db) = setup().await;
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/projects/open",
+        Some(json!({
+            "folder": {"kind": "project", "pe_id": "foreign-entry", "relative_path": ""}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "project_explorer_not_found");
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/projects/open",
+        Some(json!({
+            "folder": {"kind": "project", "pe_id": pe_id, "relative_path": "../"}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_resource");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_folder_rejects_symlink_escape() {
+    let (router, _, pe_id, dir, _db) = setup().await;
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/projects/open",
+        Some(json!({
+            "folder": {"kind": "project", "pe_id": pe_id, "relative_path": "escape"}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_resource");
+}
+
+#[tokio::test]
+async fn open_folder_rejects_another_users_real_entry() {
+    let (_, _, pe_id, _dir, db) = setup().await;
+    let store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(db.pool().clone()));
+    let service = Arc::new(ProjectService::new(store, std::env::temp_dir()));
+    let router =
+        project_routes(ProjectRouterState { project: service }).layer(axum::Extension(aionui_auth::CurrentUser {
+            id: "another-user".to_owned(),
+            username: "another-user".to_owned(),
+            user_type: aionui_db::UserType::Local,
+            status: aionui_db::UserStatus::Active,
+        }));
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/api/projects/open",
+        Some(json!({
+            "folder": {"kind": "project", "pe_id": pe_id, "relative_path": ""}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "project_explorer_not_found");
+}
+
 /// Render the `From<ProjectError> for ApiError` wire mapping to `(status,
 /// body)`. These errors are produced by `resolve_chat_message` (called from
 /// conversation/team), not by any route in this crate's router, so the mapping

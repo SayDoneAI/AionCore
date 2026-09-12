@@ -19,8 +19,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest,
-    ResolveRefResponse,
+    ApiResponse, AttachFolderRequest, OpenProjectRequest, OpenProjectResponse, ProjectDetailResponse, ProjectEntry,
+    ProjectExplorer, ResolveRefRequest, ResolveRefResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -46,11 +46,26 @@ pub struct ProjectRouterState {
 /// All routes require authentication (applied by the caller).
 pub fn project_routes(state: ProjectRouterState) -> Router {
     Router::new()
+        .route("/api/projects/open", post(open_project))
         .route("/api/projects/{project_id}", get(get_project))
         .route("/api/projects/{project_id}/folders", post(attach_folder))
         .route("/api/projects/{project_id}/folders/{pe_id}", delete(remove_folder))
         .route("/api/projects/{project_id}/resolve-ref", post(resolve_ref))
         .with_state(state)
+}
+
+/// Open a directory as a project without starting an agent or conversation.
+async fn open_project(
+    State(state): State<ProjectRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<OpenProjectRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<OpenProjectResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let (detail, workspace) = state.project.open_folder(&user.id, req.folder).await?;
+    Ok(Json(ApiResponse::ok(OpenProjectResponse {
+        project: to_detail_response(detail),
+        workspace,
+    })))
 }
 
 /// `GET /api/projects/{project_id}` — full project detail + all roots in one

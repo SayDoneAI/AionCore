@@ -14,6 +14,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::chat_file::ChatFileRef;
 
+/// Open an existing folder without creating a conversation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenProjectRequest {
+    pub folder: ChatFileRef,
+}
+
+/// Project identity for browsing and the validated path for a new chat draft.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenProjectResponse {
+    pub project: ProjectDetailResponse,
+    pub workspace: String,
+}
+
 /// Aggregated project detail — everything the explorer needs in one call,
 /// so the frontend never fans out one request per root.
 #[derive(Debug, Clone, Serialize, Deserialize)]
