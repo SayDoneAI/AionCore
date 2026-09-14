@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::constants::{WEIXIN_MAX_BACKOFF, WEIXIN_POLL_TIMEOUT};
 use crate::error::ChannelError;
-use crate::plugin::{ChannelPlugin, PluginCallbacks};
+use crate::plugin::{ChannelPlugin, PluginCallbacks, PluginCredentialUpdate};
 use crate::types::{
     BotInfo, MessageContentType, PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessage, UnifiedMessageContent,
     UnifiedOutgoingMessage, UnifiedUser,
@@ -20,6 +20,9 @@ use super::types::{ITEM_TYPE_TEXT, ITEM_TYPE_VOICE, WeixinRawItem, WeixinRawMess
 
 /// Default base URL for the iLink Bot API.
 const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+const CONTEXT_TOKENS_CONFIG_KEY: &str = "context_tokens";
+const POLL_STATE_CONFIG_KEY: &str = "poll_state";
+const POLL_CURSOR_ENTRY_KEY: &str = "get_updates_buf";
 
 /// WeChat (iLink Bot) platform plugin.
 ///
@@ -60,6 +63,12 @@ impl WeixinPlugin {
 impl ChannelPlugin for WeixinPlugin {
     async fn initialize(&mut self, config: PluginConfig, callbacks: PluginCallbacks) -> Result<(), ChannelError> {
         self.status = PluginStatus::Initializing;
+        let initial_poll_cursor = configured_poll_cursor(&config);
+
+        self.context_tokens.clear();
+        for (chat_id, token) in configured_context_tokens(&config) {
+            self.context_tokens.insert(chat_id, token);
+        }
 
         let bot_token = config
             .credentials
@@ -116,11 +125,14 @@ impl ChannelPlugin for WeixinPlugin {
 
         let api_clone = Arc::clone(self.api.as_ref().expect("api just set"));
         let context_tokens = Arc::clone(&self.context_tokens);
+        let credential_update_tx = callbacks.credential_update_tx;
         self.poll_handle = Some(tokio::spawn(poll_loop(
             api_clone,
             callbacks.message_tx,
             shutdown_rx,
             context_tokens,
+            credential_update_tx,
+            initial_poll_cursor,
         )));
 
         self.status = PluginStatus::Ready;
@@ -159,10 +171,13 @@ impl ChannelPlugin for WeixinPlugin {
             .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
 
         let text = message.text.as_deref().unwrap_or("").to_string();
-        let context_token = self.context_tokens.get(chat_id).map(|v| v.clone());
+        let context_token = self
+            .context_tokens
+            .get(chat_id)
+            .map(|value| value.clone())
+            .ok_or_else(|| ChannelError::MessageSendFailed("微信主动发送需要用户先向机器人发送一条消息。".into()))?;
 
-        api.send_message(chat_id, &text, context_token.as_deref()).await?;
-        Ok(String::new())
+        api.send_message(chat_id, &text, Some(&context_token)).await
     }
 
     /// WeChat does not support editing messages.
@@ -197,6 +212,50 @@ impl ChannelPlugin for WeixinPlugin {
     }
 }
 
+fn configured_context_tokens(config: &PluginConfig) -> Vec<(String, String)> {
+    config
+        .credentials
+        .extra
+        .get(CONTEXT_TOKENS_CONFIG_KEY)
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(chat_id, value)| {
+            value
+                .as_str()
+                .filter(|token| !token.is_empty())
+                .map(|token| (chat_id.clone(), token.to_owned()))
+        })
+        .collect()
+}
+
+fn configured_poll_cursor(config: &PluginConfig) -> String {
+    config
+        .credentials
+        .extra
+        .get(POLL_STATE_CONFIG_KEY)
+        .and_then(serde_json::Value::as_object)
+        .and_then(|state| state.get(POLL_CURSOR_ENTRY_KEY))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+async fn persist_poll_cursor(
+    credential_update_tx: Option<&tokio::sync::mpsc::Sender<PluginCredentialUpdate>>,
+    cursor: &str,
+) {
+    if let Some(tx) = credential_update_tx {
+        let _ = tx
+            .send(PluginCredentialUpdate {
+                map_key: POLL_STATE_CONFIG_KEY.to_owned(),
+                entry_key: POLL_CURSOR_ENTRY_KEY.to_owned(),
+                value: serde_json::Value::String(cursor.to_owned()),
+            })
+            .await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Long-polling loop (buffer-based protocol)
 // ---------------------------------------------------------------------------
@@ -206,8 +265,10 @@ async fn poll_loop(
     message_tx: tokio::sync::mpsc::Sender<UnifiedIncomingMessage>,
     mut shutdown_rx: watch::Receiver<bool>,
     context_tokens: Arc<DashMap<String, String>>,
+    credential_update_tx: Option<tokio::sync::mpsc::Sender<PluginCredentialUpdate>>,
+    initial_poll_cursor: String,
 ) {
-    let mut buf = String::new();
+    let mut buf = initial_poll_cursor;
     let mut consecutive_failures: u32 = 0;
 
     loop {
@@ -222,17 +283,26 @@ async fn poll_loop(
         let outcome: Result<(), String> = match api.get_updates(&buf).await {
             Ok(resp) => {
                 let is_api_error = resp.ret.unwrap_or(0) != 0 || resp.errcode.unwrap_or(0) != 0;
-                if is_api_error {
+                let cursor_expired = resp.ret == Some(-14) || resp.errcode == Some(-14);
+                if cursor_expired {
+                    buf.clear();
+                    persist_poll_cursor(credential_update_tx.as_ref(), &buf).await;
+                    info!("WeChat poll cursor expired; reset persisted cursor");
+                    Ok(())
+                } else if is_api_error {
                     Err(format!(
                         "getupdates API error ret={:?} errcode={:?}",
                         resp.ret, resp.errcode
                     ))
                 } else {
-                    if let Some(new_buf) = resp.get_updates_buf {
+                    if let Some(new_buf) = resp.get_updates_buf
+                        && new_buf != buf
+                    {
                         buf = new_buf;
+                        persist_poll_cursor(credential_update_tx.as_ref(), &buf).await;
                     }
                     for msg in resp.msgs.unwrap_or_default() {
-                        handle_message(&msg, &message_tx, &context_tokens).await;
+                        handle_message(&msg, &message_tx, &context_tokens, credential_update_tx.as_ref()).await;
                     }
                     Ok(())
                 }
@@ -322,6 +392,7 @@ async fn handle_message(
     msg: &WeixinRawMessage,
     message_tx: &tokio::sync::mpsc::Sender<UnifiedIncomingMessage>,
     context_tokens: &DashMap<String, String>,
+    credential_update_tx: Option<&tokio::sync::mpsc::Sender<PluginCredentialUpdate>>,
 ) {
     let from_user_id = match &msg.from_user_id {
         Some(id) if !id.is_empty() => id.clone(),
@@ -333,6 +404,15 @@ async fn handle_message(
         && !ctx.is_empty()
     {
         context_tokens.insert(from_user_id.clone(), ctx.clone());
+        if let Some(tx) = credential_update_tx {
+            let _ = tx
+                .send(PluginCredentialUpdate {
+                    map_key: CONTEXT_TOKENS_CONFIG_KEY.to_owned(),
+                    entry_key: from_user_id.clone(),
+                    value: serde_json::Value::String(ctx.clone()),
+                })
+                .await;
+        }
     }
 
     let items = msg.item_list.as_deref().unwrap_or_default();
@@ -348,9 +428,17 @@ async fn handle_message(
         from_user_id.clone()
     };
 
+    let reply_to_message_id = extract_reply_to_message_id(items);
+    let quoted_text = extract_quoted_reply_text(items);
+    let message_id = msg
+        .msg_id
+        .clone()
+        .or_else(|| msg.context_token.clone())
+        .unwrap_or_default();
+
     let unified = UnifiedIncomingMessage {
         owner_user_id: None,
-        id: msg.msg_id.clone().unwrap_or_default(),
+        id: message_id,
         platform: PluginType::Weixin,
         chat_id: from_user_id.clone(),
         user: UnifiedUser {
@@ -365,12 +453,45 @@ async fn handle_message(
             attachments: None,
         },
         timestamp: chrono_now(),
-        reply_to_message_id: None,
+        reply_to_message_id,
         action: None,
-        raw: None,
+        raw: quoted_text.map(|quoted_text| serde_json::json!({ "quoted_text": quoted_text })),
     };
 
     let _ = message_tx.send(unified).await;
+}
+
+/// Extract the message ID referenced by a WeChat quoted reply.
+///
+/// WeChat places quoted metadata in `item_list[*].ref_msg`; the nested
+/// `message_item.msg_id` is the ID of the bot message that was sent earlier
+/// and therefore the key needed to resume its channel session.
+fn extract_reply_to_message_id(items: &[WeixinRawItem]) -> Option<String> {
+    items.iter().find_map(|item| {
+        let reference = item.ref_msg.as_ref()?;
+        let message_item = reference.message_item.as_ref()?;
+        message_item
+            .msg_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn extract_quoted_reply_text(items: &[WeixinRawItem]) -> Option<String> {
+    items.iter().find_map(|item| {
+        let reference = item.ref_msg.as_ref()?;
+        reference
+            .message_item
+            .as_ref()
+            .and_then(|message| message.text_item.as_ref())
+            .and_then(|text| text.text.as_deref())
+            .or(reference.title.as_deref())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 /// Extract text content from item_list.
@@ -556,6 +677,68 @@ mod tests {
         assert!(!has_media);
     }
 
+    #[test]
+    fn extract_quoted_reply_message_id() {
+        let items = vec![WeixinRawItem {
+            ref_msg: Some(super::super::types::WeixinRefMessage {
+                message_item: Some(super::super::types::WeixinRefMessageItem {
+                    msg_id: Some("  bot-route-42  ".into()),
+                    text_item: None,
+                }),
+                title: None,
+            }),
+            ..Default::default()
+        }];
+        assert_eq!(extract_reply_to_message_id(&items).as_deref(), Some("bot-route-42"));
+    }
+
+    #[test]
+    fn extract_quoted_reply_ignores_blank_ids() {
+        let items = vec![WeixinRawItem {
+            ref_msg: Some(super::super::types::WeixinRefMessage {
+                message_item: Some(super::super::types::WeixinRefMessageItem {
+                    msg_id: Some("   ".into()),
+                    text_item: None,
+                }),
+                title: None,
+            }),
+            ..Default::default()
+        }];
+        assert_eq!(extract_reply_to_message_id(&items), None);
+    }
+
+    #[test]
+    fn extract_quoted_reply_text_prefers_nested_message_text() {
+        let items = vec![WeixinRawItem {
+            ref_msg: Some(super::super::types::WeixinRefMessage {
+                message_item: Some(super::super::types::WeixinRefMessageItem {
+                    msg_id: Some("bot-route-42".into()),
+                    text_item: Some(super::super::types::TextItem {
+                        text: Some("  nested answer  ".into()),
+                    }),
+                }),
+                title: Some("fallback title".into()),
+            }),
+            ..Default::default()
+        }];
+        assert_eq!(extract_quoted_reply_text(&items).as_deref(), Some("nested answer"));
+    }
+
+    #[test]
+    fn extract_quoted_reply_text_falls_back_to_reference_title() {
+        let items = vec![WeixinRawItem {
+            ref_msg: Some(super::super::types::WeixinRefMessage {
+                message_item: Some(super::super::types::WeixinRefMessageItem {
+                    msg_id: Some("bot-route-42".into()),
+                    text_item: None,
+                }),
+                title: Some("  quoted answer  ".into()),
+            }),
+            ..Default::default()
+        }];
+        assert_eq!(extract_quoted_reply_text(&items).as_deref(), Some("quoted answer"));
+    }
+
     // -- WeixinPlugin constructor -----------------------------------------------
 
     #[test]
@@ -602,6 +785,95 @@ mod tests {
         assert_eq!(plugin.status(), PluginStatus::Error);
     }
 
+    #[tokio::test]
+    async fn inbound_context_token_is_cached_and_emitted_for_encrypted_persistence() {
+        let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1);
+        let (credential_tx, mut credential_rx) = tokio::sync::mpsc::channel(1);
+        let context_tokens = DashMap::new();
+        let message = WeixinRawMessage {
+            from_user_id: Some("chat-1".into()),
+            context_token: Some("context-secret".into()),
+            msg_id: Some("message-1".into()),
+            item_list: Some(vec![make_text_item("你好")]),
+        };
+
+        handle_message(&message, &message_tx, &context_tokens, Some(&credential_tx)).await;
+
+        assert_eq!(
+            context_tokens.get("chat-1").map(|value| value.value().clone()),
+            Some("context-secret".into())
+        );
+        let update = credential_rx.recv().await.unwrap();
+        assert_eq!(update.map_key, CONTEXT_TOKENS_CONFIG_KEY);
+        assert_eq!(update.entry_key, "chat-1");
+        assert_eq!(update.value, serde_json::json!("context-secret"));
+        let incoming = message_rx.recv().await.unwrap();
+        assert!(incoming.raw.is_none());
+    }
+
+    #[tokio::test]
+    async fn proactive_send_without_context_stops_before_the_http_request() {
+        let mut plugin = WeixinPlugin::new();
+        plugin.api = Some(Arc::new(WeixinApi::new(Client::new(), "http://127.0.0.1:9", "token")));
+        let error = plugin
+            .send_message(
+                "chat-without-context",
+                UnifiedOutgoingMessage {
+                    message_type: crate::types::OutgoingMessageType::Text,
+                    text: Some("桌面消息".into()),
+                    parse_mode: None,
+                    buttons: None,
+                    keyboard: None,
+                    image_url: None,
+                    file_url: None,
+                    file_name: None,
+                    media_actions: None,
+                    reply_to_message_id: None,
+                    silent: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("需要用户先向机器人发送一条消息"));
+    }
+
+    #[test]
+    fn persisted_context_tokens_are_restored_from_plugin_config() {
+        let mut config = make_config(Some("token"), Some("account"));
+        config.credentials.extra.insert(
+            CONTEXT_TOKENS_CONFIG_KEY.into(),
+            serde_json::json!({ "chat-1": "context-persisted", "empty": "" }),
+        );
+
+        assert_eq!(
+            configured_context_tokens(&config),
+            vec![("chat-1".into(), "context-persisted".into())]
+        );
+    }
+
+    #[test]
+    fn persisted_poll_cursor_is_restored_from_plugin_config() {
+        let mut config = make_config(Some("token"), Some("account"));
+        config.credentials.extra.insert(
+            POLL_STATE_CONFIG_KEY.into(),
+            serde_json::json!({ POLL_CURSOR_ENTRY_KEY: "cursor-persisted" }),
+        );
+
+        assert_eq!(configured_poll_cursor(&config), "cursor-persisted");
+    }
+
+    #[tokio::test]
+    async fn poll_cursor_update_uses_encrypted_credential_persistence_channel() {
+        let (credential_tx, mut credential_rx) = tokio::sync::mpsc::channel(1);
+
+        persist_poll_cursor(Some(&credential_tx), "cursor-next").await;
+
+        let update = credential_rx.recv().await.unwrap();
+        assert_eq!(update.map_key, POLL_STATE_CONFIG_KEY);
+        assert_eq!(update.entry_key, POLL_CURSOR_ENTRY_KEY);
+        assert_eq!(update.value, serde_json::json!("cursor-next"));
+    }
+
     // -- Test helpers -----------------------------------------------------------
 
     fn make_text_item(text: &str) -> WeixinRawItem {
@@ -636,6 +908,10 @@ mod tests {
     fn make_callbacks() -> PluginCallbacks {
         let (message_tx, _) = tokio::sync::mpsc::channel(16);
         let (confirm_tx, _) = tokio::sync::mpsc::channel(16);
-        PluginCallbacks { message_tx, confirm_tx }
+        PluginCallbacks {
+            message_tx,
+            confirm_tx,
+            credential_update_tx: None,
+        }
     }
 }

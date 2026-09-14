@@ -836,6 +836,61 @@ mod tests {
         assert_eq!(fk_table, "conversations");
     }
 
+    #[tokio::test]
+    async fn legacy_channel_routes_are_backfilled_for_reply_routing() {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool();
+        let user_id: String = sqlx::query_scalar("SELECT id FROM users ORDER BY created_at LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let extra = serde_json::json!({
+            "channelRoutes": {
+                "entries": [{
+                    "platform": "weixin",
+                    "chatId": "chat-1",
+                    "messageIds": ["message-new", "message-old"],
+                    "messageTimestamps": [2000, 1000],
+                    "previewTexts": ["你：新问题\n\nAI：新回答", "你：旧问题\n\nAI：旧回答"],
+                    "updatedAt": 3000
+                }]
+            }
+        });
+        sqlx::query(
+            "INSERT INTO conversations \
+             (id, user_id, name, type, extra, status, source, channel_chat_id, created_at, updated_at) \
+             VALUES ('legacy-route-conversation', ?, 'legacy', 'acp', ?, 'finished', 'weixin', 'chat-1', 1, 3000)",
+        )
+        .bind(&user_id)
+        .bind(extra.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/044_backfill_channel_conversation_routes.sql"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let rows = sqlx::query_as::<_, (String, String, i64)>(
+            "SELECT message_id, preview_text, sent_at FROM channel_conversation_routes \
+             WHERE owner_user_id = ? AND conversation_id = 'legacy-route-conversation' ORDER BY sent_at DESC",
+        )
+        .bind(&user_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("message-new".into(), "你：新问题\n\nAI：新回答".into(), 2000),
+                ("message-old".into(), "你：旧问题\n\nAI：旧回答".into(), 1000),
+            ]
+        );
+    }
+
     #[test]
     fn migrations_table_unique_conflict_detected_from_message() {
         // Build the same Execute(sqlx::Error) shape that surfaces when two

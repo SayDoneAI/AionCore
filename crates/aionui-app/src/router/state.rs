@@ -195,6 +195,8 @@ pub struct ChannelOrchestratorComponents {
     pub manager: Arc<aionui_channel::manager::ChannelManager>,
     pub plugin_factory: Arc<aionui_channel::manager::PluginFactory>,
     pub owner_user_id: Option<String>,
+    pub mirror_service: Arc<aionui_channel::orchestrator::ChannelMirrorService>,
+    pub mirror_event_rx: tokio::sync::broadcast::Receiver<aionui_api_types::WebSocketMessage<serde_json::Value>>,
 }
 
 /// Build all default `ModuleStates` from application services.
@@ -713,15 +715,72 @@ fn build_channel_settings_service(
     Arc::new(service)
 }
 
+struct DesktopManagedRuntimePreparer {
+    client: reqwest::Client,
+    endpoint: reqwest::Url,
+    token: String,
+}
+
+impl DesktopManagedRuntimePreparer {
+    fn from_env() -> Option<Self> {
+        let raw_url = std::env::var("SAYDONE_CHANNEL_RUNTIME_BROKER_URL").ok()?;
+        let token = std::env::var("SAYDONE_CHANNEL_RUNTIME_BROKER_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty())?;
+        let mut endpoint = reqwest::Url::parse(raw_url.trim()).ok()?;
+        let is_loopback = endpoint
+            .host_str()
+            .is_some_and(|host| matches!(host, "127.0.0.1" | "::1" | "localhost"));
+        if endpoint.scheme() != "http" || !is_loopback {
+            tracing::warn!("channel managed runtime broker rejected: endpoint must use loopback HTTP");
+            return None;
+        }
+        endpoint.set_path("/runtime/prepare");
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        Some(Self {
+            client: reqwest::Client::new(),
+            endpoint,
+            token,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_channel::message_service::ChannelManagedRuntimePreparer for DesktopManagedRuntimePreparer {
+    async fn prepare(&self, conversation_id: &str, backend: &str, model: &str) -> Result<(), String> {
+        let response = self
+            .client
+            .post(self.endpoint.clone())
+            .header("x-saydone-managed-runtime-token", &self.token)
+            .json(&serde_json::json!({
+                "conversation_id": conversation_id,
+                "backend": backend,
+                "model": model,
+            }))
+            .send()
+            .await
+            .map_err(|error| format!("无法连接 SayDoneAI 运行时服务：{error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("SayDoneAI 运行时服务返回状态 {}", response.status().as_u16()));
+        }
+        Ok(())
+    }
+}
+
 async fn build_channel_message_service(
     services: &AppServices,
     channel_settings: Arc<aionui_channel::channel_settings::ChannelSettingsService>,
 ) -> Arc<aionui_channel::message_service::ChannelMessageService> {
-    Arc::new(aionui_channel::message_service::ChannelMessageService::new(
+    let mut service = aionui_channel::message_service::ChannelMessageService::new(
         Arc::new(services.conversation_service.clone()),
         services.worker_task_manager.clone(),
         channel_settings,
-    ))
+    );
+    if let Some(preparer) = DesktopManagedRuntimePreparer::from_env() {
+        service = service.with_managed_runtime_preparer(Arc::new(preparer));
+    }
+    Arc::new(service)
 }
 
 async fn startup_channel_owner_user_id(services: &AppServices) -> Option<String> {
@@ -787,11 +846,18 @@ pub async fn build_channel_state(
 
     let message_service = build_channel_message_service(services, Arc::clone(&channel_settings)).await;
 
+    let mirror_service = Arc::new(aionui_channel::orchestrator::ChannelMirrorService::new(
+        repo.clone(),
+        services.conversation_repo.clone(),
+        manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
+    ));
+
     let orchestrator = aionui_channel::orchestrator::ChannelOrchestrator::new(
         action_executor,
         message_service,
         Arc::clone(&session_manager),
         manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
+        Arc::clone(&mirror_service),
     );
 
     let state = ChannelRouterState {
@@ -811,6 +877,8 @@ pub async fn build_channel_state(
         manager,
         plugin_factory,
         owner_user_id: startup_owner_user_id,
+        mirror_service,
+        mirror_event_rx: services.event_bus.subscribe(),
     };
 
     (state, components)

@@ -908,11 +908,11 @@ async fn qr_login_page() -> Html<&'static str> {
 }
 
 const QR_LOGIN_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QR Login - AionUI</title>
+<title>SayDoneAI 二维码登录</title>
 <style>
   body { font-family: system-ui, sans-serif; display: flex; justify-content: center;
          align-items: center; min-height: 100vh; margin: 0; background: #f5f5f5; }
@@ -925,8 +925,8 @@ const QR_LOGIN_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
 <div class="card">
-  <h1>AionUI</h1>
-  <p id="status" class="status">Processing login...</p>
+  <h1>SayDoneAI</h1>
+  <p id="status" class="status">正在登录...</p>
 </div>
 <script>
 (function() {
@@ -934,28 +934,28 @@ const QR_LOGIN_HTML: &str = r#"<!DOCTYPE html>
   var params = new URLSearchParams(window.location.search);
   var token = params.get('token');
   if (!token) {
-    el.textContent = 'Error: No token provided';
+    el.textContent = '登录失败：缺少登录凭证';
     el.className = 'status error';
     return;
   }
-  fetch('/api/auth/qr-login', {
+  fetch('./api/auth/qr-login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ qrToken: token })
+    body: JSON.stringify({ qr_token: token })
   })
   .then(function(r) { return r.json(); })
   .then(function(data) {
     if (data.success) {
-      el.textContent = 'Login successful! Redirecting...';
+      el.textContent = '登录成功，正在跳转...';
       el.className = 'status success';
-      setTimeout(function() { window.location.href = '/'; }, 1000);
+      setTimeout(function() { window.location.href = './'; }, 1000);
     } else {
-      el.textContent = 'Login failed: ' + (data.error || 'Unknown error');
+      el.textContent = '登录失败：' + (data.error || '未知错误');
       el.className = 'status error';
     }
   })
   .catch(function(err) {
-    el.textContent = 'Error: ' + err.message;
+    el.textContent = '登录失败：' + err.message;
     el.className = 'status error';
   });
 })();

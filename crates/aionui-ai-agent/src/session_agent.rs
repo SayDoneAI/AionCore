@@ -462,7 +462,34 @@ impl SessionAgentTask {
         prompt_dump: Option<SessionPromptDump>,
         broadcaster: Option<Arc<dyn EventBroadcaster>>,
     ) -> Arc<Self> {
-        Self::build(
+        Self::new_with_preload_and_effort(
+            agent_type,
+            conversation_id,
+            user_id,
+            workspace,
+            backend,
+            session_repo,
+            handshake,
+            None,
+            prompt_dump,
+            broadcaster,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_preload_and_effort(
+        agent_type: AgentType,
+        conversation_id: String,
+        user_id: String,
+        workspace: String,
+        backend: Arc<dyn SessionBackend>,
+        session_repo: Option<Arc<dyn IAcpSessionRepository>>,
+        handshake: &aionui_api_types::AgentHandshake,
+        initial_effort: Option<String>,
+        prompt_dump: Option<SessionPromptDump>,
+        broadcaster: Option<Arc<dyn EventBroadcaster>>,
+    ) -> Arc<Self> {
+        let task = Self::build(
             agent_type,
             conversation_id,
             user_id,
@@ -472,7 +499,11 @@ impl SessionAgentTask {
             CatalogPreload::from_handshake(handshake),
             prompt_dump,
             broadcaster,
-        )
+        );
+        if let Some(effort) = initial_effort {
+            task.runtime.set_effort_override(effort);
+        }
+        task
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2035,6 +2066,7 @@ pub async fn build_session_instance(
     // is discovered) and drops it if unsupported — the same clear_invalid_desired_*
     // semantics as the codex model/mode reconcile. Best-effort: a dispatch failure must
     // not fail the open (the session is usable; only the persisted effort is lost).
+    let mut applied_effort = None;
     if let Some(effort) = persisted_effort {
         if let Err(e) = backend
             .dispatch(Command::SetConfigOption {
@@ -2046,6 +2078,7 @@ pub async fn build_session_instance(
             tracing::warn!(conv_id = %conversation_id, effort = %effort, error = %e, "session-port: re-applying persisted effort failed (session usable, effort not restored)");
         } else {
             tracing::info!(conv_id = %conversation_id, effort = %effort, "session-port: re-applied persisted reasoning effort after open");
+            applied_effort = Some(effort);
         }
     }
 
@@ -2062,7 +2095,7 @@ pub async fn build_session_instance(
         backend: if backend_label == "claude" { "claude" } else { "codex" },
     });
 
-    let task = SessionAgentTask::new_with_preload(
+    let task = SessionAgentTask::new_with_preload_and_effort(
         AgentType::Acp,
         conversation_id,
         user_id,
@@ -2070,6 +2103,7 @@ pub async fn build_session_instance(
         backend,
         acp_session_repo,
         &metadata.handshake,
+        applied_effort,
         prompt_dump,
         // Lets the pump push a usage frame that arrives after the turn's relay has
         // already stopped listening — the claude case (usage rides `result`).
@@ -9850,6 +9884,46 @@ mod pump_tests {
             })),
             ..Default::default()
         }
+    }
+
+    fn handshake_with_effort_catalog() -> aionui_api_types::AgentHandshake {
+        aionui_api_types::AgentHandshake {
+            available_models: Some(serde_json::json!({
+                "available_models": [
+                    {
+                        "id": "gpt-6-astra",
+                        "label": "GPT-6 Astra",
+                        "reasoning_efforts": ["low", "medium", "high"]
+                    }
+                ],
+                "current_model_id": "gpt-6-astra",
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restored_startup_effort_is_visible_in_config_options() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(Vec::new()));
+        let task = SessionAgentTask::new_with_preload_and_effort(
+            AgentType::Acp,
+            "conv-effort".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            &handshake_with_effort_catalog(),
+            Some("low".into()),
+            None,
+            None,
+        );
+
+        let options = task.get_config_options().await.unwrap().config_options;
+        let effort = options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("thought_level"))
+            .expect("reasoning effort option");
+        assert_eq!(effort.current_value.as_deref(), Some("low"));
     }
 
     // Cold-start resume: the backend's live capabilities() is still empty (initialize

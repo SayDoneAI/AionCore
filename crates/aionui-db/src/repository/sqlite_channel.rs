@@ -2,7 +2,7 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
-use crate::repository::channel::{IChannelRepository, UpdatePluginStatusParams};
+use crate::repository::channel::{IChannelRepository, UpdatePluginStatusParams, UpsertChannelConversationRouteParams};
 
 /// SQLite-backed implementation of [`IChannelRepository`].
 #[derive(Clone, Debug)]
@@ -14,6 +14,16 @@ impl SqliteChannelRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+}
+
+fn normalize_route_preview(value: &str) -> String {
+    value
+        .replace("\r\n", "\n")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[async_trait::async_trait]
@@ -322,6 +332,316 @@ impl IChannelRepository for SqliteChannelRepository {
         self.get_session(owner_user_id, &new_row.id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("Channel user '{channel_user_id}' not found")))
+    }
+
+    async fn create_session(
+        &self,
+        owner_user_id: &str,
+        channel_user_id: &str,
+        new_row: &AssistantSessionRow,
+    ) -> Result<AssistantSessionRow, DbError> {
+        sqlx::query(
+            "INSERT INTO assistant_sessions \
+                (id, user_id, agent_type, conversation_id, workspace, \
+                 chat_id, created_at, last_activity) \
+             SELECT ?, ?, ?, ?, ?, ?, ?, ? \
+             WHERE EXISTS ( \
+                 SELECT 1 FROM assistant_users \
+                 WHERE owner_user_id = ? AND id = ? \
+             ) \
+             AND ( \
+                 ? IS NULL OR EXISTS ( \
+                     SELECT 1 FROM conversations WHERE id = ? AND user_id = ? \
+                 ) \
+             )",
+        )
+        .bind(&new_row.id)
+        .bind(channel_user_id)
+        .bind(&new_row.agent_type)
+        .bind(&new_row.conversation_id)
+        .bind(&new_row.workspace)
+        .bind(&new_row.chat_id)
+        .bind(new_row.created_at)
+        .bind(new_row.last_activity)
+        .bind(owner_user_id)
+        .bind(channel_user_id)
+        .bind(&new_row.conversation_id)
+        .bind(&new_row.conversation_id)
+        .bind(owner_user_id)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_session(owner_user_id, &new_row.id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("Channel user '{channel_user_id}' not found")))
+    }
+
+    async fn get_session_by_route(
+        &self,
+        owner_user_id: &str,
+        channel_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Option<AssistantSessionRow>, DbError> {
+        let row = sqlx::query_as::<_, AssistantSessionRow>(
+            "SELECT s.* FROM channel_session_routes r \
+             JOIN assistant_sessions s ON s.id = r.session_id \
+             JOIN assistant_users u ON u.id = s.user_id \
+             WHERE r.owner_user_id = ? \
+               AND r.channel_user_id = ? \
+               AND r.platform_type = ? \
+               AND r.chat_id = ? \
+               AND r.message_id = ? \
+               AND u.owner_user_id = r.owner_user_id \
+               AND u.id = r.channel_user_id \
+               AND u.platform_type = r.platform_type \
+               AND s.chat_id = r.chat_id",
+        )
+        .bind(owner_user_id)
+        .bind(channel_user_id)
+        .bind(platform_type)
+        .bind(chat_id)
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn upsert_session_route(
+        &self,
+        owner_user_id: &str,
+        session_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+        created_at: aionui_common::TimestampMs,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "INSERT INTO channel_session_routes \
+                (owner_user_id, platform_type, chat_id, channel_user_id, message_id, session_id, created_at) \
+             SELECT ?, ?, ?, s.user_id, ?, s.id, ? \
+             FROM assistant_sessions s \
+             JOIN assistant_users u ON u.id = s.user_id \
+             WHERE s.id = ? \
+               AND s.chat_id = ? \
+               AND u.owner_user_id = ? \
+               AND u.platform_type = ? \
+             ON CONFLICT(owner_user_id, platform_type, chat_id, channel_user_id, message_id) \
+             DO UPDATE SET session_id = excluded.session_id, created_at = excluded.created_at",
+        )
+        .bind(owner_user_id)
+        .bind(platform_type)
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(created_at)
+        .bind(session_id)
+        .bind(chat_id)
+        .bind(owner_user_id)
+        .bind(platform_type)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("Session '{session_id}' not found")));
+        }
+
+        sqlx::query(
+            "DELETE FROM channel_session_routes \
+             WHERE session_id = ? AND rowid NOT IN ( \
+                 SELECT rowid FROM channel_session_routes \
+                 WHERE session_id = ? \
+                 ORDER BY created_at DESC, rowid DESC \
+                 LIMIT 20 \
+             )",
+        )
+        .bind(session_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_conversation_route(
+        &self,
+        owner_user_id: &str,
+        params: &UpsertChannelConversationRouteParams<'_>,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "INSERT INTO channel_conversation_routes \
+                (owner_user_id, platform_type, chat_id, message_id, conversation_id, \
+                 preview_text, sent_at, delivery_started_at, delivery_completed_at) \
+             SELECT ?, ?, ?, ?, c.id, ?, ?, ?, ? \
+             FROM conversations c \
+             WHERE c.id = ? AND c.user_id = ? \
+             ON CONFLICT(owner_user_id, platform_type, chat_id, message_id) \
+             DO UPDATE SET \
+                conversation_id = excluded.conversation_id, \
+                preview_text = excluded.preview_text, \
+                sent_at = excluded.sent_at, \
+                delivery_started_at = excluded.delivery_started_at, \
+                delivery_completed_at = excluded.delivery_completed_at",
+        )
+        .bind(owner_user_id)
+        .bind(params.platform_type)
+        .bind(params.chat_id)
+        .bind(params.message_id)
+        .bind(params.preview_text)
+        .bind(params.sent_at)
+        .bind(params.delivery_started_at)
+        .bind(params.delivery_completed_at)
+        .bind(params.conversation_id)
+        .bind(owner_user_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!(
+                "Conversation '{}' not found",
+                params.conversation_id
+            )));
+        }
+
+        sqlx::query(
+            "DELETE FROM channel_conversation_routes \
+             WHERE conversation_id = ? AND platform_type = ? AND chat_id = ? \
+               AND rowid NOT IN ( \
+                   SELECT rowid FROM channel_conversation_routes \
+                   WHERE conversation_id = ? AND platform_type = ? AND chat_id = ? \
+                   ORDER BY sent_at DESC, rowid DESC LIMIT 20 \
+               )",
+        )
+        .bind(params.conversation_id)
+        .bind(params.platform_type)
+        .bind(params.chat_id)
+        .bind(params.conversation_id)
+        .bind(params.platform_type)
+        .bind(params.chat_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn resolve_conversation_route(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        let conversation_id = sqlx::query_scalar::<_, String>(
+            "SELECT r.conversation_id \
+             FROM channel_conversation_routes r \
+             JOIN conversations c ON c.id = r.conversation_id \
+             WHERE r.owner_user_id = ? \
+               AND r.platform_type = ? \
+               AND r.chat_id = ? \
+               AND r.message_id = ? \
+               AND c.user_id = r.owner_user_id",
+        )
+        .bind(owner_user_id)
+        .bind(platform_type)
+        .bind(chat_id)
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(conversation_id)
+    }
+
+    async fn resolve_conversation_route_by_preview(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        quoted_text: &str,
+        require_unique: bool,
+    ) -> Result<Option<String>, DbError> {
+        let normalized_quote = normalize_route_preview(quoted_text);
+        if normalized_quote.is_empty() {
+            return Ok(None);
+        }
+        let rows = sqlx::query_as::<_, (String, String)>(
+            "SELECT r.conversation_id, r.preview_text \
+             FROM channel_conversation_routes r \
+             JOIN conversations c ON c.id = r.conversation_id \
+             WHERE r.owner_user_id = ? AND r.platform_type = ? AND r.chat_id = ? \
+               AND r.preview_text IS NOT NULL AND c.user_id = r.owner_user_id \
+             ORDER BY r.sent_at DESC",
+        )
+        .bind(owner_user_id)
+        .bind(platform_type)
+        .bind(chat_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut matches = Vec::new();
+        for (conversation_id, preview) in rows {
+            let normalized_preview = normalize_route_preview(&preview);
+            if (normalized_preview == normalized_quote
+                || normalized_preview.contains(&normalized_quote)
+                || normalized_quote.contains(&normalized_preview))
+                && !matches.contains(&conversation_id)
+            {
+                matches.push(conversation_id);
+                if !require_unique {
+                    break;
+                }
+            }
+        }
+        Ok((matches.len() == 1).then(|| matches.remove(0)))
+    }
+
+    async fn resolve_conversation_route_by_timestamp(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        reply_timestamp: aionui_common::TimestampMs,
+        max_skew_ms: aionui_common::TimestampMs,
+    ) -> Result<Option<String>, DbError> {
+        let rows = sqlx::query_as::<_, (String, i64, Option<i64>, Option<i64>)>(
+            "SELECT r.conversation_id, r.sent_at, r.delivery_started_at, r.delivery_completed_at \
+             FROM channel_conversation_routes r \
+             JOIN conversations c ON c.id = r.conversation_id \
+             WHERE r.owner_user_id = ? AND r.platform_type = ? AND r.chat_id = ? \
+               AND c.user_id = r.owner_user_id \
+               AND (ABS(r.sent_at - ?) <= ? \
+                    OR (? BETWEEN r.delivery_started_at AND r.delivery_completed_at)) \
+             ORDER BY r.sent_at DESC",
+        )
+        .bind(owner_user_id)
+        .bind(platform_type)
+        .bind(chat_id)
+        .bind(reply_timestamp)
+        .bind(max_skew_ms)
+        .bind(reply_timestamp)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut window_matches = Vec::new();
+        let mut nearby_matches = Vec::new();
+        for (conversation_id, sent_at, started_at, completed_at) in rows {
+            let within_window = started_at
+                .zip(completed_at)
+                .is_some_and(|(start, end)| reply_timestamp >= start && reply_timestamp <= end);
+            let target = if within_window {
+                &mut window_matches
+            } else if (sent_at - reply_timestamp).abs() <= max_skew_ms {
+                &mut nearby_matches
+            } else {
+                continue;
+            };
+            if !target.contains(&conversation_id) {
+                target.push(conversation_id);
+            }
+        }
+        if window_matches.len() == 1 {
+            return Ok(window_matches.pop());
+        }
+        if window_matches.is_empty() && nearby_matches.len() == 1 {
+            return Ok(nearby_matches.pop());
+        }
+        Ok(None)
     }
 
     async fn update_session_activity(
@@ -1178,6 +1498,143 @@ mod tests {
 
         let found = repo.get_session(OWNER_A, "sess-1").await.unwrap().unwrap();
         assert_eq!(found.conversation_id.as_deref(), Some("conv-42"));
+    }
+
+    #[tokio::test]
+    async fn quoted_messages_route_to_their_exact_desktop_conversations() {
+        let (repo, db) = setup().await;
+        create_stub_conversation(db.pool(), OWNER_A, "desktop-a").await;
+        create_stub_conversation(db.pool(), OWNER_A, "desktop-b").await;
+
+        repo.upsert_conversation_route(
+            OWNER_A,
+            &crate::UpsertChannelConversationRouteParams {
+                conversation_id: "desktop-a",
+                platform_type: "lark",
+                chat_id: "chat-abc",
+                message_id: "om-a",
+                preview_text: Some("answer a"),
+                sent_at: 100,
+                delivery_started_at: None,
+                delivery_completed_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        repo.upsert_conversation_route(
+            OWNER_A,
+            &crate::UpsertChannelConversationRouteParams {
+                conversation_id: "desktop-b",
+                platform_type: "lark",
+                chat_id: "chat-abc",
+                message_id: "om-b",
+                preview_text: Some("answer b"),
+                sent_at: 200,
+                delivery_started_at: None,
+                delivery_completed_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.resolve_conversation_route(OWNER_A, "lark", "chat-abc", "om-a")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("desktop-a")
+        );
+        assert_eq!(
+            repo.resolve_conversation_route(OWNER_A, "lark", "chat-abc", "om-b")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("desktop-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn quoted_preview_routes_only_when_the_weixin_match_is_unique() {
+        let (repo, db) = setup().await;
+        create_stub_conversation(db.pool(), OWNER_A, "desktop-a").await;
+        create_stub_conversation(db.pool(), OWNER_A, "desktop-b").await;
+
+        for (conversation_id, message_id, preview_text, sent_at) in [
+            ("desktop-a", "wx-a", "You: Question A\n\nAI: Shared answer", 100),
+            ("desktop-b", "wx-b", "You: Question B\n\nAI: Shared answer", 200),
+        ] {
+            repo.upsert_conversation_route(
+                OWNER_A,
+                &crate::UpsertChannelConversationRouteParams {
+                    conversation_id,
+                    platform_type: "weixin",
+                    chat_id: "wx-user",
+                    message_id,
+                    preview_text: Some(preview_text),
+                    sent_at,
+                    delivery_started_at: None,
+                    delivery_completed_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(
+            repo.resolve_conversation_route_by_preview(OWNER_A, "weixin", "wx-user", "Shared answer", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repo.resolve_conversation_route_by_preview(OWNER_A, "weixin", "wx-user", "Question A", true)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("desktop-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn weixin_timestamp_routes_to_the_nearest_delivered_conversation() {
+        let (repo, db) = setup().await;
+        create_stub_conversation(db.pool(), OWNER_A, "desktop-a").await;
+        create_stub_conversation(db.pool(), OWNER_A, "desktop-b").await;
+
+        for (conversation_id, message_id, sent_at) in [
+            ("desktop-a", "wx-a", 1_700_000_000_000_i64),
+            ("desktop-b", "wx-b", 1_700_000_010_000_i64),
+        ] {
+            repo.upsert_conversation_route(
+                OWNER_A,
+                &crate::UpsertChannelConversationRouteParams {
+                    conversation_id,
+                    platform_type: "weixin",
+                    chat_id: "wx-user",
+                    message_id,
+                    preview_text: None,
+                    sent_at,
+                    delivery_started_at: None,
+                    delivery_completed_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            repo.resolve_conversation_route_by_timestamp(OWNER_A, "weixin", "wx-user", 1_700_000_010_900, 3_000,)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("desktop-b")
+        );
+        assert!(
+            repo.resolve_conversation_route_by_timestamp(OWNER_A, "weixin", "wx-user", 1_700_000_020_000, 3_000,)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

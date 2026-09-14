@@ -10,8 +10,86 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::error::ChannelError;
-use crate::plugin::{ChannelPlugin, PluginCallbacks};
+use crate::plugin::{ChannelPlugin, PluginCallbacks, PluginCredentialUpdate};
 use crate::types::{PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessage};
+
+fn move_legacy_key(map: &mut serde_json::Map<String, serde_json::Value>, legacy: &str, current: &str) -> bool {
+    let Some(value) = map.remove(legacy) else {
+        return false;
+    };
+    map.entry(current.to_owned()).or_insert(value);
+    true
+}
+
+fn parse_stored_plugin_config(config_json: &str) -> Result<(PluginConfig, bool), serde_json::Error> {
+    let mut value: serde_json::Value = serde_json::from_str(config_json)?;
+    let mut migrated = false;
+
+    if let Some(credentials) = value.get_mut("credentials").and_then(serde_json::Value::as_object_mut) {
+        for (legacy, current) in [
+            ("appId", "app_id"),
+            ("appSecret", "app_secret"),
+            ("encryptKey", "encrypt_key"),
+            ("verificationToken", "verification_token"),
+            ("clientId", "client_id"),
+            ("clientSecret", "client_secret"),
+            ("accountId", "account_id"),
+            ("botToken", "bot_token"),
+            ("appToken", "app_token"),
+        ] {
+            migrated |= move_legacy_key(credentials, legacy, current);
+        }
+    }
+
+    if let Some(config) = value.get_mut("config").and_then(serde_json::Value::as_object_mut) {
+        for (legacy, current) in [
+            ("webhookUrl", "webhook_url"),
+            ("rateLimit", "rate_limit"),
+            ("requireMention", "require_mention"),
+        ] {
+            migrated |= move_legacy_key(config, legacy, current);
+        }
+    }
+
+    serde_json::from_value(value).map(|config| (config, migrated))
+}
+
+async fn persist_runtime_credential_update(
+    repo: &dyn IChannelRepository,
+    encryption_key: &[u8; 32],
+    owner_user_id: &str,
+    plugin_id: &str,
+    update: PluginCredentialUpdate,
+) -> Result<(), ChannelError> {
+    let Some(mut row) = repo.get_plugin(owner_user_id, plugin_id).await? else {
+        return Err(ChannelError::PluginNotFound(plugin_id.to_owned()));
+    };
+    let config_json = match decrypt_string(&row.config, encryption_key) {
+        Ok(value) => value,
+        Err(_error) if row.config.trim_start().starts_with('{') => row.config.clone(),
+        Err(error) => return Err(ChannelError::DecryptionFailed(error.to_string())),
+    };
+    let (mut config, _) = parse_stored_plugin_config(&config_json)?;
+    let entries = config
+        .credentials
+        .extra
+        .entry(update.map_key)
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !entries.is_object() {
+        *entries = serde_json::Value::Object(serde_json::Map::new());
+    }
+    entries
+        .as_object_mut()
+        .expect("runtime credential map was normalized above")
+        .insert(update.entry_key, update.value);
+
+    let serialized = serde_json::to_string(&config)?;
+    row.config = encrypt_string(&serialized, encryption_key)
+        .map_err(|error| ChannelError::EncryptionFailed(error.to_string()))?;
+    row.updated_at = now_ms();
+    repo.upsert_plugin(owner_user_id, &row).await?;
+    Ok(())
+}
 
 /// Manages the lifecycle of channel plugins.
 ///
@@ -164,7 +242,7 @@ impl ChannelManager {
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
-        let callbacks = self.callbacks_for_owner(owner_user_id);
+        let callbacks = self.callbacks_for_plugin(owner_user_id, plugin_id);
 
         if let Err(e) = plugin.initialize(config, callbacks).await {
             self.update_plugin_error(owner_user_id, plugin_id, &e.to_string()).await;
@@ -281,6 +359,7 @@ impl ChannelManager {
         let callbacks = PluginCallbacks {
             message_tx: msg_tx,
             confirm_tx,
+            credential_update_tx: None,
         };
 
         plugin.initialize(config, callbacks).await?;
@@ -457,11 +536,61 @@ impl ChannelManager {
                     "No credentials provided and no stored configuration for plugin '{plugin_id}'"
                 ))
             })?;
+        self.load_config_from_row(owner_user_id, &row).await
+    }
 
-        let config_json = decrypt_string(&row.config, &self.encryption_key)
-            .map_err(|e| ChannelError::DecryptionFailed(e.to_string()))?;
-        let config: PluginConfig = serde_json::from_str(&config_json)?;
-        Ok(config)
+    /// Loads a stored plugin config and upgrades the plaintext format written
+    /// by the pre-encryption channel implementation on first successful read.
+    async fn load_config_from_row(
+        &self,
+        owner_user_id: &str,
+        row: &ChannelPluginRow,
+    ) -> Result<PluginConfig, ChannelError> {
+        match decrypt_string(&row.config, &self.encryption_key) {
+            Ok(config_json) => {
+                let (config, migrated) = parse_stored_plugin_config(&config_json)?;
+                if migrated {
+                    self.persist_migrated_config(owner_user_id, row, &config).await?;
+                    info!(
+                        owner_user_id = %owner_user_id,
+                        plugin_id = %row.id,
+                        "migrated camel-case channel credentials to current storage schema"
+                    );
+                }
+                Ok(config)
+            }
+            Err(decryption_error) => {
+                if !row.config.trim_start().starts_with('{') {
+                    return Err(ChannelError::DecryptionFailed(decryption_error.to_string()));
+                }
+
+                let (config, _) = parse_stored_plugin_config(&row.config)
+                    .map_err(|_| ChannelError::DecryptionFailed(decryption_error.to_string()))?;
+                self.persist_migrated_config(owner_user_id, row, &config).await?;
+                info!(
+                    owner_user_id = %owner_user_id,
+                    plugin_id = %row.id,
+                    "migrated plaintext channel credentials to encrypted storage"
+                );
+                Ok(config)
+            }
+        }
+    }
+
+    async fn persist_migrated_config(
+        &self,
+        owner_user_id: &str,
+        row: &ChannelPluginRow,
+        config: &PluginConfig,
+    ) -> Result<(), ChannelError> {
+        let config_json = serde_json::to_string(config)?;
+        let encrypted_config = encrypt_string(&config_json, &self.encryption_key)
+            .map_err(|e| ChannelError::EncryptionFailed(e.to_string()))?;
+        let mut migrated_row = row.clone();
+        migrated_row.config = encrypted_config;
+        migrated_row.updated_at = now_ms();
+        self.repo.upsert_plugin(owner_user_id, &migrated_row).await?;
+        Ok(())
     }
 
     /// Stops and removes an active plugin instance.
@@ -469,15 +598,41 @@ impl ChannelManager {
         ChannelRuntimeKey::new(owner_user_id, plugin_id)
     }
 
-    fn callbacks_for_owner(&self, owner_user_id: &str) -> PluginCallbacks {
+    fn callbacks_for_plugin(&self, owner_user_id: &str, plugin_id: &str) -> PluginCallbacks {
         let (plugin_msg_tx, mut plugin_msg_rx) = mpsc::channel::<UnifiedIncomingMessage>(64);
         let message_tx = self.message_tx.clone();
-        let owner_user_id = owner_user_id.to_owned();
+        let route_owner_user_id = owner_user_id.to_owned();
+        let credential_owner_user_id = owner_user_id.to_owned();
+        let plugin_id = plugin_id.to_owned();
         tokio::spawn(async move {
             while let Some(mut msg) = plugin_msg_rx.recv().await {
-                msg.owner_user_id = Some(owner_user_id.clone());
+                msg.owner_user_id = Some(route_owner_user_id.clone());
                 if message_tx.send(msg).await.is_err() {
                     break;
+                }
+            }
+        });
+
+        let (credential_update_tx, mut credential_update_rx) = mpsc::channel::<PluginCredentialUpdate>(16);
+        let repo = Arc::clone(&self.repo);
+        let encryption_key = self.encryption_key;
+        tokio::spawn(async move {
+            while let Some(update) = credential_update_rx.recv().await {
+                if let Err(error) = persist_runtime_credential_update(
+                    repo.as_ref(),
+                    &encryption_key,
+                    &credential_owner_user_id,
+                    &plugin_id,
+                    update,
+                )
+                .await
+                {
+                    warn!(
+                        owner_user_id = %credential_owner_user_id,
+                        plugin_id = %plugin_id,
+                        error = %error,
+                        "failed to persist refreshed channel credential"
+                    );
                 }
             }
         });
@@ -485,6 +640,7 @@ impl ChannelManager {
         PluginCallbacks {
             message_tx: plugin_msg_tx,
             confirm_tx: self.confirm_tx.clone(),
+            credential_update_tx: Some(credential_update_tx),
         }
     }
 
@@ -518,15 +674,12 @@ impl ChannelManager {
         let plugin_type =
             PluginType::from_str_opt(&row.r#type).ok_or_else(|| ChannelError::InvalidPluginType(row.r#type.clone()))?;
 
-        // Decrypt config
-        let config_json = decrypt_string(&row.config, &self.encryption_key)
-            .map_err(|e| ChannelError::DecryptionFailed(e.to_string()))?;
-        let config: PluginConfig = serde_json::from_str(&config_json)?;
+        let config = self.load_config_from_row(owner_user_id, row).await?;
 
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
-        let callbacks = self.callbacks_for_owner(owner_user_id);
+        let callbacks = self.callbacks_for_plugin(owner_user_id, &row.id);
 
         plugin.initialize(config, callbacks).await?;
         plugin.start().await?;
@@ -633,6 +786,7 @@ impl ChannelManager {
             PluginType::Lark => "Lark Bot".into(),
             PluginType::Dingtalk => "DingTalk Bot".into(),
             PluginType::Weixin => "WeChat Bot".into(),
+            PluginType::Wecom => "WeCom Bot".into(),
             PluginType::Slack => "Slack Bot".into(),
             PluginType::Discord => "Discord Bot".into(),
         }
@@ -647,8 +801,14 @@ impl crate::stream_relay::ChannelSender for ChannelManager {
         plugin_id: &str,
         chat_id: &str,
         message: crate::types::UnifiedOutgoingMessage,
-    ) -> Result<String, crate::error::ChannelError> {
-        self.send_message(owner_user_id, plugin_id, chat_id, message).await
+    ) -> Result<crate::stream_relay::ChannelDeliveryReceipt, crate::error::ChannelError> {
+        let started_at = aionui_common::now_ms();
+        let message_id = self.send_message(owner_user_id, plugin_id, chat_id, message).await?;
+        Ok(crate::stream_relay::ChannelDeliveryReceipt {
+            message_id,
+            started_at,
+            completed_at: aionui_common::now_ms(),
+        })
     }
 
     async fn edit_message(
@@ -1411,6 +1571,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_migrates_legacy_camel_case_plaintext_credentials() {
+        let (mgr, repo, _bc) = make_manager();
+        let factory = make_factory();
+        let plaintext = serde_json::json!({
+            "credentials": {
+                "accountId": "wx-account",
+                "botToken": "wx-token",
+                "baseUrl": "https://ilinkai.weixin.qq.com"
+            },
+            "config": {}
+        })
+        .to_string();
+
+        repo.plugins.lock().unwrap().push(ChannelPluginRow {
+            id: "weixin_default".into(),
+            owner_user_id: OWNER_ID.into(),
+            r#type: "weixin".into(),
+            name: "WeChat Bot".into(),
+            enabled: true,
+            config: plaintext,
+            status: Some("stopped".into()),
+            last_connected: None,
+            created_at: now_ms(),
+            updated_at: now_ms(),
+        });
+
+        mgr.restore_plugins(OWNER_ID, &factory).await.unwrap();
+
+        assert!(mgr.is_plugin_running(OWNER_ID, "weixin_default"));
+        let stored = repo
+            .get_plugins()
+            .into_iter()
+            .find(|row| row.id == "weixin_default")
+            .unwrap();
+        assert!(!stored.config.starts_with('{'));
+        let decrypted = decrypt_string(&stored.config, &test_key()).unwrap();
+        let migrated = serde_json::from_str::<PluginConfig>(&decrypted).unwrap();
+        assert_eq!(migrated.credentials.account_id.as_deref(), Some("wx-account"));
+        assert_eq!(migrated.credentials.bot_token.as_deref(), Some("wx-token"));
+        assert_eq!(
+            migrated
+                .credentials
+                .extra
+                .get("baseUrl")
+                .and_then(serde_json::Value::as_str),
+            Some("https://ilinkai.weixin.qq.com")
+        );
+    }
+
+    #[tokio::test]
     async fn restore_continues_on_individual_failure() {
         let (mgr, repo, _bc) = make_manager();
 
@@ -1606,6 +1816,7 @@ mod tests {
         assert_eq!(mgr.default_plugin_name(PluginType::Lark), "Lark Bot");
         assert_eq!(mgr.default_plugin_name(PluginType::Dingtalk), "DingTalk Bot");
         assert_eq!(mgr.default_plugin_name(PluginType::Weixin), "WeChat Bot");
+        assert_eq!(mgr.default_plugin_name(PluginType::Wecom), "WeCom Bot");
         assert_eq!(mgr.default_plugin_name(PluginType::Slack), "Slack Bot");
         assert_eq!(mgr.default_plugin_name(PluginType::Discord), "Discord Bot");
     }

@@ -7,7 +7,7 @@ use aionui_ai_agent::{AgentError, AgentSendError, AgentStreamEvent, IMockAgent, 
 use aionui_api_types::WebSocketMessage;
 use aionui_channel::channel_settings::ChannelSettingsService;
 use aionui_channel::error::ChannelError;
-use aionui_channel::message_service::ChannelMessageService;
+use aionui_channel::message_service::{ChannelManagedRuntimePreparer, ChannelMessageService};
 use aionui_channel::types::PluginType;
 use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
 use aionui_conversation::ConversationService;
@@ -125,12 +125,21 @@ impl IMockAgent for ScriptedAgent {}
 
 struct RecordingTaskManager {
     agents: Mutex<std::collections::HashMap<String, AgentInstance>>,
+    events: Option<Arc<Mutex<Vec<&'static str>>>>,
 }
 
 impl RecordingTaskManager {
     fn new() -> Self {
         Self {
             agents: Mutex::new(std::collections::HashMap::new()),
+            events: None,
+        }
+    }
+
+    fn with_events(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
+        Self {
+            agents: Mutex::new(std::collections::HashMap::new()),
+            events: Some(events),
         }
     }
 }
@@ -146,6 +155,9 @@ impl IWorkerTaskManager for RecordingTaskManager {
         conversation_id: &str,
         _options: BuildTaskOptions,
     ) -> Result<AgentInstance, AgentError> {
+        if let Some(events) = &self.events {
+            events.lock().unwrap().push("warmup");
+        }
         let mut agents = self.agents.lock().unwrap();
         if let Some(agent) = agents.get(conversation_id) {
             return Ok(agent.clone());
@@ -180,6 +192,29 @@ impl IWorkerTaskManager for RecordingTaskManager {
 
     fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
         Vec::new()
+    }
+}
+
+struct RecordingManagedRuntimePreparer {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+struct NoopManagedRuntimePreparer;
+
+#[async_trait]
+impl ChannelManagedRuntimePreparer for NoopManagedRuntimePreparer {
+    async fn prepare(&self, _conversation_id: &str, _backend: &str, _model: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ChannelManagedRuntimePreparer for RecordingManagedRuntimePreparer {
+    async fn prepare(&self, _conversation_id: &str, backend: &str, model: &str) -> Result<(), String> {
+        assert_eq!(backend, "pi");
+        assert_eq!(model, "deepseek-flash");
+        self.events.lock().unwrap().push("prepare");
+        Ok(())
     }
 }
 
@@ -272,6 +307,76 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
 }
 
 #[tokio::test]
+async fn managed_channel_runtime_is_prepared_before_agent_warmup() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::with_events(Arc::clone(&events)));
+    let conversation_svc = Arc::new(ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(TestBroadcaster::new()),
+        Arc::new(NoopSkillResolver),
+        Arc::clone(&task_manager),
+        Arc::new(SqliteConversationRepository::new(pool.clone())),
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
+        Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
+    ));
+    let pref_repo = Arc::new(SqliteClientPreferenceRepository::new(pool));
+    pref_repo
+        .upsert_batch(
+            TEST_OWNER_USER_ID,
+            &[
+                (
+                    "assistant.weixin.agent",
+                    r#"{"agent_type":"acp","backend":"pi","name":"SayDone CLI"}"#,
+                ),
+                (
+                    "assistant.weixin.defaultModel",
+                    r#"{"id":"saydone-managed-openai","use_model":"deepseek-flash"}"#,
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    let settings = Arc::new(ChannelSettingsService::new(pref_repo));
+    let preparer = Arc::new(RecordingManagedRuntimePreparer {
+        events: Arc::clone(&events),
+    });
+    let session = AssistantSessionRow {
+        id: "session-managed".to_owned(),
+        user_id: "channel-user-managed".to_owned(),
+        agent_type: "acp".to_owned(),
+        conversation_id: None,
+        workspace: None,
+        chat_id: Some("managed-chat".to_owned()),
+        created_at: 1,
+        last_activity: 1,
+    };
+
+    let unavailable_message_svc = ChannelMessageService::new(
+        Arc::clone(&conversation_svc),
+        Arc::clone(&task_manager),
+        Arc::clone(&settings),
+    );
+    let error = unavailable_message_svc
+        .send_to_agent(TEST_OWNER_USER_ID, &session, "hello", PluginType::Weixin)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("托管模型服务未启动"));
+    assert!(events.lock().unwrap().is_empty());
+
+    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings)
+        .with_managed_runtime_preparer(preparer);
+
+    message_svc
+        .send_to_agent(TEST_OWNER_USER_ID, &session, "hello", PluginType::Weixin)
+        .await
+        .unwrap();
+
+    assert_eq!(*events.lock().unwrap(), vec!["prepare", "warmup"]);
+}
+
+#[tokio::test]
 async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
@@ -308,16 +413,23 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     pref_repo
         .upsert_batch(
             TEST_OWNER_USER_ID,
-            &[(
-                "assistant.telegram.agent",
-                r#"{"assistant_id":"bare-claude","name":"Claude"}"#,
-            )],
+            &[
+                (
+                    "assistant.telegram.agent",
+                    r#"{"assistant_id":"bare-claude","name":"Claude"}"#,
+                ),
+                (
+                    "assistant.telegram.defaultModel",
+                    r#"{"id":"saydone-managed-openai","use_model":"gpt-6-astra"}"#,
+                ),
+            ],
         )
         .await
         .unwrap();
 
     let settings = Arc::new(ChannelSettingsService::new(pref_repo).with_assistant_repos(definition_repo, overlay_repo));
-    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
+    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings)
+        .with_managed_runtime_preparer(Arc::new(NoopManagedRuntimePreparer));
 
     let session = AssistantSessionRow {
         id: "session-assisted".to_owned(),
@@ -358,6 +470,7 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     assert_eq!(session_row.agent_id, "2d23ff1c");
     assert_eq!(snapshot.assistant_id, "bare-claude");
     assert_eq!(snapshot.agent_id, "2d23ff1c");
+    assert_eq!(snapshot.resolved_model_id.as_deref(), Some("gpt-6-astra"));
     assert_eq!(conversation.name, "Claude");
 }
 

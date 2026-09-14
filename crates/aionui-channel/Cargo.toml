@@ -42,3 +42,4 @@ uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 aionui-ai-agent = { workspace = true, features = ["test-support"] }
+sqlx.workspace = true

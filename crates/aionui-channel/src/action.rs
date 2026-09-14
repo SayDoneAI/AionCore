@@ -7,7 +7,8 @@ use crate::error::ChannelError;
 use crate::pairing::PairingService;
 use crate::session::SessionManager;
 use crate::types::{
-    ActionBehavior, ActionButton, ActionCategory, ActionResponse, UnifiedAction, UnifiedIncomingMessage,
+    ActionBehavior, ActionButton, ActionCategory, ActionResponse, MessageContentType, ParseMode, UnifiedAction,
+    UnifiedIncomingMessage,
 };
 
 /// Result of processing an incoming message.
@@ -18,6 +19,13 @@ use crate::types::{
 pub enum MessageResult {
     /// An action response to send/edit on the platform.
     Action(ActionResponse),
+    /// An action response whose platform message should route replies to a session.
+    RoutedAction {
+        response: ActionResponse,
+        session_id: String,
+        conversation_id: Option<String>,
+        follow_up_text: Option<String>,
+    },
     /// Message was dispatched to the AI Agent. The caller should send
     /// a "thinking" placeholder and then relay stream events.
     Dispatched {
@@ -97,20 +105,107 @@ impl ActionExecutor {
 
         // 2. Button callback → action routing
         if let Some(action) = &msg.action {
+            if action.category == ActionCategory::System && action.action == "session.new" {
+                let (response, session_id) = self
+                    .create_new_session(owner_user_id, &internal_user_id, action.context.platform, chat_id)
+                    .await?;
+                return Ok(MessageResult::RoutedAction {
+                    response,
+                    session_id,
+                    conversation_id: None,
+                    follow_up_text: None,
+                });
+            }
             let response = self.route_action(owner_user_id, action, &internal_user_id).await?;
+            if let Some(message_id) = action.context.message_id.as_deref()
+                && let Some(conversation_id) = self
+                    .resolve_conversation_by_reply(
+                        owner_user_id,
+                        msg.platform,
+                        chat_id,
+                        user_id,
+                        message_id,
+                        quoted_text_from_raw(msg.raw.as_ref()),
+                    )
+                    .await?
+            {
+                let agent_config = self.settings.get_agent_config(owner_user_id, msg.platform).await?;
+                let session = self
+                    .session_mgr
+                    .activate_conversation(
+                        owner_user_id,
+                        &internal_user_id,
+                        chat_id,
+                        &agent_config.agent_type,
+                        &conversation_id,
+                    )
+                    .await?;
+                return Ok(MessageResult::RoutedAction {
+                    response,
+                    session_id: session.id,
+                    conversation_id: Some(conversation_id),
+                    follow_up_text: None,
+                });
+            }
             return Ok(MessageResult::Action(response));
         }
 
-        // 3. Text message → session resolution → AI dispatch
+        // 3. Text commands create sessions or show help without an existing route.
+        if matches!(
+            msg.content.content_type,
+            MessageContentType::Text | MessageContentType::Command
+        ) {
+            match resolve_session_command(&msg.content.text) {
+                Some(("session.new", follow_up_text)) => {
+                    let (mut response, session_id) = self
+                        .create_new_session(owner_user_id, &internal_user_id, msg.platform, chat_id)
+                        .await?;
+                    if follow_up_text.is_some() {
+                        response.text = None;
+                    }
+                    return Ok(MessageResult::RoutedAction {
+                        response,
+                        session_id,
+                        conversation_id: None,
+                        follow_up_text,
+                    });
+                }
+                Some(("help.show", _)) => return Ok(MessageResult::Action(build_help_response())),
+                _ => {}
+            }
+        }
+
+        // 4. Normal text is valid only when it replies to a session-bound bot message.
+        let Some(reply_to_message_id) = msg.reply_to_message_id.as_deref() else {
+            debug!(
+                platform = %platform_type,
+                has_quoted_text = quoted_text_from_raw(msg.raw.as_ref()).is_some(),
+                "incoming channel text has no reply message id"
+            );
+            return Ok(MessageResult::Action(build_unbound_session_response()));
+        };
+        let Some(conversation_id) = self
+            .resolve_conversation_by_reply(
+                owner_user_id,
+                msg.platform,
+                chat_id,
+                user_id,
+                reply_to_message_id,
+                quoted_text_from_raw(msg.raw.as_ref()),
+            )
+            .await?
+        else {
+            return Ok(MessageResult::Action(build_unbound_session_response()));
+        };
         let agent_config = self.settings.get_agent_config(owner_user_id, msg.platform).await?;
         let session = self
             .session_mgr
-            .get_or_create_session(
+            .activate_conversation(
                 owner_user_id,
                 &internal_user_id,
                 chat_id,
                 &agent_config.agent_type,
-                None,
+                &conversation_id,
             )
             .await?;
 
@@ -125,8 +220,115 @@ impl ActionExecutor {
         Ok(MessageResult::Dispatched {
             owner_user_id: owner_user_id.to_owned(),
             session_id: session.id,
-            conversation_id: session.conversation_id,
+            conversation_id: Some(conversation_id),
         })
+    }
+
+    async fn resolve_conversation_by_reply(
+        &self,
+        owner_user_id: &str,
+        platform: crate::types::PluginType,
+        chat_id: &str,
+        platform_user_id: &str,
+        message_id: &str,
+        quoted_text: Option<&str>,
+    ) -> Result<Option<String>, ChannelError> {
+        let platform_type = platform.to_string();
+        debug!(
+            platform = %platform_type,
+            has_message_id = !message_id.is_empty(),
+            has_quoted_text = quoted_text.is_some_and(|text| !text.trim().is_empty()),
+            "resolving quoted channel reply"
+        );
+        if let Some(conversation_id) = self
+            .session_mgr
+            .resolve_conversation_route(owner_user_id, &platform_type, chat_id, message_id)
+            .await?
+        {
+            debug!(platform = %platform_type, "matched exact channel message id");
+            return Ok(Some(conversation_id));
+        }
+
+        if platform == crate::types::PluginType::Lark
+            && platform_user_id != chat_id
+            && let Some(conversation_id) = self
+                .session_mgr
+                .resolve_conversation_route(owner_user_id, &platform_type, platform_user_id, message_id)
+                .await?
+        {
+            debug!(platform = %platform_type, "matched Lark user route");
+            return Ok(Some(conversation_id));
+        }
+
+        if platform == crate::types::PluginType::Weixin
+            && let Some(reply_timestamp) = decode_weixin_message_timestamp(message_id)
+            && let Some(conversation_id) = self
+                .session_mgr
+                .resolve_conversation_route_by_timestamp(owner_user_id, &platform_type, chat_id, reply_timestamp, 3_000)
+                .await?
+        {
+            debug!(platform = %platform_type, "matched Weixin timestamp route");
+            return Ok(Some(conversation_id));
+        }
+
+        let candidates = quoted_route_candidates(quoted_text);
+        debug!(
+            platform = %platform_type,
+            candidate_count = candidates.len(),
+            "trying quoted channel preview routes"
+        );
+        for candidate in candidates {
+            if let Some(conversation_id) = self
+                .session_mgr
+                .resolve_conversation_route_by_preview(
+                    owner_user_id,
+                    &platform_type,
+                    chat_id,
+                    &candidate,
+                    platform == crate::types::PluginType::Weixin,
+                )
+                .await?
+            {
+                debug!(platform = %platform_type, "matched quoted channel preview route");
+                return Ok(Some(conversation_id));
+            }
+        }
+        debug!(platform = %platform_type, "no channel route matched quoted reply");
+        Ok(None)
+    }
+
+    async fn create_new_session(
+        &self,
+        owner_user_id: &str,
+        internal_user_id: &str,
+        platform: crate::types::PluginType,
+        chat_id: &str,
+    ) -> Result<(ActionResponse, String), ChannelError> {
+        let agent_config = self.settings.get_agent_config(owner_user_id, platform).await?;
+        let session = self
+            .session_mgr
+            .create_session(owner_user_id, internal_user_id, chat_id, &agent_config.agent_type, None)
+            .await?;
+        let session_id = session.id;
+        let response = ActionResponse {
+            text: Some(
+                "🆕 <b>新会话已就绪</b>\n\n\
+                 引用回复这条消息即可继续这个会话。\n\
+                 发送 <code>/new</code> 可再创建一个新会话，也可以发送 <code>/new 你的消息</code> 创建并立即发送。"
+                    .into(),
+            ),
+            parse_mode: Some(ParseMode::HTML),
+            buttons: Some(vec![vec![ActionButton {
+                label: "帮助".into(),
+                action: "help.show".into(),
+                params: None,
+            }]]),
+            keyboard: None,
+            behavior: ActionBehavior::Send,
+            toast: None,
+            edit_message_id: None,
+        };
+        Ok((response, session_id))
     }
 
     /// Handles an unauthorized user: generate pairing code and return
@@ -197,7 +399,7 @@ impl ActionExecutor {
                     .await?;
                 if authorized {
                     Ok(ActionResponse {
-                        text: Some("You are authorized! Send a message to start chatting.".into()),
+                        text: Some("授权已通过。发送 /new 创建新会话。".into()),
                         parse_mode: None,
                         buttons: None,
                         keyboard: None,
@@ -207,16 +409,16 @@ impl ActionExecutor {
                     })
                 } else {
                     Ok(ActionResponse {
-                        text: Some("Still waiting for approval. Ask the admin to check Settings → Channel.".into()),
+                        text: Some("仍在等待授权。请让管理员前往 SayDoneAI → 远程连接 → Channels 处理。".into()),
                         parse_mode: None,
                         buttons: Some(vec![vec![
                             ActionButton {
-                                label: "Refresh".into(),
+                                label: "刷新".into(),
                                 action: "pairing.refresh".into(),
                                 params: None,
                             },
                             ActionButton {
-                                label: "Check Again".into(),
+                                label: "再次检查".into(),
                                 action: "pairing.check".into(),
                                 params: None,
                             },
@@ -230,11 +432,11 @@ impl ActionExecutor {
             }
             "pairing.help" => Ok(ActionResponse {
                 text: Some(
-                    "To use this bot, you need authorization:\n\
-                         1. Send any message to get a 6-digit pairing code\n\
-                         2. Share this code with the admin\n\
-                         3. Admin approves in Settings → Channel\n\
-                         4. You're ready to chat!"
+                    "使用此机器人前需要完成授权：\n\
+                         1. 发送任意消息获取 6 位配对码\n\
+                         2. 把配对码交给管理员\n\
+                         3. 管理员在 SayDoneAI → 远程连接 → Channels 中批准\n\
+                         4. 授权通过后发送 /new 创建会话"
                         .into(),
                 ),
                 parse_mode: None,
@@ -269,18 +471,15 @@ impl ActionExecutor {
                     .await?;
                 let session = self
                     .session_mgr
-                    .reset_session(owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
+                    .create_session(owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
                     .await?;
+                let cli_name = display_cli_name(agent_config.backend.as_deref().unwrap_or(&session.agent_type));
 
                 Ok(ActionResponse {
-                    text: Some(format!(
-                        "New session created.\nAgent: {}\nSession: {}",
-                        session.agent_type,
-                        &session.id[..8]
-                    )),
+                    text: Some(format!("新会话已创建。\nCLI：{}\n会话：{}", cli_name, &session.id[..8])),
                     parse_mode: None,
                     buttons: Some(vec![vec![ActionButton {
-                        label: "Help".into(),
+                        label: "帮助".into(),
                         action: "help.show".into(),
                         params: None,
                     }]]),
@@ -291,28 +490,49 @@ impl ActionExecutor {
                 })
             }
             "session.status" => {
-                let user_id = internal_user_id;
-                let chat_id = &action.context.chat_id;
+                let Some(message_id) = action.context.message_id.as_deref() else {
+                    return Ok(build_unbound_session_response());
+                };
+                let Some(conversation_id) = self
+                    .resolve_conversation_by_reply(
+                        owner_user_id,
+                        action.context.platform,
+                        &action.context.chat_id,
+                        &action.context.user_id,
+                        message_id,
+                        None,
+                    )
+                    .await?
+                else {
+                    return Ok(build_unbound_session_response());
+                };
                 let agent_config = self
                     .settings
                     .get_agent_config(owner_user_id, action.context.platform)
                     .await?;
                 let session = self
                     .session_mgr
-                    .get_or_create_session(owner_user_id, user_id, chat_id, &agent_config.agent_type, None)
+                    .activate_conversation(
+                        owner_user_id,
+                        internal_user_id,
+                        &action.context.chat_id,
+                        &agent_config.agent_type,
+                        &conversation_id,
+                    )
                     .await?;
+                let cli_name = display_cli_name(agent_config.backend.as_deref().unwrap_or(&session.agent_type));
 
                 Ok(ActionResponse {
                     text: Some(format!(
-                        "Session: {}\nAgent: {}\nCreated: {}\nLast active: {}",
+                        "会话：{}\nCLI：{}\n创建时间：{}\n最后活跃时间：{}",
                         &session.id[..8],
-                        session.agent_type,
+                        cli_name,
                         session.created_at,
                         session.last_activity,
                     )),
                     parse_mode: None,
                     buttons: Some(vec![vec![ActionButton {
-                        label: "New Session".into(),
+                        label: "新建会话".into(),
                         action: "session.new".into(),
                         params: None,
                     }]]),
@@ -325,10 +545,10 @@ impl ActionExecutor {
             "help.show" => Ok(build_help_response()),
             "help.features" => Ok(ActionResponse {
                 text: Some(
-                    "Features:\n\
-                         • AI chat through your configured assistant\n\
-                         • Tool execution with auto-approval\n\
-                         • Session isolation per chat"
+                    "功能：\n\
+                         • 使用已配置的 CLI 和模型聊天\n\
+                         • 在授权模式下执行工具\n\
+                         • 通过引用回复精确进入指定会话"
                         .into(),
                 ),
                 parse_mode: None,
@@ -340,8 +560,8 @@ impl ActionExecutor {
             }),
             "help.pairing" => Ok(ActionResponse {
                 text: Some(
-                    "Pairing:\n\
-                         Send any message → get a 6-digit code → admin approves → you're in!"
+                    "配对：\n\
+                         发送任意消息 → 获取 6 位配对码 → 管理员批准 → 完成授权"
                         .into(),
                 ),
                 parse_mode: None,
@@ -353,10 +573,11 @@ impl ActionExecutor {
             }),
             "help.tips" => Ok(ActionResponse {
                 text: Some(
-                    "Tips:\n\
-                         • Start a new session to clear context\n\
-                         • Use /help to see available commands\n\
-                         • In group chats, @mention the bot"
+                    "使用提示：\n\
+                         • 发送 /new 创建空白新会话\n\
+                         • 发送 /new 你的消息，创建会话并立即发送\n\
+                         • 引用回复机器人消息，继续对应的会话\n\
+                         • 使用 /help 查看帮助"
                         .into(),
                 ),
                 parse_mode: None,
@@ -368,8 +589,8 @@ impl ActionExecutor {
             }),
             "settings.show" => Ok(ActionResponse {
                 text: Some(
-                    "Settings are managed in the desktop app.\n\
-                         Go to Settings → Channel to configure plugins and manage users."
+                    "渠道设置由 SayDoneAI 桌面应用管理。\n\
+                         请前往远程连接 → Channels 配置渠道、CLI、模型和授权用户。"
                         .into(),
                 ),
                 parse_mode: None,
@@ -399,7 +620,7 @@ impl ActionExecutor {
                     buttons: None,
                     keyboard: None,
                     behavior: ActionBehavior::Send,
-                    toast: Some("Processing...".into()),
+                    toast: Some("处理中…".into()),
                     edit_message_id: None,
                 })
             }
@@ -409,7 +630,7 @@ impl ActionExecutor {
                 buttons: None,
                 keyboard: None,
                 behavior: ActionBehavior::Answer,
-                toast: Some("Copied to clipboard".into()),
+                toast: Some("已复制到剪贴板".into()),
                 edit_message_id: None,
             }),
             "system.confirm" => {
@@ -434,7 +655,7 @@ impl ActionExecutor {
                     buttons: None,
                     keyboard: None,
                     behavior: ActionBehavior::Answer,
-                    toast: Some("Confirmed".into()),
+                    toast: Some("已确认".into()),
                     edit_message_id: None,
                 })
             }
@@ -446,31 +667,145 @@ impl ActionExecutor {
     }
 }
 
+fn display_cli_name(cli: &str) -> &str {
+    if cli.eq_ignore_ascii_case("pi") {
+        "SayDone CLI"
+    } else {
+        cli
+    }
+}
+
 // ── Helper builders ─────────────────────────────────────────────────
+
+fn resolve_session_command(text: &str) -> Option<(&'static str, Option<String>)> {
+    let normalized = normalize_channel_command_text(text);
+    let (command, follow_up_text) = normalized
+        .split_once(' ')
+        .map_or((normalized.as_str(), None), |(command, follow_up)| {
+            (command, (!follow_up.is_empty()).then(|| follow_up.to_owned()))
+        });
+    let command = command.split('@').next()?.to_ascii_lowercase();
+    match command.as_str() {
+        "/new" => Some(("session.new", follow_up_text)),
+        "/help" if follow_up_text.is_none() => Some(("help.show", None)),
+        _ => None,
+    }
+}
+
+fn normalize_channel_command_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| {
+            !matches!(
+                character,
+                '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
+            )
+        })
+        .map(|character| match character {
+            '\u{3000}' => ' ',
+            '\u{ff0f}' | '\u{2044}' | '\u{2215}' => '/',
+            other => other,
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quoted_text_from_raw(raw: Option<&serde_json::Value>) -> Option<&str> {
+    raw.and_then(|value| value.get("quoted_text"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn quoted_route_candidates(value: Option<&str>) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let normalized = value
+        .replace("\r\n", "\n")
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            if let Some((prefix, suffix)) = line.split_once('：') {
+                format!(
+                    "{}：{}",
+                    prefix.trim_end(),
+                    suffix.split_whitespace().collect::<Vec<_>>().join(" ")
+                )
+            } else if let Some((prefix, suffix)) = line.split_once(':') {
+                format!(
+                    "{}:{}",
+                    prefix.trim_end(),
+                    suffix.split_whitespace().collect::<Vec<_>>().join(" ")
+                )
+            } else {
+                line.split_whitespace().collect::<Vec<_>>().join(" ")
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = vec![normalized.clone()];
+    if let Some((_, suffix)) = normalized.split_once('：').or_else(|| normalized.split_once(':'))
+        && !suffix.trim().is_empty()
+    {
+        candidates.push(suffix.trim().to_owned());
+    }
+    let without_ellipsis = normalized.trim_end_matches("...").trim_end_matches('…').trim();
+    if !without_ellipsis.is_empty() && without_ellipsis != normalized {
+        candidates.push(without_ellipsis.to_owned());
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn decode_weixin_message_timestamp(message_id: &str) -> Option<i64> {
+    if !(16..=20).contains(&message_id.len()) || !message_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let timestamp = message_id.parse::<u128>().ok()?.checked_div(4_194_304)?;
+    let timestamp = i64::try_from(timestamp).ok()?;
+    let earliest = 1_577_836_800_000_i64;
+    (timestamp >= earliest && timestamp <= aionui_common::now_ms() + 86_400_000).then_some(timestamp)
+}
+
+fn build_unbound_session_response() -> ActionResponse {
+    ActionResponse {
+        text: Some("我还不知道你想继续哪个会话。\n请引用回复我之前的一条消息，或发送 /new 创建新会话。".into()),
+        parse_mode: None,
+        buttons: None,
+        keyboard: None,
+        behavior: ActionBehavior::Send,
+        toast: None,
+        edit_message_id: None,
+    }
+}
 
 fn build_pairing_response(code: &str) -> ActionResponse {
     ActionResponse {
         text: Some(format!(
-            "Welcome! To use this bot, you need authorization.\n\n\
-             Your pairing code: *{code}*\n\n\
-             Share this code with the admin, who can approve it in \
-             Settings → Channel → Pairing Requests.\n\
-             The code expires in 10 minutes."
+            "欢迎使用 SayDoneAI。首次使用需要完成授权。\n\n\
+             你的配对码：*{code}*\n\n\
+             请把配对码交给管理员，由管理员在 SayDoneAI → 远程连接 → Channels 中批准。\n\
+             配对码将在 10 分钟后过期。"
         )),
         parse_mode: None,
         buttons: Some(vec![vec![
             ActionButton {
-                label: "Refresh Code".into(),
+                label: "刷新配对码".into(),
                 action: "pairing.refresh".into(),
                 params: None,
             },
             ActionButton {
-                label: "Check Status".into(),
+                label: "检查授权状态".into(),
                 action: "pairing.check".into(),
                 params: None,
             },
             ActionButton {
-                label: "Help".into(),
+                label: "帮助".into(),
                 action: "pairing.help".into(),
                 params: None,
             },
@@ -485,32 +820,34 @@ fn build_pairing_response(code: &str) -> ActionResponse {
 fn build_help_response() -> ActionResponse {
     ActionResponse {
         text: Some(
-            "How can I help?\n\
-             Choose an option below or just send me a message."
+            "Channels 使用方式：\n\
+             • 发送 /new 创建空白新会话\n\
+             • 发送 /new 你的消息，创建新会话并立即发送\n\
+             • 其他会话请引用回复我之前的消息，以继续对应会话"
                 .into(),
         ),
         parse_mode: None,
         buttons: Some(vec![
             vec![
                 ActionButton {
-                    label: "New Session".into(),
+                    label: "新建会话".into(),
                     action: "session.new".into(),
                     params: None,
                 },
                 ActionButton {
-                    label: "Session Status".into(),
+                    label: "会话状态".into(),
                     action: "session.status".into(),
                     params: None,
                 },
             ],
             vec![
                 ActionButton {
-                    label: "Features".into(),
+                    label: "功能".into(),
                     action: "help.features".into(),
                     params: None,
                 },
                 ActionButton {
-                    label: "Tips".into(),
+                    label: "使用提示".into(),
                     action: "help.tips".into(),
                     params: None,
                 },
@@ -525,7 +862,7 @@ fn build_help_response() -> ActionResponse {
 
 fn build_unknown_action_response(action: &str) -> ActionResponse {
     ActionResponse {
-        text: Some(format!("Unknown action: {action}")),
+        text: Some(format!("无法识别的操作：{action}")),
         parse_mode: None,
         buttons: None,
         keyboard: None,
@@ -667,6 +1004,15 @@ mod tests {
                 return Ok(existing.clone());
             }
             sessions.push(new_row.clone());
+            Ok(new_row.clone())
+        }
+        async fn create_session(
+            &self,
+            _owner_user_id: &str,
+            _user_id: &str,
+            new_row: &AssistantSessionRow,
+        ) -> Result<AssistantSessionRow, DbError> {
+            self.sessions.lock().unwrap().push(new_row.clone());
             Ok(new_row.clone())
         }
         async fn update_session_activity(
@@ -872,7 +1218,7 @@ mod tests {
             MessageResult::Action(resp) => {
                 assert_eq!(resp.behavior, ActionBehavior::Send);
                 let text = resp.text.unwrap();
-                assert!(text.contains("pairing code"));
+                assert!(text.contains("配对码"));
                 assert!(resp.buttons.is_some());
             }
             _ => panic!("Expected Action result for unauthorized user"),
@@ -890,19 +1236,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorized_user_text_dispatches_to_agent() {
+    async fn authorized_user_text_without_reply_route_is_rejected() {
         let (executor, repo) = setup();
         repo.add_authorized_user("tg_42", "telegram");
 
         let msg = make_text_message("tg_42", "chat_1", "Hello AI", PluginType::Telegram);
         let result = executor.handle_incoming_message(&msg).await.unwrap();
 
-        match result {
-            MessageResult::Dispatched { session_id, .. } => {
-                assert!(!session_id.is_empty());
-            }
-            _ => panic!("Expected Dispatched result for authorized user"),
-        }
+        let MessageResult::Action(response) = result else {
+            panic!("Expected unbound-session instructions");
+        };
+        assert!(response.text.as_deref().is_some_and(|text| text.contains("/new")));
     }
 
     // ── Platform action tests ──────────────────────────────────────────
@@ -925,7 +1269,7 @@ mod tests {
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
-                assert!(text.contains("pairing code"));
+                assert!(text.contains("配对码"));
             }
             _ => panic!("Expected Action result"),
         }
@@ -949,7 +1293,7 @@ mod tests {
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
-                assert!(text.contains("authorized"));
+                assert!(text.contains("授权已通过"));
             }
             _ => panic!("Expected Action result"),
         }
@@ -978,7 +1322,7 @@ mod tests {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
                 // tg_99 is authorized
-                assert!(text.contains("authorized"));
+                assert!(text.contains("授权已通过"));
             }
             _ => panic!("Expected Action result"),
         }
@@ -1001,7 +1345,7 @@ mod tests {
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
-                assert!(text.contains("authorization"));
+                assert!(text.contains("完成授权"));
             }
             _ => panic!("Expected Action result"),
         }
@@ -1024,31 +1368,25 @@ mod tests {
         );
         let result = executor.handle_incoming_message(&msg).await.unwrap();
         match result {
-            MessageResult::Action(resp) => {
+            MessageResult::RoutedAction {
+                response: resp,
+                session_id,
+                ..
+            } => {
                 let text = resp.text.unwrap();
-                assert!(text.contains("New session"));
-                // With no client_preferences configured, channels use bundled Pi.
-                assert!(text.contains("acp"));
+                assert!(text.contains("新会话已就绪"));
+                assert!(!session_id.is_empty());
             }
-            _ => panic!("Expected Action result"),
+            _ => panic!("Expected routed action result"),
         }
     }
 
     #[tokio::test]
-    async fn session_new_resets_existing_session() {
+    async fn session_new_preserves_existing_sessions() {
         let (executor, repo) = setup();
         repo.add_authorized_user("tg_42", "telegram");
 
-        // First: send a text message to create a session
-        let text_msg = make_text_message("tg_42", "chat_1", "Hello", PluginType::Telegram);
-        let r1 = executor.handle_incoming_message(&text_msg).await.unwrap();
-        let sid1 = match r1 {
-            MessageResult::Dispatched { session_id, .. } => session_id,
-            _ => panic!("Expected Dispatched"),
-        };
-
-        // Then: session.new should delete old + create fresh
-        let new_msg = make_action_message(
+        let first_new = make_action_message(
             "tg_42",
             "chat_1",
             "session.new",
@@ -1056,36 +1394,37 @@ mod tests {
             PluginType::Telegram,
             None,
         );
-        let r2 = executor.handle_incoming_message(&new_msg).await.unwrap();
-        match r2 {
-            MessageResult::Action(resp) => {
-                let text = resp.text.unwrap();
-                assert!(text.contains("New session"));
-            }
-            _ => panic!("Expected Action result"),
-        }
-
-        // Send another text message — the session ID should differ
-        let text_msg2 = make_text_message("tg_42", "chat_1", "Again", PluginType::Telegram);
-        let r3 = executor.handle_incoming_message(&text_msg2).await.unwrap();
-        let sid3 = match r3 {
-            MessageResult::Dispatched { session_id, .. } => session_id,
-            _ => panic!("Expected Dispatched"),
+        let r1 = executor.handle_incoming_message(&first_new).await.unwrap();
+        let sid1 = match r1 {
+            MessageResult::RoutedAction { session_id, .. } => session_id,
+            _ => panic!("Expected routed action"),
         };
-        // New session has different full ID (reset deleted the old one)
-        assert_ne!(sid1, sid3);
 
-        // Only 1 session should exist for this user+chat
+        let second_new = make_action_message(
+            "tg_42",
+            "chat_1",
+            "session.new",
+            ActionCategory::System,
+            PluginType::Telegram,
+            None,
+        );
+        let r2 = executor.handle_incoming_message(&second_new).await.unwrap();
+        let sid2 = match r2 {
+            MessageResult::RoutedAction { session_id, .. } => session_id,
+            _ => panic!("Expected routed action"),
+        };
+        assert_ne!(sid1, sid2);
+
         let sessions = repo.sessions.lock().unwrap();
         let user_chat_sessions: Vec<_> = sessions
             .iter()
             .filter(|s| s.user_id == "user_tg_42" && s.chat_id.as_deref() == Some("chat_1"))
             .collect();
-        assert_eq!(user_chat_sessions.len(), 1);
+        assert_eq!(user_chat_sessions.len(), 2);
     }
 
     #[tokio::test]
-    async fn session_status_shows_info() {
+    async fn session_status_without_reply_route_shows_instructions() {
         let (executor, repo) = setup();
         repo.add_authorized_user("tg_42", "telegram");
 
@@ -1101,8 +1440,7 @@ mod tests {
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
-                assert!(text.contains("Session:"));
-                assert!(text.contains("Agent:"));
+                assert!(text.contains("/new"));
             }
             _ => panic!("Expected Action result"),
         }
@@ -1154,7 +1492,7 @@ mod tests {
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
-                assert!(text.contains("Unknown action"));
+                assert!(text.contains("无法识别的操作"));
                 assert!(text.contains("agent.show"));
             }
             _ => panic!("Expected Action result"),
@@ -1179,7 +1517,7 @@ mod tests {
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
-                assert!(text.contains("Unknown action"));
+                assert!(text.contains("无法识别的操作"));
                 assert!(text.contains("agent.select"));
             }
             _ => panic!("Expected Action result"),
@@ -1206,7 +1544,7 @@ mod tests {
         match result {
             MessageResult::Action(resp) => {
                 assert_eq!(resp.behavior, ActionBehavior::Answer);
-                assert_eq!(resp.toast.as_deref(), Some("Confirmed"));
+                assert_eq!(resp.toast.as_deref(), Some("已确认"));
             }
             _ => panic!("Expected Action result"),
         }
@@ -1229,7 +1567,7 @@ mod tests {
         match result {
             MessageResult::Action(resp) => {
                 assert_eq!(resp.behavior, ActionBehavior::Answer);
-                assert!(resp.toast.as_deref().unwrap().contains("Copied"));
+                assert!(resp.toast.as_deref().unwrap().contains("已复制"));
             }
             _ => panic!("Expected Action result"),
         }
@@ -1254,7 +1592,7 @@ mod tests {
         match result {
             MessageResult::Action(resp) => {
                 let text = resp.text.unwrap();
-                assert!(text.contains("Unknown action"));
+                assert!(text.contains("无法识别的操作"));
             }
             _ => panic!("Expected Action result"),
         }
@@ -1267,7 +1605,7 @@ mod tests {
         let resp = build_pairing_response("123456");
         let text = resp.text.unwrap();
         assert!(text.contains("123456"));
-        assert!(text.contains("pairing code"));
+        assert!(text.contains("配对码"));
         assert_eq!(resp.behavior, ActionBehavior::Send);
         assert!(resp.buttons.is_some());
     }
@@ -1285,5 +1623,31 @@ mod tests {
         let resp = build_unknown_action_response("foo.bar");
         let text = resp.text.unwrap();
         assert!(text.contains("foo.bar"));
+    }
+
+    #[test]
+    fn quoted_route_candidates_normalize_weixin_preview_text() {
+        let candidates = quoted_route_candidates(Some("AI：  answer line  \r\n\r\n"));
+        assert!(candidates.contains(&"AI：answer line".to_owned()));
+        assert!(candidates.contains(&"answer line".to_owned()));
+    }
+
+    #[test]
+    fn decode_weixin_message_timestamp_accepts_snowflake_ids() {
+        let expected = now_ms();
+        let message_id = (u128::try_from(expected).unwrap() * 4_194_304).to_string();
+        assert_eq!(decode_weixin_message_timestamp(&message_id), Some(expected));
+    }
+
+    #[test]
+    fn decode_weixin_message_timestamp_rejects_non_snowflake_ids() {
+        assert_eq!(decode_weixin_message_timestamp("bot-route-42"), None);
+        assert_eq!(decode_weixin_message_timestamp("1234"), None);
+    }
+
+    #[test]
+    fn pi_backend_is_presented_as_saydone_cli() {
+        assert_eq!(display_cli_name("pi"), "SayDone CLI");
+        assert_eq!(display_cli_name("claude"), "claude");
     }
 }

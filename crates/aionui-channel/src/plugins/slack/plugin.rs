@@ -153,6 +153,7 @@ impl ChannelPlugin for SlackPlugin {
         let PluginCallbacks {
             message_tx,
             confirm_tx: _,
+            credential_update_tx: _,
         } = callbacks;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

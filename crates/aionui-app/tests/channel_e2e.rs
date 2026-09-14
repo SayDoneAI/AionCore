@@ -338,6 +338,42 @@ async fn get_channel_settings_omits_unavailable_default_pi_assistant() {
 }
 
 #[tokio::test]
+async fn wecom_channel_settings_namespace_is_available() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let req = json_with_token(
+        "PUT",
+        "/api/channel/settings/wecom/assistant",
+        json!({
+            "assistant_id": "bare-claude",
+            "name": "Claude",
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = get_with_token("/api/channel/settings/wecom", &token);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["platform"], "wecom");
+    assert_eq!(json["data"]["assistant"]["assistant_id"], "bare-claude");
+
+    let req = json_with_token(
+        "POST",
+        "/api/channel/settings/sync",
+        json!({ "platform": "wecom" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn put_channel_assistant_setting_persists_binding() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
@@ -402,7 +438,7 @@ async fn put_channel_default_model_setting_persists_model_ref() {
 }
 
 #[tokio::test]
-async fn put_channel_assistant_setting_clears_active_sessions() {
+async fn put_channel_assistant_setting_preserves_existing_reply_routes() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let repo: std::sync::Arc<dyn IChannelRepository> =
@@ -442,6 +478,16 @@ async fn put_channel_assistant_setting_clears_active_sessions() {
     )
     .await
     .unwrap();
+    repo.upsert_session_route(
+        OWNER_ID,
+        "sess-channel-assistant",
+        "lark",
+        "chat-channel-assistant",
+        "bot-message-before-agent-change",
+        now,
+    )
+    .await
+    .unwrap();
     assert_eq!(repo.get_all_sessions(OWNER_ID).await.unwrap().len(), 1);
 
     let req = json_with_token(
@@ -456,11 +502,23 @@ async fn put_channel_assistant_setting_clears_active_sessions() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
+    assert_eq!(repo.get_all_sessions(OWNER_ID).await.unwrap().len(), 1);
+    assert!(
+        repo.get_session_by_route(
+            OWNER_ID,
+            "user-channel-assistant",
+            "lark",
+            "chat-channel-assistant",
+            "bot-message-before-agent-change",
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
 }
 
 #[tokio::test]
-async fn put_channel_default_model_setting_clears_active_sessions() {
+async fn put_channel_default_model_setting_preserves_active_sessions() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
     let repo: std::sync::Arc<dyn IChannelRepository> =
@@ -510,14 +568,56 @@ async fn put_channel_default_model_setting_clears_active_sessions() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    assert!(repo.get_all_sessions(OWNER_ID).await.unwrap().is_empty());
+    assert_eq!(repo.get_all_sessions(OWNER_ID).await.unwrap().len(), 1);
 }
 
-// SS-1: Sync valid platform clears sessions
+// SS-1: Sync valid platform preserves sessions and their quoted-reply routes
 #[tokio::test]
 async fn sync_settings_valid() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let repo: std::sync::Arc<dyn IChannelRepository> =
+        std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
+
+    let now = now_ms();
+    repo.create_user(
+        OWNER_ID,
+        &AssistantUserRow {
+            id: "user-channel-sync".to_owned(),
+            owner_user_id: OWNER_ID.to_owned(),
+            platform_user_id: "user-channel-sync".to_owned(),
+            platform_type: "telegram".to_owned(),
+            display_name: Some("Channel Sync User".to_owned()),
+            authorized_at: now,
+            last_active: Some(now),
+            session_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let session = AssistantSessionRow {
+        id: "sess-channel-sync".to_owned(),
+        user_id: "user-channel-sync".to_owned(),
+        agent_type: "acp".to_owned(),
+        conversation_id: None,
+        workspace: None,
+        chat_id: Some("chat-channel-sync".to_owned()),
+        created_at: now,
+        last_activity: now,
+    };
+    repo.get_or_create_session(OWNER_ID, "user-channel-sync", "chat-channel-sync", &session)
+        .await
+        .unwrap();
+    repo.upsert_session_route(
+        OWNER_ID,
+        "sess-channel-sync",
+        "telegram",
+        "chat-channel-sync",
+        "bot-message-before-sync",
+        now,
+    )
+    .await
+    .unwrap();
 
     let req = json_with_token(
         "POST",
@@ -532,6 +632,18 @@ async fn sync_settings_valid() {
     let json = body_json(resp).await;
     assert!(json["success"].as_bool().unwrap());
     assert!(json["data"]["success"].as_bool().unwrap());
+    assert!(
+        repo.get_session_by_route(
+            OWNER_ID,
+            "user-channel-sync",
+            "telegram",
+            "chat-channel-sync",
+            "bot-message-before-sync",
+        )
+        .await
+        .unwrap()
+        .is_some()
+    );
 }
 
 // SS-2: Sync missing platform fails deserialization

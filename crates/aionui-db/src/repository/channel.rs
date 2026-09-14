@@ -80,6 +80,102 @@ pub trait IChannelRepository: Send + Sync {
         new_row: &AssistantSessionRow,
     ) -> Result<AssistantSessionRow, DbError>;
 
+    /// Inserts a new session even when the same user and chat already have sessions.
+    async fn create_session(
+        &self,
+        owner_user_id: &str,
+        channel_user_id: &str,
+        new_row: &AssistantSessionRow,
+    ) -> Result<AssistantSessionRow, DbError> {
+        let _ = (owner_user_id, channel_user_id, new_row);
+        Err(DbError::Init("create_session is not implemented".into()))
+    }
+
+    /// Resolves a platform reply target to its exact channel session.
+    async fn get_session_by_route(
+        &self,
+        owner_user_id: &str,
+        channel_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Option<AssistantSessionRow>, DbError> {
+        let _ = (owner_user_id, channel_user_id, platform_type, chat_id, message_id);
+        Err(DbError::Init("get_session_by_route is not implemented".into()))
+    }
+
+    /// Binds a platform message to a session and keeps recent route history bounded.
+    async fn upsert_session_route(
+        &self,
+        owner_user_id: &str,
+        session_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+        created_at: TimestampMs,
+    ) -> Result<(), DbError> {
+        let _ = (
+            owner_user_id,
+            session_id,
+            platform_type,
+            chat_id,
+            message_id,
+            created_at,
+        );
+        Err(DbError::Init("upsert_session_route is not implemented".into()))
+    }
+
+    // ── Conversation reply routes ───────────────────────────────────
+
+    /// Binds an outgoing platform message to any desktop conversation.
+    async fn upsert_conversation_route(
+        &self,
+        _owner_user_id: &str,
+        _params: &UpsertChannelConversationRouteParams<'_>,
+    ) -> Result<(), DbError> {
+        Err(DbError::Init("upsert_conversation_route is not implemented".into()))
+    }
+
+    /// Resolves an exact quoted platform message to its desktop conversation.
+    async fn resolve_conversation_route(
+        &self,
+        _owner_user_id: &str,
+        _platform_type: &str,
+        _chat_id: &str,
+        _message_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        Err(DbError::Init("resolve_conversation_route is not implemented".into()))
+    }
+
+    /// Resolves quoted preview text. When `require_unique` is true, ambiguous
+    /// matches intentionally return `None`.
+    async fn resolve_conversation_route_by_preview(
+        &self,
+        _owner_user_id: &str,
+        _platform_type: &str,
+        _chat_id: &str,
+        _quoted_text: &str,
+        _require_unique: bool,
+    ) -> Result<Option<String>, DbError> {
+        Err(DbError::Init(
+            "resolve_conversation_route_by_preview is not implemented".into(),
+        ))
+    }
+
+    /// Resolves a WeChat snowflake timestamp against recorded send/delivery times.
+    async fn resolve_conversation_route_by_timestamp(
+        &self,
+        _owner_user_id: &str,
+        _platform_type: &str,
+        _chat_id: &str,
+        _reply_timestamp: TimestampMs,
+        _max_skew_ms: TimestampMs,
+    ) -> Result<Option<String>, DbError> {
+        Err(DbError::Init(
+            "resolve_conversation_route_by_timestamp is not implemented".into(),
+        ))
+    }
+
     /// Updates `last_activity` timestamp for a session.
     async fn update_session_activity(
         &self,
@@ -136,4 +232,17 @@ pub struct UpdatePluginStatusParams {
     pub status: Option<String>,
     pub last_connected: Option<TimestampMs>,
     pub enabled: Option<bool>,
+}
+
+/// Parameters for recording one outgoing channel message as a reply target.
+#[derive(Debug, Clone)]
+pub struct UpsertChannelConversationRouteParams<'a> {
+    pub conversation_id: &'a str,
+    pub platform_type: &'a str,
+    pub chat_id: &'a str,
+    pub message_id: &'a str,
+    pub preview_text: Option<&'a str>,
+    pub sent_at: TimestampMs,
+    pub delivery_started_at: Option<TimestampMs>,
+    pub delivery_completed_at: Option<TimestampMs>,
 }

@@ -6288,7 +6288,7 @@ fn validate_managed_runtime_target(row: &ConversationRow, backend: &str) -> Resu
             let is_builtin = extra
                 .get("agent_source")
                 .and_then(serde_json::Value::as_str)
-                .is_none_or(|source| source.eq_ignore_ascii_case("builtin"));
+                .is_some_and(|source| source.eq_ignore_ascii_case("builtin"));
             let configured_backend = extra.get("backend").and_then(serde_json::Value::as_str);
             if row.r#type != "acp"
                 || !is_builtin
@@ -7195,6 +7195,15 @@ mod tests {
     #[test]
     fn managed_runtime_target_rejects_custom_acp_agents() {
         let row = managed_target_row("acp", r#"{"backend":"claude","agent_source":"custom"}"#, None);
+
+        let error = validate_managed_runtime_target(&row, "claude").unwrap_err();
+
+        assert!(matches!(error, ConversationError::Forbidden { .. }));
+    }
+
+    #[test]
+    fn managed_runtime_target_rejects_acp_agents_without_explicit_builtin_source() {
+        let row = managed_target_row("acp", r#"{"backend":"claude"}"#, None);
 
         let error = validate_managed_runtime_target(&row, "claude").unwrap_err();
 

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest, SendMessageRequest};
+use aionui_api_types::{
+    AssistantConversationOverridesRequest, AssistantConversationRequest, ConversationResponse,
+    CreateConversationRequest, SendMessageRequest,
+};
 use aionui_common::{AgentType, ConversationSource};
 use aionui_conversation::ConversationService;
 use aionui_db::models::AssistantSessionRow;
@@ -14,6 +17,14 @@ use crate::error::ChannelError;
 use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
 
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+const SAYDONE_MANAGED_MODEL_PROVIDER_ID: &str = "saydone-managed-openai";
+
+/// Host-owned boundary used to attach a short-lived SayDoneAI managed runtime
+/// before a channel conversation starts its CLI process.
+#[async_trait::async_trait]
+pub trait ChannelManagedRuntimePreparer: Send + Sync {
+    async fn prepare(&self, conversation_id: &str, backend: &str, model: &str) -> Result<(), String>;
+}
 
 /// Bridges channel messages to the conversation + AI agent layer.
 ///
@@ -27,6 +38,7 @@ pub struct ChannelMessageService {
     conversation_svc: Arc<ConversationService>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     settings: Arc<ChannelSettingsService>,
+    managed_runtime_preparer: Option<Arc<dyn ChannelManagedRuntimePreparer>>,
 }
 
 impl ChannelMessageService {
@@ -39,7 +51,17 @@ impl ChannelMessageService {
             conversation_svc,
             task_manager,
             settings,
+            managed_runtime_preparer: None,
         }
+    }
+
+    pub fn with_managed_runtime_preparer(mut self, preparer: Arc<dyn ChannelManagedRuntimePreparer>) -> Self {
+        self.managed_runtime_preparer = Some(preparer);
+        self
+    }
+
+    pub fn runtime_state(&self) -> Arc<aionui_conversation::runtime_state::ConversationRuntimeStateService> {
+        self.conversation_svc.runtime_state()
     }
 
     /// Sends a text message from a channel user to the AI agent.
@@ -59,13 +81,9 @@ impl ChannelMessageService {
         platform: PluginType,
     ) -> Result<SendResult, ChannelError> {
         // Ensure conversation exists
-        let conversation_id = match &session.conversation_id {
-            Some(cid) => cid.clone(),
-            None => {
-                self.create_conversation_for_session(owner_user_id, session, platform)
-                    .await?
-            }
-        };
+        let conversation_id = self.ensure_conversation(owner_user_id, session, platform).await?;
+
+        self.prepare_managed_runtime(owner_user_id, &conversation_id).await?;
 
         // Send message through ConversationService. `msg_id` is now
         // server-generated inside the service; channel plugins that need to
@@ -118,16 +136,38 @@ impl ChannelMessageService {
         })
     }
 
+    async fn prepare_managed_runtime(&self, owner_user_id: &str, conversation_id: &str) -> Result<(), ChannelError> {
+        let conversation = self
+            .conversation_svc
+            .get(owner_user_id, conversation_id)
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+        let Some((backend, model)) = managed_runtime_target(&conversation) else {
+            return Ok(());
+        };
+        let preparer = self.managed_runtime_preparer.as_ref().ok_or_else(|| {
+            ChannelError::MessageSendFailed("SayDoneAI 托管模型服务未启动，请重启应用后重试。".into())
+        })?;
+        preparer
+            .prepare(conversation_id, backend, &model)
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(format!("托管模型准备失败：{error}")))
+    }
+
     /// Creates a new conversation for a channel session.
     ///
     /// Sets `source` to the appropriate platform and `channel_chat_id`
     /// for per-chat isolation.
-    async fn create_conversation_for_session(
+    pub async fn ensure_conversation(
         &self,
         owner_user_id: &str,
         session: &AssistantSessionRow,
         platform: PluginType,
     ) -> Result<String, ChannelError> {
+        if let Some(conversation_id) = &session.conversation_id {
+            return Ok(conversation_id.clone());
+        }
+
         let source = platform_to_source(platform);
         let agent_config = self
             .settings
@@ -153,6 +193,13 @@ impl ChannelMessageService {
         } else {
             agent_config.backend.as_deref()
         });
+        if assistant_id.is_none()
+            && model_config
+                .as_ref()
+                .is_some_and(|model| model.provider_id == SAYDONE_MANAGED_MODEL_PROVIDER_ID)
+        {
+            extra["agent_source"] = serde_json::Value::String("builtin".to_owned());
+        }
         let name = assistant_name.unwrap_or_else(|| {
             channel_conversation_name(
                 platform,
@@ -177,7 +224,12 @@ impl ChannelMessageService {
             assistant: assistant_id.map(|assistant_id| AssistantConversationRequest {
                 id: assistant_id,
                 locale: None,
-                conversation_overrides: None,
+                conversation_overrides: model_config.as_ref().and_then(|config| config.use_model.clone()).map(
+                    |model| AssistantConversationOverridesRequest {
+                        model: Some(model),
+                        ..Default::default()
+                    },
+                ),
             }),
             source: Some(source),
             channel_chat_id: session.chat_id.clone(),
@@ -260,7 +312,7 @@ impl ChannelMessageService {
     pub fn build_thinking_message() -> UnifiedOutgoingMessage {
         UnifiedOutgoingMessage {
             message_type: OutgoingMessageType::Text,
-            text: Some("\u{23f3} Thinking...".into()),
+            text: Some("\u{23f3} 正在思考…".into()),
             parse_mode: None,
             buttons: None,
             keyboard: None,
@@ -282,17 +334,17 @@ impl ChannelMessageService {
             parse_mode: None,
             buttons: Some(vec![vec![
                 ActionButton {
-                    label: "\u{1f504} Regenerate".into(),
+                    label: "\u{1f504} 重新生成".into(),
                     action: "chat.regenerate".into(),
                     params: None,
                 },
                 ActionButton {
-                    label: "\u{25b6}\u{fe0f} Continue".into(),
+                    label: "\u{25b6}\u{fe0f} 继续".into(),
                     action: "chat.continue".into(),
                     params: None,
                 },
                 ActionButton {
-                    label: "\u{2795} New Session".into(),
+                    label: "\u{2795} 新建会话".into(),
                     action: "session.new".into(),
                     params: None,
                 },
@@ -382,7 +434,7 @@ fn platform_to_source(platform: PluginType) -> ConversationSource {
         PluginType::Dingtalk => ConversationSource::Dingtalk,
         PluginType::Weixin => ConversationSource::Weixin,
         // Reserved variants default to Aionui
-        PluginType::Slack | PluginType::Discord => ConversationSource::Aionui,
+        PluginType::Slack | PluginType::Discord | PluginType::Wecom => ConversationSource::Aionui,
     }
 }
 
@@ -426,6 +478,7 @@ fn channel_conversation_name(
         PluginType::Lark => "lark",
         PluginType::Dingtalk => "ding",
         PluginType::Weixin => "wx",
+        PluginType::Wecom => "wecom",
         PluginType::Slack => "slack",
         PluginType::Discord => "discord",
     };
@@ -446,6 +499,58 @@ fn channel_conversation_name(
     parts.join("-")
 }
 
+fn managed_runtime_target(conversation: &ConversationResponse) -> Option<(&'static str, String)> {
+    match conversation.r#type {
+        AgentType::Acp => {
+            let backend = conversation.extra.get("backend")?.as_str()?;
+            let backend = match backend {
+                "pi" => "pi",
+                "claude" => "claude",
+                "codex" => "codex",
+                _ => return None,
+            };
+            let is_builtin = conversation
+                .extra
+                .get("agent_source")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|source| source.eq_ignore_ascii_case("builtin"));
+            if !is_builtin {
+                return None;
+            }
+            let model = conversation
+                .extra
+                .get("current_model_id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    let model = conversation.extra.get("model")?;
+                    let provider_id = model
+                        .get("provider_id")
+                        .or_else(|| model.get("id"))
+                        .and_then(serde_json::Value::as_str)?;
+                    if provider_id != SAYDONE_MANAGED_MODEL_PROVIDER_ID {
+                        return None;
+                    }
+                    model
+                        .get("use_model")
+                        .or_else(|| model.get("model"))
+                        .and_then(serde_json::Value::as_str)
+                })?
+                .trim();
+            let model = model.strip_prefix("saydone/").unwrap_or(model).trim();
+            (!model.is_empty()).then(|| (backend, model.to_owned()))
+        }
+        AgentType::Aionrs => {
+            let model = conversation.model.as_ref()?;
+            if model.provider_id != SAYDONE_MANAGED_MODEL_PROVIDER_ID {
+                return None;
+            }
+            let selected = model.use_model.as_deref().unwrap_or(model.model.as_str()).trim();
+            (!selected.is_empty()).then(|| ("saydone", selected.to_owned()))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +559,33 @@ mod tests {
         ToolCallStatus,
     };
     use aionui_common::ProviderWithModel;
+
+    fn managed_target_conversation(
+        agent_type: AgentType,
+        extra: serde_json::Value,
+        model: Option<ProviderWithModel>,
+    ) -> ConversationResponse {
+        ConversationResponse {
+            id: "conversation-1".to_owned(),
+            name: "test".to_owned(),
+            name_source: None,
+            r#type: agent_type,
+            model,
+            status: aionui_common::ConversationStatus::Pending,
+            runtime: None,
+            source: None,
+            pinned: false,
+            pinned_at: None,
+            channel_chat_id: None,
+            assistant: None,
+            project_id: None,
+            fork_capability: None,
+            prompt_capability: None,
+            created_at: 0,
+            modified_at: 0,
+            extra,
+        }
+    }
 
     // ── platform_to_source ─────────────────────────────────────────────
 
@@ -510,6 +642,81 @@ mod tests {
     fn parse_unknown_agent_type_defaults_to_acp() {
         assert_eq!(parse_agent_type("unknown").unwrap(), AgentType::Acp);
         assert_eq!(parse_agent_type("").unwrap(), AgentType::Acp);
+    }
+
+    #[test]
+    fn managed_pi_target_strips_wire_provider_prefix_for_host_lookup() {
+        let conversation = managed_target_conversation(
+            AgentType::Acp,
+            serde_json::json!({
+                "backend": "pi",
+                "agent_source": "builtin",
+                "current_model_id": "saydone/deepseek-flash",
+            }),
+            None,
+        );
+
+        assert_eq!(
+            managed_runtime_target(&conversation),
+            Some(("pi", "deepseek-flash".to_owned()))
+        );
+    }
+
+    #[test]
+    fn custom_acp_target_does_not_receive_managed_runtime() {
+        let conversation = managed_target_conversation(
+            AgentType::Acp,
+            serde_json::json!({
+                "backend": "pi",
+                "agent_source": "custom",
+                "current_model_id": "deepseek-flash",
+            }),
+            None,
+        );
+
+        assert_eq!(managed_runtime_target(&conversation), None);
+    }
+
+    #[test]
+    fn acp_target_without_explicit_builtin_source_does_not_receive_managed_runtime() {
+        let conversation = managed_target_conversation(
+            AgentType::Acp,
+            serde_json::json!({
+                "backend": "pi",
+                "current_model_id": "deepseek-flash",
+            }),
+            None,
+        );
+
+        assert_eq!(managed_runtime_target(&conversation), None);
+    }
+
+    #[test]
+    fn saydone_cli_requires_managed_provider_marker() {
+        let managed = managed_target_conversation(
+            AgentType::Aionrs,
+            serde_json::json!({}),
+            Some(ProviderWithModel {
+                provider_id: SAYDONE_MANAGED_MODEL_PROVIDER_ID.to_owned(),
+                model: "deepseek-flash".to_owned(),
+                use_model: Some("deepseek-flash".to_owned()),
+            }),
+        );
+        let user_provider = managed_target_conversation(
+            AgentType::Aionrs,
+            serde_json::json!({}),
+            Some(ProviderWithModel {
+                provider_id: "user-provider".to_owned(),
+                model: "deepseek-flash".to_owned(),
+                use_model: Some("deepseek-flash".to_owned()),
+            }),
+        );
+
+        assert_eq!(
+            managed_runtime_target(&managed),
+            Some(("saydone", "deepseek-flash".to_owned()))
+        );
+        assert_eq!(managed_runtime_target(&user_provider), None);
     }
 
     // ── process_stream_event ───────────────────────────────────────────
@@ -593,7 +800,7 @@ mod tests {
         let msg = ChannelMessageService::build_thinking_message();
         assert_eq!(msg.message_type, OutgoingMessageType::Text);
         let text = msg.text.unwrap();
-        assert!(text.contains("Thinking"));
+        assert!(text.contains("正在思考"));
     }
 
     // ── build_final_message ────────────────────────────────────────────
