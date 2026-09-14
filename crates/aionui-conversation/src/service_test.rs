@@ -1478,7 +1478,8 @@ fn make_create_req_with_backend(backend: &str) -> CreateConversationRequest {
         "extra": {
             "workspace": workspace,
             "custom_workspace": true,
-            "backend": backend
+            "backend": backend,
+            "agent_source": "builtin"
         }
     }))
     .unwrap()
