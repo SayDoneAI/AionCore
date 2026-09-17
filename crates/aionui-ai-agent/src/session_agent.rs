@@ -442,6 +442,7 @@ impl SessionAgentTask {
             // No broadcaster: this ctor is the test/simple path, which has no
             // conversation WebSocket to push a late usage frame to.
             None,
+            None,
         )
     }
 
@@ -461,6 +462,7 @@ impl SessionAgentTask {
         handshake: &aionui_api_types::AgentHandshake,
         prompt_dump: Option<SessionPromptDump>,
         broadcaster: Option<Arc<dyn EventBroadcaster>>,
+        initial_effort: Option<String>,
     ) -> Arc<Self> {
         Self::build(
             agent_type,
@@ -472,6 +474,7 @@ impl SessionAgentTask {
             CatalogPreload::from_handshake(handshake),
             prompt_dump,
             broadcaster,
+            initial_effort,
         )
     }
 
@@ -486,6 +489,7 @@ impl SessionAgentTask {
         catalog_preload: CatalogPreload,
         prompt_dump: Option<SessionPromptDump>,
         broadcaster: Option<Arc<dyn EventBroadcaster>>,
+        initial_effort: Option<String>,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
@@ -496,7 +500,7 @@ impl SessionAgentTask {
             session_id: std::sync::Mutex::new(None),
             mode_override: std::sync::Mutex::new(None),
             model_override: std::sync::Mutex::new(None),
-            effort_override: std::sync::Mutex::new(None),
+            effort_override: std::sync::Mutex::new(initial_effort),
             last_catalog: std::sync::Mutex::new(None),
             caps_fallback: std::sync::Mutex::new(CapsFallback::default()),
         });
@@ -1776,6 +1780,7 @@ pub async fn build_antigravity_instance(
         &metadata.handshake,
         None,
         Some(broadcaster),
+        None,
     );
     Ok(crate::agent_task::AgentInstance::Session(task))
 }
@@ -2035,6 +2040,7 @@ pub async fn build_session_instance(
     // is discovered) and drops it if unsupported — the same clear_invalid_desired_*
     // semantics as the codex model/mode reconcile. Best-effort: a dispatch failure must
     // not fail the open (the session is usable; only the persisted effort is lost).
+    let mut applied_effort = None;
     if let Some(effort) = persisted_effort {
         if let Err(e) = backend
             .dispatch(Command::SetConfigOption {
@@ -2046,6 +2052,7 @@ pub async fn build_session_instance(
             tracing::warn!(conv_id = %conversation_id, effort = %effort, error = %e, "session-port: re-applying persisted effort failed (session usable, effort not restored)");
         } else {
             tracing::info!(conv_id = %conversation_id, effort = %effort, "session-port: re-applied persisted reasoning effort after open");
+            applied_effort = Some(effort);
         }
     }
 
@@ -2074,6 +2081,7 @@ pub async fn build_session_instance(
         // Lets the pump push a usage frame that arrives after the turn's relay has
         // already stopped listening — the claude case (usage rides `result`).
         Some(broadcaster),
+        applied_effort,
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
@@ -6525,6 +6533,30 @@ mod persist_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_open_effort_is_visible_before_backend_echo() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(EffortCapsBackend);
+        let task = SessionAgentTask::new_with_preload(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            &aionui_api_types::AgentHandshake::default(),
+            None,
+            None,
+            Some("max".into()),
+        );
+        let snapshot = task.get_config_options().await.unwrap();
+        let effort = snapshot
+            .config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("thought_level"))
+            .expect("effort option");
+        assert_eq!(effort.current_value.as_deref(), Some("max"));
+    }
+
     // A model with no advertised efforts (claude `haiku`) must NOT get an effort option —
     // an empty select would render a dead, choice-less group.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7754,6 +7786,7 @@ mod pump_tests {
                 backend: "claude",
             }),
             None,
+            None,
         );
         crate::agent_task::IAgentTask::send_message(
             task.as_ref(),
@@ -7797,6 +7830,7 @@ mod pump_tests {
                 backend: "codex",
             }),
             None,
+            None,
         );
         // Inject an image directly onto the task's dump path via a content slice
         // containing an Image block.
@@ -7831,6 +7865,7 @@ mod pump_tests {
             backend,
             None,
             CatalogPreload::default(),
+            None,
             None,
             None,
         );
@@ -9870,6 +9905,7 @@ mod pump_tests {
             &handshake_with_catalog(),
             None,
             None,
+            None,
         );
 
         // get_model serves the preloaded catalog + persisted current model.
@@ -9930,6 +9966,7 @@ mod pump_tests {
             &stale,
             None,
             None,
+            None,
         );
         let m = task.get_model().await.unwrap().model_info.expect("model_info");
         assert_eq!(
@@ -9984,6 +10021,7 @@ mod pump_tests {
             backend,
             None,
             &handshake_with_catalog(),
+            None,
             None,
             None,
         );

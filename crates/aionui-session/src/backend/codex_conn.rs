@@ -53,6 +53,7 @@ const SAYDONE_MANAGED_BACKEND_ENV: &str = "SAYDONE_MANAGED_BACKEND";
 const SAYDONE_MANAGED_PROTOCOL_ENV: &str = "SAYDONE_MANAGED_PROTOCOL";
 const SAYDONE_MANAGED_MODEL_ENV: &str = "SAYDONE_MANAGED_MODEL";
 const SAYDONE_MANAGED_BASE_URL_ENV: &str = "SAYDONE_MANAGED_BASE_URL";
+const SAYDONE_MANAGED_REASONING_POLICY_ENV: &str = "SAYDONE_MANAGED_REASONING_POLICY";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// 仅在完整的 SayDone 托管 Codex 上保留服务端已授权的模型。
@@ -64,6 +65,8 @@ const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 struct SaydoneManagedCodexRuntime {
     model: String,
     base_url: String,
+    reasoning_efforts: Vec<String>,
+    default_reasoning_effort: Option<String>,
 }
 
 fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManagedCodexRuntime> {
@@ -79,6 +82,26 @@ fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManage
     let model = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_MODEL_ENV)?;
     let base_url = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BASE_URL_ENV)?;
     let api_key = unique_env_value(&config.spawn_env, OPENAI_API_KEY_ENV)?;
+    let reasoning_policy = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_REASONING_POLICY_ENV)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok());
+    let reasoning_efforts = reasoning_policy
+        .as_ref()
+        .and_then(|policy| policy.get("efforts"))
+        .and_then(Value::as_array)
+        .map(|efforts| {
+            efforts
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let default_reasoning_effort = reasoning_policy
+        .as_ref()
+        .and_then(|policy| policy.get("default_effort"))
+        .and_then(Value::as_str)
+        .filter(|effort| reasoning_efforts.iter().any(|allowed| allowed == effort))
+        .map(str::to_owned);
     (unique_env_value(&config.spawn_env, SAYDONE_MANAGED_AGENT_ENV) == Some("1")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BACKEND_ENV) == Some("codex")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_PROTOCOL_ENV) == Some("openai")
@@ -87,60 +110,24 @@ fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManage
     .then(|| SaydoneManagedCodexRuntime {
         model: model.to_owned(),
         base_url: base_url.to_owned(),
+        reasoning_efforts,
+        default_reasoning_effort,
     })
-}
-
-fn saydone_managed_reasoning_levels(model: &str) -> (&'static str, &'static [(&'static str, &'static str)]) {
-    const LOW_TO_HIGH: &[(&str, &str)] = &[
-        ("low", "Fast responses with lighter reasoning."),
-        ("medium", "Balances speed and reasoning depth for everyday tasks."),
-        ("high", "Greater reasoning depth for complex problems."),
-    ];
-    const LOW_TO_XHIGH: &[(&str, &str)] = &[
-        ("low", "Fast responses with lighter reasoning."),
-        ("medium", "Balances speed and reasoning depth for everyday tasks."),
-        ("high", "Greater reasoning depth for complex problems."),
-        ("xhigh", "Extra high reasoning depth for complex problems."),
-    ];
-    const LOW_TO_MAX: &[(&str, &str)] = &[
-        ("low", "Fast responses with lighter reasoning."),
-        ("medium", "Balances speed and reasoning depth for everyday tasks."),
-        ("high", "Greater reasoning depth for complex problems."),
-        ("xhigh", "Extra high reasoning depth for complex problems."),
-        ("max", "Maximum reasoning depth for the hardest problems."),
-    ];
-    const LOW_TO_ULTRA: &[(&str, &str)] = &[
-        ("low", "Fast responses with lighter reasoning."),
-        ("medium", "Balances speed and reasoning depth for everyday tasks."),
-        ("high", "Greater reasoning depth for complex problems."),
-        ("xhigh", "Extra high reasoning depth for complex problems."),
-        ("max", "Maximum reasoning depth for the hardest problems."),
-        ("ultra", "Maximum reasoning with automatic task delegation."),
-    ];
-
-    match model {
-        "gpt-5.6-sol" => ("low", LOW_TO_ULTRA),
-        "gpt-5.6-terra" => ("medium", LOW_TO_ULTRA),
-        "gpt-5.6-luna" => ("medium", LOW_TO_MAX),
-        "gpt-5.5" | "gpt-5.4" => ("medium", LOW_TO_XHIGH),
-        _ => ("medium", LOW_TO_HIGH),
-    }
 }
 
 fn write_saydone_managed_model_catalog(
     runtime: &SaydoneManagedCodexRuntime,
 ) -> Result<tempfile::TempPath, BackendError> {
-    let (default_reasoning_level, supported_reasoning_levels) = saydone_managed_reasoning_levels(&runtime.model);
     let catalog = json!({
         "models": [{
             "slug": runtime.model,
             "display_name": runtime.model,
             "description": "SayDone managed model.",
             "base_instructions": "You are a coding agent. Follow the user's instructions and work in the current workspace.",
-            "default_reasoning_level": default_reasoning_level,
-            "supported_reasoning_levels": supported_reasoning_levels.iter().map(|(effort, description)| json!({
+            "default_reasoning_level": runtime.default_reasoning_effort,
+            "supported_reasoning_levels": runtime.reasoning_efforts.iter().map(|effort| json!({
                 "effort": effort,
-                "description": description,
+                "description": effort,
             })).collect::<Vec<_>>(),
             "shell_type": "shell_command",
             "visibility": "list",
@@ -7312,6 +7299,10 @@ mod tests {
                     value: "https://admin.saydone.ai/openai/v1".into(),
                 },
                 aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_REASONING_POLICY_ENV.into(),
+                    value: r#"{"efforts":["low","high"],"default_effort":"high"}"#.into(),
+                },
+                aionui_common::EnvVar {
                     name: OPENAI_API_KEY_ENV.into(),
                     value: "lease-token".into(),
                 },
@@ -7323,6 +7314,8 @@ mod tests {
             Some(SaydoneManagedCodexRuntime {
                 model: "deepseek-v4-flash".into(),
                 base_url: "https://admin.saydone.ai/openai/v1".into(),
+                reasoning_efforts: vec!["low".into(), "high".into()],
+                default_reasoning_effort: Some("high".into()),
             })
         );
 
@@ -7356,6 +7349,10 @@ mod tests {
                     value: "https://admin.saydone.ai/openai/v1".into(),
                 },
                 aionui_common::EnvVar {
+                    name: SAYDONE_MANAGED_REASONING_POLICY_ENV.into(),
+                    value: r#"{"efforts":["low","high"],"default_effort":"high"}"#.into(),
+                },
+                aionui_common::EnvVar {
                     name: OPENAI_API_KEY_ENV.into(),
                     value: "lease-token".into(),
                 },
@@ -7381,6 +7378,8 @@ mod tests {
         let runtime = SaydoneManagedCodexRuntime {
             model: "deepseek-v4-flash".into(),
             base_url: "https://admin.saydone.ai/openai/v1".into(),
+            reasoning_efforts: vec!["low".into(), "high".into()],
+            default_reasoning_effort: Some("high".into()),
         };
         let path = write_saydone_managed_model_catalog(&runtime).expect("catalog writes");
         let body = std::fs::read_to_string(&*path).expect("catalog reads");
@@ -7400,32 +7399,41 @@ mod tests {
     }
 
     #[test]
-    fn managed_codex_reasoning_levels_match_each_model_capability() {
-        let cases = [
-            (
-                "gpt-5.6-sol",
-                "low",
-                &["low", "medium", "high", "xhigh", "max", "ultra"][..],
-            ),
-            (
-                "gpt-5.6-terra",
-                "medium",
-                &["low", "medium", "high", "xhigh", "max", "ultra"][..],
-            ),
-            ("gpt-5.6-luna", "medium", &["low", "medium", "high", "xhigh", "max"][..]),
-            ("gpt-5.5", "medium", &["low", "medium", "high", "xhigh"][..]),
-            ("deepseek-v4-flash", "medium", &["low", "medium", "high"][..]),
-        ];
+    fn managed_codex_model_catalog_uses_only_admin_reasoning_policy() {
+        let runtime = SaydoneManagedCodexRuntime {
+            model: "same-model".into(),
+            base_url: "https://admin.saydone.ai/openai/v1".into(),
+            reasoning_efforts: vec!["off".into(), "ultra".into()],
+            default_reasoning_effort: Some("ultra".into()),
+        };
+        let path = write_saydone_managed_model_catalog(&runtime).expect("catalog writes");
+        let catalog: Value = serde_json::from_slice(&std::fs::read(&*path).unwrap()).unwrap();
+        let model = &catalog["models"][0];
+        assert_eq!(model["default_reasoning_level"], "ultra");
+        assert_eq!(
+            model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|level| level["effort"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["off", "ultra"]
+        );
+    }
 
-        for (model, default_level, expected_levels) in cases {
-            let (actual_default, actual_levels) = saydone_managed_reasoning_levels(model);
-            assert_eq!(actual_default, default_level, "default for {model}");
-            assert_eq!(
-                actual_levels.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
-                expected_levels,
-                "levels for {model}"
-            );
-        }
+    #[test]
+    fn managed_codex_model_catalog_does_not_invent_reasoning_for_empty_policy() {
+        let runtime = SaydoneManagedCodexRuntime {
+            model: "gpt-5.6-sol".into(),
+            base_url: "https://admin.saydone.ai/openai/v1".into(),
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+        };
+        let path = write_saydone_managed_model_catalog(&runtime).expect("catalog writes");
+        let catalog: Value = serde_json::from_slice(&std::fs::read(&*path).unwrap()).unwrap();
+        let model = &catalog["models"][0];
+        assert_eq!(model["default_reasoning_level"], Value::Null);
+        assert_eq!(model["supported_reasoning_levels"], json!([]));
     }
 
     #[test]

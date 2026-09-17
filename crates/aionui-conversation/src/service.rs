@@ -204,10 +204,6 @@ fn validate_managed_reasoning_policy(
     let invalid = || ConversationError::BadRequest {
         reason: "Managed CLI reasoning policy is missing or invalid".into(),
     };
-    // The legacy managed SayDone runtime does not consume per-CLI reasoning policy.
-    if backend == "saydone" && policy.is_none() {
-        return Ok(());
-    }
     let config = policy.and_then(serde_json::Value::as_object).ok_or_else(invalid)?;
     if config.keys().any(|key| {
         !matches!(
@@ -255,7 +251,7 @@ fn validate_managed_reasoning_policy(
     {
         return Err(invalid());
     }
-    if backend == "pi" {
+    if matches!(backend, "pi" | "saydone") {
         let protocol = config.get("wire_protocol").and_then(serde_json::Value::as_str);
         if protocol.is_some() && protocol != Some("pi_thinking_level_map") {
             return Err(invalid());
@@ -271,6 +267,21 @@ fn validate_managed_reasoning_policy(
         }
     }
     Ok(())
+}
+
+fn managed_reasoning_effort(current: Option<&str>, policy: Option<&serde_json::Value>) -> Option<String> {
+    let config = policy?.as_object()?;
+    let efforts = config.get("efforts")?.as_array()?;
+    let allowed = |value: &str| efforts.iter().any(|effort| effort.as_str() == Some(value));
+    current
+        .filter(|value| allowed(value))
+        .or_else(|| {
+            config
+                .get("default_effort")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| allowed(value))
+        })
+        .map(str::to_owned)
 }
 
 fn managed_runtime_acp_model_id(backend: &str, model: &str) -> String {
@@ -5676,15 +5687,10 @@ impl ConversationService {
                     .and_then(serde_json::Value::as_array)
                 {
                     let allowed = |value: &str| efforts.iter().any(|effort| effort.as_str() == Some(value));
-                    if !context.config.thought_level.as_deref().is_some_and(allowed) {
-                        context.config.thought_level = runtime
-                            .reasoning_policy
-                            .as_ref()
-                            .and_then(|policy| policy.get("default_effort"))
-                            .and_then(serde_json::Value::as_str)
-                            .filter(|value| allowed(value))
-                            .map(str::to_owned);
-                    }
+                    context.config.thought_level = managed_reasoning_effort(
+                        context.config.thought_level.as_deref(),
+                        runtime.reasoning_policy.as_ref(),
+                    );
                     // Filter only the launch snapshot; failed switches must not rewrite user state.
                     // These categories match ACP startup preference restoration.
                     if let Some(snapshot) = context.session_snapshot.as_mut() {
@@ -5700,8 +5706,20 @@ impl ConversationService {
                     snapshot.current_model_id = Some(aionui_ai_agent::shared_kernel::ModelId::new(wire_model));
                 }
             }
-            AgentSessionKind::Aionrs(_) => {
+            AgentSessionKind::Aionrs(context) => {
                 build_opts.context.model.use_model = Some(runtime.model.clone());
+                if runtime
+                    .reasoning_policy
+                    .as_ref()
+                    .and_then(|policy| policy.get("efforts"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some()
+                {
+                    context.config.thought_level = managed_reasoning_effort(
+                        context.config.thought_level.as_deref(),
+                        runtime.reasoning_policy.as_ref(),
+                    );
+                }
             }
             AgentSessionKind::Antigravity(_) => {}
         }
@@ -7329,12 +7347,12 @@ mod tests {
         ] {
             validate_managed_reasoning_policy("pi", Some(&policy)).unwrap();
         }
-        validate_managed_reasoning_policy("saydone", None).unwrap();
+        validate_managed_reasoning_policy("saydone", Some(&serde_json::json!({ "efforts": [] }))).unwrap();
     }
 
     #[test]
     fn managed_runtime_reasoning_policy_rejects_missing_and_malformed_configuration() {
-        for backend in ["pi", "codex", "claude"] {
+        for backend in ["saydone", "pi", "codex", "claude"] {
             assert!(matches!(
                 validate_managed_reasoning_policy(backend, None),
                 Err(ConversationError::BadRequest { .. })
@@ -7363,6 +7381,27 @@ mod tests {
                 "{policy}"
             );
         }
+    }
+
+    #[test]
+    fn managed_reasoning_effort_preserves_allowed_selection_or_uses_admin_default() {
+        let policy = serde_json::json!({
+            "efforts": ["off", "medium", "max"],
+            "default_effort": "max"
+        });
+        assert_eq!(
+            managed_reasoning_effort(Some("medium"), Some(&policy)).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            managed_reasoning_effort(Some("invalid"), Some(&policy)).as_deref(),
+            Some("max")
+        );
+        assert_eq!(managed_reasoning_effort(None, Some(&policy)).as_deref(), Some("max"));
+        assert_eq!(
+            managed_reasoning_effort(Some("medium"), Some(&serde_json::json!({ "efforts": [] }))),
+            None
+        );
     }
 
     #[test]

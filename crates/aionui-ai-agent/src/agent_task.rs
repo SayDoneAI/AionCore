@@ -777,6 +777,44 @@ mod aionrs_config_option_tests {
             .expect("response should include thought level");
         assert_eq!(updated.current_value.as_deref(), Some("low"));
     }
+
+    #[tokio::test]
+    async fn managed_aionrs_uses_admin_reasoning_levels_including_max() {
+        let mut config = make_test_config();
+        config.provider = "openai".into();
+        config.model = "managed-model".into();
+        config.compat_overrides.reasoning_effort_levels = Some(vec!["off".into(), "medium".into(), "max".into()]);
+        config.thought_level = Some("max".into());
+        let manager = AionrsAgentManager::new("conv-managed-effort".into(), "/project".into(), config, None)
+            .await
+            .expect("managed aionrs manager should start in tests");
+        let instance = AgentInstance::Aionrs(Arc::new(manager));
+
+        let initial = instance.get_config_options().await.unwrap();
+        let effort = initial
+            .config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("thought_level"))
+            .expect("managed aionrs should expose the Admin thought-level policy");
+        assert_eq!(effort.current_value.as_deref(), Some("max"));
+        assert_eq!(
+            effort
+                .options
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["off", "medium", "max"]
+        );
+
+        let response = instance.set_config_option("reasoning_effort", "off").await.unwrap();
+        let updated = response
+            .config_options
+            .unwrap()
+            .into_iter()
+            .find(|option| option.id == "reasoning_effort")
+            .expect("response should include Admin thought levels");
+        assert_eq!(updated.current_value.as_deref(), Some("off"));
+    }
 }
 
 #[cfg(test)]

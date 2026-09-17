@@ -213,6 +213,10 @@ impl AionrsAgentManager {
         if let Some(path) = config_extra.compat_overrides.api_path {
             config.compat.transport.api_path = Some(path);
         }
+        if let Some(levels) = config_extra.compat_overrides.reasoning_effort_levels.as_ref() {
+            config.compat.reasoning.supports_effort = Some(!levels.is_empty());
+            config.compat.reasoning.effort_levels = Some(levels.clone());
+        }
 
         if !config_extra.extra_mcp_servers.is_empty() {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
