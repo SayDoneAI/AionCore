@@ -138,9 +138,8 @@ pub struct ForkCapabilityView {
 #[derive(Debug, Deserialize)]
 pub struct UpdateConversationRequest {
     pub name: Option<String>,
-    /// Intent of a `name` change: `"user"` = explicit rename (agent titles
-    /// will never overwrite it afterwards), `"auto"` = frontend-derived
-    /// default title (keeps the name overwritable by agent titles).
+    /// Intent of a `name` change: `"user"` = explicit rename, `"auto"` =
+    /// client-derived title. Automatic titles never overwrite user-owned names.
     /// Absent defaults to `"user"` so old clients' renames stay protected.
     /// Ignored when `name` is absent.
     #[serde(default)]
@@ -349,8 +348,8 @@ pub struct ConversationResponse {
     pub id: String,
     pub name: String,
     /// Origin of the current `name`: `"user"` (explicit rename, protected),
-    /// `"agent"` (agent-generated title), or absent for a default/placeholder
-    /// name that agents may replace.
+    /// `"auto"` (client-generated title), legacy `"agent"`, or absent for a
+    /// default/placeholder name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_source: Option<String>,
     pub r#type: AgentType,
@@ -456,8 +455,7 @@ pub struct ConversationArtifactResponse {
 /// List of conversation artifacts for a single conversation.
 pub type ConversationArtifactListResponse = Vec<ConversationArtifactResponse>;
 
-/// Payload of the `conversation.nameUpdated` websocket event, emitted when an
-/// agent-generated session title is applied to a conversation.
+/// Legacy payload of the `conversation.nameUpdated` websocket event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationNameUpdatedPayload {
     pub conversation_id: String,

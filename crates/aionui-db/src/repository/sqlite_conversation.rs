@@ -288,6 +288,88 @@ impl SqliteConversationRepository {
             has_more_after,
         })
     }
+
+    async fn update_conversation(
+        &self,
+        user_id: &str,
+        id: &str,
+        updates: &ConversationRowUpdate,
+        auto_only: bool,
+    ) -> Result<bool, DbError> {
+        let mut set_parts: Vec<String> = Vec::new();
+        let mut binds: Vec<BindValue> = Vec::new();
+
+        if let Some(ref name) = updates.name {
+            set_parts.push("name = ?".to_string());
+            binds.push(BindValue::Str(name.clone()));
+        }
+        if let Some(pinned) = updates.pinned {
+            set_parts.push("pinned = ?".to_string());
+            binds.push(BindValue::Bool(pinned));
+        }
+        if let Some(ref pinned_at) = updates.pinned_at {
+            set_parts.push("pinned_at = ?".to_string());
+            binds.push(BindValue::OptI64(*pinned_at));
+        }
+        if let Some(ref model) = updates.model {
+            set_parts.push("model = ?".to_string());
+            binds.push(BindValue::OptStr(model.clone()));
+        }
+        if let Some(ref extra) = updates.extra {
+            set_parts.push("extra = ?".to_string());
+            binds.push(BindValue::Str(extra.clone()));
+        }
+        if let Some(ref status) = updates.status {
+            set_parts.push("status = ?".to_string());
+            binds.push(BindValue::Str(status.clone()));
+        }
+        if let Some(updated_at) = updates.updated_at {
+            set_parts.push("updated_at = ?".to_string());
+            binds.push(BindValue::I64(updated_at));
+        }
+        if let Some(ref project_id) = updates.project_id {
+            set_parts.push("project_id = ?".to_string());
+            binds.push(BindValue::Str(project_id.clone()));
+        }
+        if let Some(ref folder_id) = updates.folder_id {
+            set_parts.push("folder_id = ?".to_string());
+            binds.push(BindValue::Str(folder_id.clone()));
+        }
+        if let Some(ref name_source) = updates.name_source {
+            set_parts.push("name_source = ?".to_string());
+            binds.push(BindValue::Str(name_source.clone()));
+        }
+
+        if set_parts.is_empty() {
+            return Ok(true);
+        }
+
+        let source_guard = if auto_only {
+            " AND (name_source IS NULL OR name_source = 'auto')"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "UPDATE conversations SET {} WHERE user_id = ? AND id = ?{}",
+            set_parts.join(", "),
+            source_guard
+        );
+
+        let mut query = sqlx::query(&sql);
+        for bind in &binds {
+            query = bind_value(query, bind);
+        }
+        query = query.bind(user_id).bind(id);
+
+        let result = query.execute(&self.pool).await?;
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+        if auto_only && self.conversation_exists_for_user(user_id, id).await? {
+            return Ok(false);
+        }
+        Err(DbError::NotFound(format!("Conversation '{id}' not found")))
+    }
 }
 
 #[async_trait::async_trait]
@@ -342,74 +424,12 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError> {
-        // Build dynamic SET clause
-        let mut set_parts: Vec<String> = Vec::new();
-        let mut binds: Vec<BindValue> = Vec::new();
-
-        if let Some(ref name) = updates.name {
-            set_parts.push("name = ?".to_string());
-            binds.push(BindValue::Str(name.clone()));
-        }
-        if let Some(pinned) = updates.pinned {
-            set_parts.push("pinned = ?".to_string());
-            binds.push(BindValue::Bool(pinned));
-        }
-        if let Some(ref pinned_at) = updates.pinned_at {
-            set_parts.push("pinned_at = ?".to_string());
-            binds.push(BindValue::OptI64(*pinned_at));
-        }
-        if let Some(ref model) = updates.model {
-            set_parts.push("model = ?".to_string());
-            binds.push(BindValue::OptStr(model.clone()));
-        }
-        if let Some(ref extra) = updates.extra {
-            set_parts.push("extra = ?".to_string());
-            binds.push(BindValue::Str(extra.clone()));
-        }
-        if let Some(ref status) = updates.status {
-            set_parts.push("status = ?".to_string());
-            binds.push(BindValue::Str(status.clone()));
-        }
-        if let Some(updated_at) = updates.updated_at {
-            set_parts.push("updated_at = ?".to_string());
-            binds.push(BindValue::I64(updated_at));
-        }
-        if let Some(ref project_id) = updates.project_id {
-            set_parts.push("project_id = ?".to_string());
-            binds.push(BindValue::Str(project_id.clone()));
-        }
-        if let Some(ref folder_id) = updates.folder_id {
-            set_parts.push("folder_id = ?".to_string());
-            binds.push(BindValue::Str(folder_id.clone()));
-        }
-        if let Some(ref name_source) = updates.name_source {
-            set_parts.push("name_source = ?".to_string());
-            binds.push(BindValue::Str(name_source.clone()));
-        }
-
-        if set_parts.is_empty() {
-            return Ok(());
-        }
-
-        let sql = format!(
-            "UPDATE conversations SET {} WHERE user_id = ? AND id = ?",
-            set_parts.join(", ")
-        );
-
-        let mut query = sqlx::query(&sql);
-        for bind in &binds {
-            query = bind_value(query, bind);
-        }
-        query = query.bind(user_id);
-        query = query.bind(id);
-
-        let result = query.execute(&self.pool).await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
-        }
-
+        self.update_conversation(user_id, id, updates, false).await?;
         Ok(())
+    }
+
+    async fn update_auto(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<bool, DbError> {
+        self.update_conversation(user_id, id, updates, true).await
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {

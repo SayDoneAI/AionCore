@@ -19,12 +19,12 @@ use aionui_api_types::{
     AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
     ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, RefreshWealthMcpRuntimeRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding,
-    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse,
+    ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
+    MessageListResponse, MessageResponse, MessageSearchResponse, PromptCapabilityView, RefreshWealthMcpRuntimeRequest,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer, SessionMcpTransport,
+    TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, SessionRef};
@@ -907,12 +907,9 @@ impl ConversationService {
     /// channel while the old one exits on `Closed`.
     ///
     /// Direct-CLI Session instances get the FULL watcher (orphan turns + card
-    /// refreshes + agent session titles). ACP manager instances get a
-    /// TITLE-ONLY watcher: pi/omp emit `session_info_update` at session-open
-    /// (no turn running) and ~1ms before the turn's Finish (racing the relay's
-    /// exit), so only a persistent consumer sees them; their other frames keep
-    /// the existing ACP delivery paths untouched. aionrs/test instances emit no
-    /// agent titles and get none.
+    /// refreshes). ACP manager instances get a restricted watcher because their
+    /// session-info frames are forwarded as stream data but are not conversation
+    /// name sources. aionrs/test instances get none.
     pub(crate) fn ensure_background_watcher(&self, user_id: &str, conversation_id: &str, agent: &AgentInstance) {
         let (instance_ptr, title_only) = match agent {
             AgentInstance::Session(task) => (Arc::as_ptr(task) as usize, false),
@@ -2612,15 +2609,19 @@ impl ConversationService {
             })
             .transpose()?;
 
-        // Rename intent: a name change without `name_source` (old clients) or
-        // with `"user"` is an explicit rename — mark it 'user' so agent titles
-        // never overwrite it. `"auto"` marks a frontend-derived default title,
-        // which keeps the stored origin untouched (still agent-overwritable).
-        let name_source = match (req.name.as_deref(), req.name_source.as_deref()) {
-            (Some(_), Some("auto")) => None,
-            (Some(_), _) => Some("user".to_string()),
-            (None, _) => None,
-        };
+        // A name change without `name_source` (old clients) or with `"user"`
+        // is an explicit rename. `"auto"` is a client-derived title and is
+        // conditionally written by the repository so a concurrent user rename
+        // always wins. Legacy `"agent"` rows remain readable but are never
+        // created by this update path.
+        let auto_name_update = req.name.is_some() && req.name_source.as_deref() == Some("auto");
+        let name_source = req.name.as_ref().map(|_| {
+            if auto_name_update {
+                "auto".to_string()
+            } else {
+                "user".to_string()
+            }
+        });
 
         let updates = ConversationRowUpdate {
             name: req.name,
@@ -2635,7 +2636,11 @@ impl ConversationService {
             name_source,
         };
 
-        self.conversation_repo.update(user_id, id, &updates).await?;
+        if auto_name_update {
+            self.conversation_repo.update_auto(user_id, id, &updates).await?;
+        } else {
+            self.conversation_repo.update(user_id, id, &updates).await?;
+        }
 
         if let Some(model) = req.model.as_ref() {
             let selected_model = model.use_model.as_deref().unwrap_or(model.model.as_str());
@@ -6992,88 +6997,6 @@ fn is_tool_message_type(message_type: MessageType) -> bool {
         message_type,
         MessageType::ToolCall | MessageType::ToolGroup | MessageType::AcpToolCall
     )
-}
-
-/// Apply an agent-proposed session title under the `name_source` guard.
-///
-/// Origin rules (migration 035): NULL (default/placeholder name) and "agent"
-/// accept a new agent title; "user" (explicit rename) never does. On apply the
-/// row is renamed with `name_source='agent'` and a `conversation.nameUpdated`
-/// websocket event is broadcast (payload + `user_id` for connection routing,
-/// mirroring the `conversation.artifact` event).
-///
-/// Returns `Ok(true)` if the name was updated, `Ok(false)` if the title was
-/// discarded (user-owned name, unchanged title, or unknown conversation).
-///
-/// A free function (not a `ConversationService` method) so the per-turn
-/// `StreamRelay` can call it with just the repo + broadcaster it already owns.
-pub(crate) async fn apply_agent_title(
-    repo: &Arc<dyn IConversationRepository>,
-    broadcaster: &Arc<dyn EventBroadcaster>,
-    user_id: &str,
-    conversation_id: &str,
-    title: &str,
-    // Which consumer won the frame — "watcher" (between turns) or "relay"
-    // (inside a turn, incl. the orphan-turn window). Both are valid; logging it
-    // is what makes a lost title diagnosable: the two paths were previously
-    // indistinguishable in production logs, which is why this bug hid so long.
-    consumer: &str,
-) -> Result<bool, ConversationError> {
-    let Some(existing) = repo.get(user_id, conversation_id).await? else {
-        debug!(conversation_id, consumer, "agent title dropped: conversation not found");
-        return Ok(false);
-    };
-    if existing.name_source.as_deref() == Some("user") {
-        debug!(conversation_id, consumer, "agent title dropped: name is user-owned");
-        return Ok(false);
-    }
-    if existing.name == title {
-        return Ok(false);
-    }
-
-    repo.update(
-        user_id,
-        conversation_id,
-        &ConversationRowUpdate {
-            name: Some(title.to_string()),
-            name_source: Some("agent".to_string()),
-            updated_at: Some(now_ms()),
-            ..Default::default()
-        },
-    )
-    .await?;
-
-    let payload = ConversationNameUpdatedPayload {
-        conversation_id: conversation_id.to_string(),
-        name: title.to_string(),
-    };
-    let mut value = serde_json::to_value(&payload)
-        .map_err(|e| ConversationError::internal(format!("Failed to serialize nameUpdated event: {e}")))?;
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("user_id".to_owned(), serde_json::Value::String(user_id.to_owned()));
-    }
-    broadcaster.broadcast(WebSocketMessage::new("conversation.nameUpdated", value));
-    // Also emit the generic list-refresh event: the existing frontend already
-    // refetches the sidebar list AND the open conversation on
-    // `conversation.listChanged(updated)`, so an agent rename propagates
-    // without any new frontend subscription (mirrors `broadcast_list_changed`).
-    broadcaster.broadcast(WebSocketMessage::new(
-        "conversation.listChanged",
-        serde_json::json!({
-            "user_id": user_id,
-            "conversation_id": conversation_id,
-            "action": "updated",
-            "source": existing.source,
-        }),
-    ));
-
-    info!(
-        conversation_id,
-        title_len = title.chars().count(),
-        consumer,
-        "agent session title applied"
-    );
-    Ok(true)
 }
 
 #[cfg(test)]
