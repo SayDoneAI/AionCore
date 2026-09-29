@@ -1,6 +1,13 @@
 use crate::error::ChannelError;
 use crate::types::{BotInfo, PluginConfig, PluginStatus, PluginType, UnifiedIncomingMessage, UnifiedOutgoingMessage};
 
+#[derive(Clone, Debug)]
+pub struct PluginCredentialUpdate {
+    pub map_key: String,
+    pub entry_key: String,
+    pub value: serde_json::Value,
+}
+
 /// Callback channels for a channel plugin.
 ///
 /// Instead of closures (which are hard to make object-safe), plugins
@@ -15,6 +22,8 @@ pub struct PluginCallbacks {
     pub message_tx: tokio::sync::mpsc::Sender<UnifiedIncomingMessage>,
     /// Sender for tool confirmation callbacks (callId, value).
     pub confirm_tx: tokio::sync::mpsc::Sender<(String, String)>,
+    /// Persists runtime credentials that a platform refreshes while connected.
+    pub credential_update_tx: Option<tokio::sync::mpsc::Sender<PluginCredentialUpdate>>,
 }
 
 /// Abstraction over a platform-specific channel plugin.
@@ -191,7 +200,11 @@ mod tests {
     fn make_test_callbacks() -> PluginCallbacks {
         let (message_tx, _message_rx) = mpsc::channel(16);
         let (confirm_tx, _confirm_rx) = mpsc::channel(16);
-        PluginCallbacks { message_tx, confirm_tx }
+        PluginCallbacks {
+            message_tx,
+            confirm_tx,
+            credential_update_tx: None,
+        }
     }
 
     fn make_test_outgoing() -> UnifiedOutgoingMessage {

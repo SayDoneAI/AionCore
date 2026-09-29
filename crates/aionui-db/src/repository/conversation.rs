@@ -30,6 +30,21 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
+    /// Applies an automatic name update only while the current name is not user- or
+    /// legacy-agent-owned. The production repository implements this as one
+    /// conditional SQL update so a concurrent explicit rename wins atomically.
+    /// Returns `Ok(false)` when the conversation exists but is protected.
+    async fn update_auto(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<bool, DbError> {
+        let Some(row) = self.get(user_id, id).await? else {
+            return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
+        };
+        if matches!(row.name_source.as_deref(), Some("user" | "agent")) {
+            return Ok(false);
+        }
+        self.update(user_id, id, updates).await?;
+        Ok(true)
+    }
+
     /// Deletes a conversation (messages cascade via FK).
     /// Returns `DbError::NotFound` if ID is missing for the user.
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
@@ -444,7 +459,7 @@ pub struct ConversationRowUpdate {
     /// Project binding (project-bind side branch); `Some` sets the column.
     pub project_id: Option<String>,
     pub folder_id: Option<String>,
-    /// Origin of `name` when this update also renames: `Some("user"|"agent")`
+    /// Origin of `name` when this update also renames: `Some("user"|"auto"|"agent")`
     /// sets the column, `None` leaves it untouched. Never cleared back to NULL.
     pub name_source: Option<String>,
 }

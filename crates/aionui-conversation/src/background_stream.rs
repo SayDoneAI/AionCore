@@ -127,48 +127,12 @@ impl BackgroundStreamWatcher {
                 // Instance torn down (conversation deleted / process replaced).
                 Err(broadcast::error::RecvError::Closed) => break,
             };
-            // Agent session titles are consumed HERE unconditionally — the
-            // active-turn gate below must NOT apply:
-            // - claude: the generate_session_title reply lands seconds AFTER the
-            //   first turn's Finish (live 2026-08-04: TurnResult 07:21:33 →
-            //   title frame 07:21:36) — the per-turn relay is already gone.
-            // - ACP agents (pi/omp, live 2026-08-04): session_info_update fires
-            //   at session-open (no turn yet) and ~1ms BEFORE the turn's Finish
-            //   — racing the relay's exit.
-            // The StreamRelay ALSO applies titles (live 2026-08-19, conv
-            // a7f2838a: a reply landing 0.6s into an orphan turn — while this
-            // watcher's receiver was lent to `run_orphan_turn` — was otherwise
-            // lost with the latch already completed). apply_agent_title is
-            // guarded (name_source) and idempotent (same-title no-op), so the
-            // watcher/relay overlap is never harmful.
-            if let AgentStreamEvent::AcpSessionInfo(payload) = &ev {
-                if let Some(title) = payload
-                    .get("title")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|t| !t.is_empty())
-                {
-                    if let Err(e) = crate::service::apply_agent_title(
-                        &self.repo,
-                        &self.broadcaster,
-                        &self.user_id,
-                        &self.conversation_id,
-                        title,
-                        "watcher",
-                    )
-                    .await
-                    {
-                        warn!(
-                            conversation_id = %self.conversation_id,
-                            error = %e,
-                            "agent session title apply failed (background)"
-                        );
-                    }
-                } else {
-                    tracing::debug!(
-                        conversation_id = %self.conversation_id,
-                        "session info frame without title ignored"
-                    );
+            // Session info remains an ACP stream event, but its optional title
+            // is not a conversation-name source. Forward it while no turn relay
+            // owns the stream; an active relay forwards the same frame itself.
+            if matches!(ev, AgentStreamEvent::AcpSessionInfo(_)) {
+                if self.runtime_state.active_turn_id_for(&self.conversation_id).is_none() {
+                    self.forward_out_of_turn_frame(&ev);
                 }
                 continue;
             }
@@ -531,10 +495,6 @@ mod tests {
         rig_with_opts(false, PENDING_STARTED_TTL).await
     }
 
-    async fn rig_with(title_only: bool) -> Rig {
-        rig_with_opts(title_only, PENDING_STARTED_TTL).await
-    }
-
     async fn rig_with_opts(title_only: bool, pending_started_ttl: std::time::Duration) -> Rig {
         let db = init_database_memory().await.unwrap();
         let user_repo = SqliteUserRepository::new(db.pool().clone());
@@ -552,8 +512,8 @@ mod tests {
             channel_chat_id: None,
             pinned: false,
             pinned_at: None,
-            created_at: now_ms(),
-            updated_at: now_ms(),
+            created_at: 1,
+            updated_at: 1,
             project_id: None,
             folder_id: None,
             name_source: None,
@@ -1073,134 +1033,6 @@ mod tests {
         drop(claim);
     }
 
-    /// A title-only (ACP manager) watcher applies titles even while a user
-    /// turn is ACTIVE — pi/omp fire session_info_update ~1ms before the turn's
-    /// Finish, racing the per-turn relay's exit; the gate-free consumer is the
-    /// only one that reliably sees it. Non-title frames must stay untouched
-    /// (no orphan turns for ACP instances).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn title_only_watcher_applies_title_even_during_active_turn() {
-        let rig = rig_with(true).await;
-        let claim = rig
-            .runtime_state
-            .try_claim_turn("conv-1", "turn-user")
-            .expect("claimed");
-        rig.tx
-            .send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
-                "title": "创建带时间戳的JSON文件"
-            })))
-            .unwrap();
-        rig.tx
-            .send(AgentStreamEvent::Text(TextEventData {
-                content: "acp content the manager path owns".into(),
-            }))
-            .unwrap();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            let row = rig.repo.get(&rig.user_id, "conv-1").await.unwrap().unwrap();
-            if row.name == "创建带时间戳的JSON文件" {
-                assert_eq!(row.name_source.as_deref(), Some("agent"));
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "title-only watcher must apply mid-turn titles, name still {:?}",
-                row.name
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        // The stray text frame must NOT spawn an orphan turn on the ACP path.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(
-            rows_of_type(&rig, "text").await.is_empty(),
-            "title-only watcher must never deliver content frames"
-        );
-        drop(claim);
-    }
-
-    /// The claude generate_session_title reply lands seconds AFTER the first
-    /// turn's Finish (live 2026-08-04), between turns — the watcher must apply
-    /// it (guarded rename + nameUpdated broadcast), since the per-turn relay is
-    /// already gone.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn between_turns_agent_title_renames_and_broadcasts() {
-        let rig = rig().await;
-        let mut ws = rig.bus.subscribe();
-        rig.tx
-            .send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
-                "title": "Fix login bug"
-            })))
-            .unwrap();
-
-        // Poll until the watcher applies the rename (bounded).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            let row = rig.repo.get(&rig.user_id, "conv-1").await.unwrap().unwrap();
-            if row.name == "Fix login bug" {
-                assert_eq!(row.name_source.as_deref(), Some("agent"));
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "watcher did not apply the between-turns title, name still {:?}",
-                row.name
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-
-        let mut saw_name_updated = false;
-        while let Ok(msg) = ws.try_recv() {
-            if msg.name == "conversation.nameUpdated" {
-                saw_name_updated = true;
-                assert_eq!(msg.data["conversation_id"], "conv-1");
-                assert_eq!(msg.data["name"], "Fix login bug");
-            }
-        }
-        assert!(saw_name_updated, "nameUpdated must be broadcast");
-    }
-
-    /// Live 2026-08-19 (conv a7f2838a): the title reply landed 0.6s AFTER the
-    /// watcher had lent its receiver to a CLI-initiated orphan turn
-    /// (`run_orphan_turn`), so the watcher's own gate-free title arm never saw
-    /// the frame — the nested relay was the only consumer, dropped it, and the
-    /// one-shot claude latch was already completed (no retry). A title frame
-    /// arriving MID-orphan-turn must still rename the conversation.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn title_arriving_mid_orphan_turn_still_renames() {
-        let rig = rig().await;
-        // Orphan-turn content first: the watcher claims the turn and hands its
-        // receiver to the nested relay before the title frame arrives.
-        rig.tx
-            .send(AgentStreamEvent::Text(TextEventData {
-                content: "background continuation".into(),
-            }))
-            .unwrap();
-        rig.tx
-            .send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
-                "title": "Fix login bug"
-            })))
-            .unwrap();
-        rig.tx
-            .send(AgentStreamEvent::Finish(FinishEventData::default()))
-            .unwrap();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            let row = rig.repo.get(&rig.user_id, "conv-1").await.unwrap().unwrap();
-            if row.name == "Fix login bug" {
-                assert_eq!(row.name_source.as_deref(), Some("agent"));
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "a title arriving mid-orphan-turn must still be applied, name still {:?}",
-                row.name
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
     /// A config-options snapshot arriving BETWEEN turns must still reach the frontend.
     ///
     /// This is exactly when a mode confirmation lands for the backends that apply a
@@ -1277,5 +1109,37 @@ mod tests {
         }
         let msg = forwarded.expect("an out-of-turn acp_mode_info must be forwarded to the frontend");
         assert_eq!(msg.data["data"]["current_mode_id"], "plan");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn between_turns_acp_session_info_is_forwarded_without_renaming() {
+        let rig = rig_with_opts(true, PENDING_STARTED_TTL).await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::AcpSessionInfo(serde_json::json!({
+                "title": "Native session title",
+                "_meta": { "retry": { "status": "clear" } }
+            })))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut forwarded: Option<aionui_api_types::WebSocketMessage<serde_json::Value>> = None;
+        while std::time::Instant::now() < deadline && forwarded.is_none() {
+            while let Ok(msg) = ws.try_recv() {
+                if msg.name == "message.stream" && msg.data["type"] == "acp_session_info" {
+                    forwarded = Some(msg);
+                    break;
+                }
+            }
+            if forwarded.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        let msg = forwarded.expect("an out-of-turn acp_session_info must be forwarded to the frontend");
+        assert_eq!(msg.data["data"]["title"], "Native session title");
+        let row = rig.repo.get(&rig.user_id, "conv-1").await.unwrap().unwrap();
+        assert_eq!(row.name, "test");
+        assert_eq!(row.name_source, None);
     }
 }

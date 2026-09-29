@@ -106,6 +106,29 @@ pub(crate) struct WeixinRawItem {
     pub image_item: Option<MediaItemData>,
     #[serde(default)]
     pub file_item: Option<MediaItemData>,
+    /// Quoted message metadata sent by WeChat when the user replies to a
+    /// previous message. The referenced `msg_id` is the route key persisted
+    /// by the channel session manager.
+    #[serde(default)]
+    pub ref_msg: Option<WeixinRefMessage>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct WeixinRefMessage {
+    #[serde(default)]
+    pub message_item: Option<WeixinRefMessageItem>,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct WeixinRefMessageItem {
+    #[serde(default)]
+    pub msg_id: Option<String>,
+    #[serde(default)]
+    pub text_item: Option<TextItem>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

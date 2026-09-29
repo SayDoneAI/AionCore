@@ -119,6 +119,9 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let team_service = states.team.service.clone();
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
+    let mirror_service = Arc::clone(&channel_components.mirror_service);
+    tokio::spawn(mirror_service.run(channel_components.mirror_event_rx));
+
     // Start channel orchestrator (message loop)
     tokio::spawn(
         channel_components

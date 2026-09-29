@@ -1167,6 +1167,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_text_quoted_reply_keeps_parent_message_id() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = mpsc::channel(16);
+        let dedup_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        let payload = r#"{
+            "header": {
+                "event_id": "ev_reply_1",
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_user1", "user_id": "", "union_id": "" },
+                    "sender_type": "user",
+                    "tenant_key": "t1"
+                },
+                "message": {
+                    "message_id": "msg_reply_1",
+                    "parent_id": "bot-message-from-session-a",
+                    "root_id": "bot-message-from-session-a",
+                    "chat_id": "oc_chat1",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"Continue session A\"}"
+                }
+            }
+        }"#;
+
+        handle_ws_text(payload, "event", &message_tx, &confirm_tx, &dedup_cache).await;
+
+        let msg = message_rx.try_recv().unwrap();
+        assert_eq!(msg.reply_to_message_id.as_deref(), Some("bot-message-from-session-a"));
+    }
+
+    #[tokio::test]
     async fn ws_text_event_deduplicates() {
         let (message_tx, mut message_rx) = mpsc::channel(16);
         let (confirm_tx, _confirm_rx) = mpsc::channel(16);

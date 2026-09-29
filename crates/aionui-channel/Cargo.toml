@@ -28,6 +28,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+chrono.workspace = true
 getrandom.workspace = true
 dashmap.workspace = true
 regex.workspace = true
@@ -42,3 +43,4 @@ uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 aionui-ai-agent = { workspace = true, features = ["test-support"] }
+sqlx.workspace = true

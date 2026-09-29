@@ -29,7 +29,7 @@ impl WeixinApi {
 
         let mut uin_bytes = [0u8; 4];
         getrandom::getrandom(&mut uin_bytes).expect("RNG failure");
-        let wechat_uin = base64::engine::general_purpose::STANDARD.encode(uin_bytes);
+        let wechat_uin = encode_wechat_uin(u32::from_ne_bytes(uin_bytes));
 
         Self {
             client,
@@ -185,13 +185,14 @@ impl WeixinApi {
         to_user_id: &str,
         text: &str,
         context_token: Option<&str>,
-    ) -> Result<(), ChannelError> {
+    ) -> Result<String, ChannelError> {
         debug!(to_user_id, "Sending WeChat message");
 
+        let client_id = Uuid::new_v4().to_string();
         let body = SendMessageRequest {
             msg: SendMessageMsg {
                 to_user_id: to_user_id.to_string(),
-                client_id: Uuid::new_v4().to_string(),
+                client_id: client_id.clone(),
                 message_type: 2,
                 message_state: 2,
                 item_list: vec![SendMessageItem {
@@ -203,7 +204,7 @@ impl WeixinApi {
             base_info: serde_json::json!({}),
         };
 
-        let _resp: serde_json::Value = self
+        let resp: serde_json::Value = self
             .authenticated_post("ilink/bot/sendmessage", &body, WEIXIN_API_TIMEOUT)
             .await
             .map_err(|e| {
@@ -211,8 +212,47 @@ impl WeixinApi {
                 ChannelError::MessageSendFailed(format!("sendmessage failed: {e}"))
             })?;
 
-        Ok(())
+        validate_send_response(&resp)?;
+
+        // The iLink API does not consistently return a server message ID.
+        // The client ID is echoed by the quoted-reply payload on supported
+        // clients and is therefore the stable route key used by the session
+        // manager. Prefer an explicit ID when the server provides one.
+        let response_id = resp
+            .get("msg_id")
+            .or_else(|| resp.get("message_id"))
+            .or_else(|| resp.get("client_id"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or(client_id);
+        Ok(response_id)
     }
+}
+
+fn encode_wechat_uin(value: u32) -> String {
+    base64::engine::general_purpose::STANDARD.encode(value.to_string())
+}
+
+fn validate_send_response(response: &serde_json::Value) -> Result<(), ChannelError> {
+    let business_code = response
+        .get("ret")
+        .or_else(|| response.get("errcode"))
+        .or_else(|| response.get("code"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    if business_code == 0 {
+        return Ok(());
+    }
+
+    let message = response
+        .get("errmsg")
+        .or_else(|| response.get("msg"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown error");
+    Err(ChannelError::MessageSendFailed(format!(
+        "sendmessage failed: code={business_code} {message}"
+    )))
 }
 
 #[cfg(test)]
@@ -238,12 +278,11 @@ mod tests {
     fn api_generates_wechat_uin() {
         let client = Client::new();
         let api = WeixinApi::new(client, "https://example.com", "tok");
-        // base64 of 4 bytes should be 8 chars (with padding)
-        assert_eq!(api.wechat_uin().len(), 8);
-        // Should be valid base64
-        let decoded = base64::engine::general_purpose::STANDARD.decode(api.wechat_uin());
-        assert!(decoded.is_ok());
-        assert_eq!(decoded.unwrap().len(), 4);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(api.wechat_uin())
+            .unwrap();
+        let decimal = String::from_utf8(decoded).unwrap();
+        assert!(decimal.parse::<u32>().is_ok());
     }
 
     #[test]
@@ -254,5 +293,21 @@ mod tests {
         let api2 = WeixinApi::new(client2, "https://example.com", "tok");
         // Extremely unlikely to collide (2^32 space)
         assert_ne!(api1.wechat_uin(), api2.wechat_uin());
+    }
+
+    #[test]
+    fn uin_is_base64_encoded_decimal_uint32() {
+        assert_eq!(encode_wechat_uin(123_456), "MTIzNDU2");
+    }
+
+    #[test]
+    fn send_response_rejects_non_zero_business_code() {
+        let error = validate_send_response(&serde_json::json!({ "ret": -1, "errmsg": "denied" })).unwrap_err();
+        assert!(error.to_string().contains("code=-1 denied"));
+    }
+
+    #[test]
+    fn send_response_accepts_empty_success_payload() {
+        assert!(validate_send_response(&serde_json::json!({})).is_ok());
     }
 }

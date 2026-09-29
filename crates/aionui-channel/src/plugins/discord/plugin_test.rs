@@ -18,7 +18,11 @@ fn make_config(token: Option<&str>) -> PluginConfig {
 fn make_callbacks() -> PluginCallbacks {
     let (message_tx, _mr) = mpsc::channel(4);
     let (confirm_tx, _cr) = mpsc::channel(4);
-    PluginCallbacks { message_tx, confirm_tx }
+    PluginCallbacks {
+        message_tx,
+        confirm_tx,
+        credential_update_tx: None,
+    }
 }
 
 // -- initialize bad paths (validated before any network call) ----------------

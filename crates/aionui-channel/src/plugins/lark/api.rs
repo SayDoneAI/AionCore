@@ -184,18 +184,21 @@ impl LarkApi {
             .ok_or_else(|| ChannelError::ConnectionFailed("Lark WS endpoint returned no URL".into()))
     }
 
-    /// Send an interactive card message to a chat.
+    /// Send an interactive card message to a chat or authorized user.
     ///
-    /// Uses `receive_id_type=chat_id` to address by chat ID.
+    /// Lark assigns different prefixes to chat and user identifiers. Desktop
+    /// conversation mirrors target the authorized user's `open_id`, while
+    /// replies inside an existing chat target its `chat_id`.
     /// Returns the message ID of the sent card.
-    pub async fn send_card(&self, chat_id: &str, card_content: &str) -> Result<SendMessageData, ChannelError> {
+    pub async fn send_card(&self, receive_id: &str, card_content: &str) -> Result<SendMessageData, ChannelError> {
         let token = self.get_token().await?;
-        let url = format!("{LARK_OPEN_API_BASE}/im/v1/messages?receive_id_type=chat_id");
+        let receive_id_type = Self::lark_receive_id_type(receive_id);
+        let url = format!("{LARK_OPEN_API_BASE}/im/v1/messages?receive_id_type={receive_id_type}");
 
-        debug!(chat_id, "Sending Lark card message");
+        debug!(receive_id, receive_id_type, "Sending Lark card message");
 
         let body = SendCardRequest {
-            receive_id: chat_id.to_string(),
+            receive_id: receive_id.to_string(),
             msg_type: "interactive".into(),
             content: card_content.to_string(),
         };
@@ -221,6 +224,18 @@ impl LarkApi {
 
         resp.data
             .ok_or_else(|| ChannelError::MessageSendFailed("Lark send card returned no data".into()))
+    }
+
+    fn lark_receive_id_type(receive_id: &str) -> &'static str {
+        if receive_id.starts_with("ou_") {
+            "open_id"
+        } else if receive_id.starts_with("oc_") {
+            "chat_id"
+        } else if receive_id.starts_with("on_") {
+            "union_id"
+        } else {
+            "user_id"
+        }
     }
 
     /// Update (patch) an existing interactive card message.
@@ -299,5 +314,13 @@ mod tests {
             expires_in: Duration::from_secs(7200),
         };
         assert!(cache.is_expired());
+    }
+
+    #[test]
+    fn receive_id_type_matches_lark_identifier_prefixes() {
+        assert_eq!(LarkApi::lark_receive_id_type("ou_user"), "open_id");
+        assert_eq!(LarkApi::lark_receive_id_type("oc_chat"), "chat_id");
+        assert_eq!(LarkApi::lark_receive_id_type("on_union"), "union_id");
+        assert_eq!(LarkApi::lark_receive_id_type("legacy-user"), "user_id");
     }
 }

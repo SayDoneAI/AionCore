@@ -617,7 +617,6 @@ async fn set_channel_assistant_setting(
         .settings_service
         .set_assistant_setting(&user.id, platform, &req)
         .await?;
-    state.session_manager.clear_all_sessions(&user.id).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -641,7 +640,6 @@ async fn set_channel_default_model_setting(
         .settings_service
         .set_model_setting(&user.id, platform, &req)
         .await?;
-    state.session_manager.clear_all_sessions(&user.id).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -654,14 +652,14 @@ async fn set_channel_default_model_setting(
 // Settings sync handler
 // ---------------------------------------------------------------------------
 
-/// `POST /api/channel/settings/sync` — invalidate channel sessions.
+/// `POST /api/channel/settings/sync` — acknowledge persisted channel settings.
 ///
-/// Clears all sessions so they are recreated with the latest
-/// agent/model configuration on the next incoming message.
-/// Agent/model config is persisted separately via `PUT /api/settings/client`.
+/// Existing sessions and reply routes stay intact so quoted replies keep
+/// targeting their original conversations. A subsequent `/new` session reads
+/// the latest assistant/model settings.
 async fn sync_channel_settings(
-    State(state): State<ChannelRouterState>,
-    Extension(user): Extension<CurrentUser>,
+    State(_state): State<ChannelRouterState>,
+    Extension(_user): Extension<CurrentUser>,
     body: Result<Json<SyncChannelSettingsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<BridgeResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -669,11 +667,9 @@ async fn sync_channel_settings(
     let _platform = PluginType::from_str_opt(&req.platform)
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid platform: {}", req.platform)))?;
 
-    state.session_manager.clear_all_sessions(&user.id).await?;
-
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
-        message: Some(format!("Sessions cleared for {}", req.platform)),
+        message: Some(format!("Settings synchronized for {}", req.platform)),
         error: None,
     })))
 }

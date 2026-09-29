@@ -826,6 +826,13 @@ async fn qr_login_page_returns_html() {
     assert_eq!(resp.status(), StatusCode::OK);
     let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
     assert!(content_type.contains("text/html"));
+    let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(body.contains("SayDoneAI"));
+    assert!(body.contains("正在登录"));
+    assert!(body.contains("fetch('./api/auth/qr-login'"));
+    assert!(body.contains("JSON.stringify({ qr_token: token })"));
+    assert!(body.contains("window.location.href = './'"));
+    assert!(!body.contains("AionUI"));
 }
 
 // ===========================================================================

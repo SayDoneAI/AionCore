@@ -7,8 +7,11 @@ use std::sync::{Arc, Mutex};
 
 use aionui_api_types::WebSocketMessage;
 use aionui_common::{generate_id, now_ms};
-use aionui_db::models::AssistantUserRow;
-use aionui_db::{IChannelRepository, SqliteChannelRepository, init_database_memory};
+use aionui_db::models::{AssistantUserRow, ConversationRow};
+use aionui_db::{
+    IChannelRepository, IConversationRepository, SqliteChannelRepository, SqliteConversationRepository,
+    init_database_memory,
+};
 use aionui_realtime::EventBroadcaster;
 
 use aionui_channel::action::{ActionExecutor, MessageResult};
@@ -60,6 +63,31 @@ async fn setup() -> (
     let settings = Arc::new(ChannelSettingsService::new(pref_repo));
     let executor = ActionExecutor::new(pairing_arc, session_mgr_arc, settings, Some(OWNER_ID.to_owned()));
 
+    let conversation_repo = SqliteConversationRepository::new(db.pool().clone());
+    for (conversation_id, updated_at) in [("desktop-a", 100_i64), ("desktop-b", 200_i64)] {
+        conversation_repo
+            .create(&ConversationRow {
+                id: conversation_id.to_owned(),
+                user_id: OWNER_ID.to_owned(),
+                name: conversation_id.to_owned(),
+                r#type: "acp".to_owned(),
+                extra: "{}".to_owned(),
+                model: None,
+                status: Some("pending".to_owned()),
+                source: Some("aionui".to_owned()),
+                channel_chat_id: None,
+                pinned: false,
+                pinned_at: None,
+                created_at: updated_at,
+                updated_at,
+                project_id: None,
+                folder_id: None,
+                name_source: None,
+            })
+            .await
+            .unwrap();
+    }
+
     // Keep db alive
     std::mem::forget(db);
     (session_mgr, executor, pairing, repo)
@@ -103,6 +131,13 @@ fn make_text_message(user_id: &str, chat_id: &str, text: &str) -> UnifiedIncomin
         reply_to_message_id: None,
         action: None,
         raw: None,
+    }
+}
+
+fn make_reply_message(user_id: &str, chat_id: &str, text: &str, reply_to_message_id: &str) -> UnifiedIncomingMessage {
+    UnifiedIncomingMessage {
+        reply_to_message_id: Some(reply_to_message_id.into()),
+        ..make_text_message(user_id, chat_id, text)
     }
 }
 
@@ -304,7 +339,7 @@ async fn action_unauthorized_triggers_pairing() {
         MessageResult::Action(resp) => {
             assert_eq!(resp.behavior, ActionBehavior::Send);
             let text = resp.text.unwrap();
-            assert!(text.contains("pairing code"));
+            assert!(text.contains("配对码"));
             assert!(resp.buttons.is_some());
         }
         _ => panic!("Expected Action (pairing) for unauthorized user"),
@@ -314,7 +349,7 @@ async fn action_unauthorized_triggers_pairing() {
 // ── ActionExecutor: authorized user dispatches to agent ────────────
 
 #[tokio::test]
-async fn action_authorized_dispatches() {
+async fn action_authorized_plain_text_requires_reply_route() {
     let (_, executor, pairing, _) = setup().await;
 
     authorize_user(&pairing, "tg_42", "telegram").await;
@@ -323,10 +358,10 @@ async fn action_authorized_dispatches() {
     let result = executor.handle_incoming_message(&msg).await.unwrap();
 
     match result {
-        MessageResult::Dispatched { session_id, .. } => {
-            assert!(!session_id.is_empty());
+        MessageResult::Action(response) => {
+            assert!(response.text.as_deref().is_some_and(|text| text.contains("/new")));
         }
-        _ => panic!("Expected Dispatched for authorized user"),
+        other => panic!("expected reply-routing instructions, got {other:?}"),
     }
 }
 
@@ -360,62 +395,75 @@ async fn action_session_new() {
 
     authorize_user(&pairing, "tg_42", "telegram").await;
 
-    let msg = make_action_message("tg_42", "chat1", "session.new", ActionCategory::System);
+    let msg = make_text_message("tg_42", "chat1", "/new");
     let result = executor.handle_incoming_message(&msg).await.unwrap();
 
     match result {
-        MessageResult::Action(resp) => {
+        MessageResult::RoutedAction {
+            response: resp,
+            session_id,
+            ..
+        } => {
             let text = resp.text.unwrap();
-            assert!(text.contains("New session"));
-            // With no client_preferences configured, channels use bundled Pi.
-            assert!(text.contains("acp"));
+            assert!(text.contains("新会话已就绪"));
+            assert!(text.contains("引用回复这条消息"));
+            assert!(!session_id.is_empty());
         }
-        _ => panic!("Expected Action result"),
+        _ => panic!("Expected routed action result"),
+    }
+}
+
+#[tokio::test]
+async fn action_session_new_with_prompt_dispatches_prompt_without_ready_message() {
+    let (_, executor, pairing, _) = setup().await;
+
+    authorize_user(&pairing, "tg_42", "telegram").await;
+
+    let msg = make_text_message("tg_42", "chat1", "/new hello");
+    let result = executor.handle_incoming_message(&msg).await.unwrap();
+
+    match result {
+        MessageResult::RoutedAction {
+            follow_up_text,
+            response,
+            session_id,
+            ..
+        } => {
+            assert_eq!(follow_up_text.as_deref(), Some("hello"));
+            assert!(response.text.is_none());
+            assert!(!session_id.is_empty());
+        }
+        _ => panic!("Expected routed action result"),
     }
 }
 
 // ── ActionExecutor: session.new resets the session (H-2 fix) ─────
 
 #[tokio::test]
-async fn action_session_new_resets_existing() {
+async fn action_session_new_preserves_existing_sessions() {
     let (_, executor, pairing, repo) = setup().await;
 
     authorize_user(&pairing, "tg_42", "telegram").await;
 
-    // Create a session by sending a text message
-    let msg1 = make_text_message("tg_42", "chat1", "Hello");
-    let r1 = executor.handle_incoming_message(&msg1).await.unwrap();
-    let sid1 = match r1 {
-        MessageResult::Dispatched { session_id, .. } => session_id,
-        _ => panic!("Expected Dispatched"),
+    let first_new = make_action_message("tg_42", "chat1", "session.new", ActionCategory::System);
+    let first_result = executor.handle_incoming_message(&first_new).await.unwrap();
+    let first_session_id = match first_result {
+        MessageResult::RoutedAction { session_id, .. } => session_id,
+        _ => panic!("Expected routed action result"),
     };
 
-    // session.new should delete old and create fresh
-    let new_msg = make_action_message("tg_42", "chat1", "session.new", ActionCategory::System);
-    let r2 = executor.handle_incoming_message(&new_msg).await.unwrap();
-    match r2 {
-        MessageResult::Action(resp) => {
-            let text = resp.text.unwrap();
-            assert!(text.contains("New session"));
-        }
-        _ => panic!("Expected Action result"),
-    }
-
-    // Send another text message — should get a different session ID
-    let msg3 = make_text_message("tg_42", "chat1", "Hello again");
-    let r3 = executor.handle_incoming_message(&msg3).await.unwrap();
-    let sid3 = match r3 {
-        MessageResult::Dispatched { session_id, .. } => session_id,
-        _ => panic!("Expected Dispatched"),
+    let second_new = make_action_message("tg_42", "chat1", "session.new", ActionCategory::System);
+    let second_result = executor.handle_incoming_message(&second_new).await.unwrap();
+    let second_session_id = match second_result {
+        MessageResult::RoutedAction { session_id, .. } => session_id,
+        _ => panic!("Expected routed action result"),
     };
+    assert_ne!(first_session_id, second_session_id);
 
-    // The new session should have a different ID from the original
-    assert_ne!(sid1, sid3);
-
-    // Only 1 session should exist for this user+chat in the DB
+    // Each /new route remains independently addressable by replies.
     let all = repo.get_all_sessions(OWNER_ID).await.unwrap();
     let user_sessions: Vec<_> = all.iter().filter(|s| s.chat_id.as_deref() == Some("chat1")).collect();
-    assert_eq!(user_sessions.len(), 1);
+    assert_eq!(user_sessions.len(), 2);
 }
 
 // NOTE: the former `action_agent_select_persists` test was removed. Direct
@@ -423,41 +471,93 @@ async fn action_session_new_resets_existing() {
 // assistant-first model — the handler now treats them as unknown actions
 // (covered by `action::tests::agent_select_is_treated_as_unknown_action`).
 
-// ── ActionExecutor: session isolation across messages ───────────────
+// ── ActionExecutor: reply-target session routing ────────────────────
 
 #[tokio::test]
-async fn action_session_isolation() {
-    let (_, executor, pairing, _) = setup().await;
+async fn action_replies_route_to_the_exact_desktop_conversation() {
+    let (session_mgr, executor, pairing, _repo) = setup().await;
 
     authorize_user(&pairing, "tg_42", "telegram").await;
+    session_mgr
+        .register_conversation_route(
+            OWNER_ID,
+            &aionui_db::UpsertChannelConversationRouteParams {
+                conversation_id: "desktop-a",
+                platform_type: "telegram",
+                chat_id: "chat1",
+                message_id: "bot-a",
+                preview_text: Some("Answer A"),
+                sent_at: 100,
+                delivery_started_at: None,
+                delivery_completed_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    session_mgr
+        .register_conversation_route(
+            OWNER_ID,
+            &aionui_db::UpsertChannelConversationRouteParams {
+                conversation_id: "desktop-b",
+                platform_type: "telegram",
+                chat_id: "chat1",
+                message_id: "bot-b",
+                preview_text: Some("Answer B"),
+                sent_at: 200,
+                delivery_started_at: None,
+                delivery_completed_at: None,
+            },
+        )
+        .await
+        .unwrap();
 
-    // Send messages in two different chats
-    let msg1 = make_text_message("tg_42", "chatA", "Hello 1");
-    let msg2 = make_text_message("tg_42", "chatB", "Hello 2");
-
-    let r1 = executor.handle_incoming_message(&msg1).await.unwrap();
-    let r2 = executor.handle_incoming_message(&msg2).await.unwrap();
-
-    let sid1 = match r1 {
-        MessageResult::Dispatched { session_id, .. } => session_id,
-        _ => panic!("Expected Dispatched"),
+    let reply_a = executor
+        .handle_incoming_message(&make_reply_message("tg_42", "chat1", "Continue A", "bot-a"))
+        .await
+        .unwrap();
+    let reply_b = executor
+        .handle_incoming_message(&make_reply_message("tg_42", "chat1", "Continue B", "bot-b"))
+        .await
+        .unwrap();
+    let routed_a = match reply_a {
+        MessageResult::Dispatched { conversation_id, .. } => conversation_id,
+        _ => panic!("Expected reply A to dispatch"),
     };
-    let sid2 = match r2 {
-        MessageResult::Dispatched { session_id, .. } => session_id,
-        _ => panic!("Expected Dispatched"),
+    let routed_b = match reply_b {
+        MessageResult::Dispatched { conversation_id, .. } => conversation_id,
+        _ => panic!("Expected reply B to dispatch"),
     };
+    assert_eq!(routed_a.as_deref(), Some("desktop-a"));
+    assert_eq!(routed_b.as_deref(), Some("desktop-b"));
 
-    // Different chats → different sessions
-    assert_ne!(sid1, sid2);
+    assert!(
+        session_mgr
+            .resolve_conversation_route(OWNER_ID, "telegram", "other-chat", "bot-a")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        session_mgr
+            .resolve_conversation_route(OWNER_ID, "lark", "chat1", "bot-a")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
-    // Same chat again → reuse
-    let msg3 = make_text_message("tg_42", "chatA", "Hello 3");
-    let r3 = executor.handle_incoming_message(&msg3).await.unwrap();
-    let sid3 = match r3 {
-        MessageResult::Dispatched { session_id, .. } => session_id,
-        _ => panic!("Expected Dispatched"),
-    };
-    assert_eq!(sid1, sid3);
+    assert!(
+        session_mgr
+            .resolve_conversation_route("other-owner", "telegram", "chat1", "bot-a")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let unknown = executor
+        .handle_incoming_message(&make_reply_message("tg_42", "chat1", "Unknown", "missing"))
+        .await
+        .unwrap();
+    assert!(matches!(unknown, MessageResult::Action(_)));
 }
 
 // Note: bind_conversation FK-constrained persistence is tested in

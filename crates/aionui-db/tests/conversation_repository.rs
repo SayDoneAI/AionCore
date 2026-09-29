@@ -119,6 +119,72 @@ async fn create_get_update_delete_lifecycle() {
 }
 
 #[tokio::test]
+async fn automatic_name_update_is_conditional_on_name_source() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("automatic title");
+    repo.create(&conv).await.unwrap();
+
+    assert!(
+        repo.update_auto(
+            &conv.user_id,
+            &conv.id,
+            &ConversationRowUpdate {
+                name: Some("0101|其他|First title".to_string()),
+                name_source: Some("auto".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    );
+
+    assert!(
+        repo.update_auto(
+            &conv.user_id,
+            &conv.id,
+            &ConversationRowUpdate {
+                name: Some("0101|技术|Updated title".to_string()),
+                name_source: Some("auto".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+    );
+
+    repo.update(
+        &conv.user_id,
+        &conv.id,
+        &ConversationRowUpdate {
+            name: Some("My title".to_string()),
+            name_source: Some("user".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !repo
+            .update_auto(
+                &conv.user_id,
+                &conv.id,
+                &ConversationRowUpdate {
+                    name: Some("0101|技术|Late title".to_string()),
+                    name_source: Some("auto".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+    );
+
+    let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+    assert_eq!(found.name, "My title");
+    assert_eq!(found.name_source.as_deref(), Some("user"));
+}
+
+#[tokio::test]
 async fn delete_conversation_cascades_messages() {
     let (repo, db) = setup().await;
     let conv = make_conversation("cascade");

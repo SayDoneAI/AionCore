@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use aionui_common::{generate_id, now_ms};
 use aionui_db::IChannelRepository;
+use aionui_db::UpsertChannelConversationRouteParams;
 use aionui_db::models::AssistantSessionRow;
 use tracing::{debug, info};
 
@@ -70,11 +71,8 @@ impl SessionManager {
         Ok(sessions)
     }
 
-    /// Deletes the existing session for a user+chat pair and creates a
-    /// fresh one. Returns the newly created session.
-    ///
-    /// Used by `session.new` to give the user a clean slate in a chat.
-    pub async fn reset_session(
+    /// Creates a fresh session while preserving all earlier sessions.
+    pub async fn create_session(
         &self,
         owner_user_id: &str,
         user_id: &str,
@@ -82,12 +80,6 @@ impl SessionManager {
         agent_type: &str,
         workspace: Option<&str>,
     ) -> Result<AssistantSessionRow, ChannelError> {
-        // Delete old session if it exists
-        self.repo
-            .delete_session_by_user_chat(owner_user_id, user_id, chat_id)
-            .await?;
-
-        // Create a fresh session
         let now = now_ms();
         let new_row = AssistantSessionRow {
             id: generate_id(),
@@ -100,19 +92,160 @@ impl SessionManager {
             last_activity: now,
         };
 
-        let session = self
-            .repo
-            .get_or_create_session(owner_user_id, user_id, chat_id, &new_row)
-            .await?;
+        let session = self.repo.create_session(owner_user_id, user_id, &new_row).await?;
 
         info!(
             session_id = %session.id,
             user_id = %user_id,
             chat_id = %chat_id,
-            "session reset"
+            "session created"
         );
 
         Ok(session)
+    }
+
+    pub async fn resolve_reply_route(
+        &self,
+        owner_user_id: &str,
+        user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Option<AssistantSessionRow>, ChannelError> {
+        let session = self
+            .repo
+            .get_session_by_route(owner_user_id, user_id, platform_type, chat_id, message_id)
+            .await?;
+        if let Some(session) = &session {
+            self.repo
+                .update_session_activity(owner_user_id, &session.id, now_ms())
+                .await?;
+        }
+        Ok(session)
+    }
+
+    pub async fn register_reply_route(
+        &self,
+        owner_user_id: &str,
+        session_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<(), ChannelError> {
+        self.repo
+            .upsert_session_route(owner_user_id, session_id, platform_type, chat_id, message_id, now_ms())
+            .await?;
+        Ok(())
+    }
+
+    /// Resolves a quoted platform message directly to its desktop conversation.
+    pub async fn resolve_conversation_route(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Option<String>, ChannelError> {
+        Ok(self
+            .repo
+            .resolve_conversation_route(owner_user_id, platform_type, chat_id, message_id)
+            .await?)
+    }
+
+    pub async fn resolve_conversation_route_by_preview(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        quoted_text: &str,
+        require_unique: bool,
+    ) -> Result<Option<String>, ChannelError> {
+        Ok(self
+            .repo
+            .resolve_conversation_route_by_preview(owner_user_id, platform_type, chat_id, quoted_text, require_unique)
+            .await?)
+    }
+
+    pub async fn resolve_conversation_route_by_timestamp(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        reply_timestamp: i64,
+        max_skew_ms: i64,
+    ) -> Result<Option<String>, ChannelError> {
+        Ok(self
+            .repo
+            .resolve_conversation_route_by_timestamp(
+                owner_user_id,
+                platform_type,
+                chat_id,
+                reply_timestamp,
+                max_skew_ms,
+            )
+            .await?)
+    }
+
+    /// Records an outgoing platform message as a reply target for a conversation.
+    pub async fn register_conversation_route(
+        &self,
+        owner_user_id: &str,
+        params: &UpsertChannelConversationRouteParams<'_>,
+    ) -> Result<(), ChannelError> {
+        self.repo.upsert_conversation_route(owner_user_id, params).await?;
+        Ok(())
+    }
+
+    /// Makes a routed desktop conversation active for this channel user/chat.
+    ///
+    /// The route table keeps old message anchors, so only one runtime adapter
+    /// session is needed per target chat at a time.
+    pub async fn activate_conversation(
+        &self,
+        owner_user_id: &str,
+        user_id: &str,
+        chat_id: &str,
+        agent_type: &str,
+        conversation_id: &str,
+    ) -> Result<AssistantSessionRow, ChannelError> {
+        if let Some(existing) = self
+            .repo
+            .get_all_sessions(owner_user_id)
+            .await?
+            .into_iter()
+            .find(|session| {
+                session.user_id == user_id
+                    && session.chat_id.as_deref() == Some(chat_id)
+                    && session.conversation_id.as_deref() == Some(conversation_id)
+            })
+        {
+            self.repo
+                .update_session_activity(owner_user_id, &existing.id, now_ms())
+                .await?;
+            return Ok(existing);
+        }
+
+        self.repo
+            .delete_session_by_user_chat(owner_user_id, user_id, chat_id)
+            .await?;
+        let now = now_ms();
+        self.repo
+            .create_session(
+                owner_user_id,
+                user_id,
+                &AssistantSessionRow {
+                    id: generate_id(),
+                    user_id: user_id.to_owned(),
+                    agent_type: agent_type.to_owned(),
+                    conversation_id: Some(conversation_id.to_owned()),
+                    workspace: None,
+                    chat_id: Some(chat_id.to_owned()),
+                    created_at: now,
+                    last_activity: now,
+                },
+            )
+            .await
+            .map_err(Into::into)
     }
 
     /// Updates the agent_type for an existing session.
@@ -299,6 +432,16 @@ mod tests {
             }
             // Create new
             sessions.push(new_row.clone());
+            Ok(new_row.clone())
+        }
+
+        async fn create_session(
+            &self,
+            _owner_user_id: &str,
+            _user_id: &str,
+            new_row: &AssistantSessionRow,
+        ) -> Result<AssistantSessionRow, DbError> {
+            self.sessions.lock().unwrap().push(new_row.clone());
             Ok(new_row.clone())
         }
 
@@ -556,17 +699,17 @@ mod tests {
         assert!(err.is_err());
     }
 
-    // ── reset_session ─────────────────────────────────────────────────
+    // ── create_session ────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn reset_session_creates_fresh_session() {
+    async fn create_session_preserves_existing_session() {
         let (mgr, repo) = make_manager();
         let s1 = mgr
             .get_or_create_session(OWNER_ID, "u1", "c1", "gemini", None)
             .await
             .unwrap();
 
-        let s2 = mgr.reset_session(OWNER_ID, "u1", "c1", "gemini", None).await.unwrap();
+        let s2 = mgr.create_session(OWNER_ID, "u1", "c1", "gemini", None).await.unwrap();
 
         // New session should have a different ID
         assert_ne!(s1.id, s2.id);
@@ -574,14 +717,13 @@ mod tests {
         assert_eq!(s2.chat_id.as_deref(), Some("c1"));
         assert!(s2.conversation_id.is_none());
 
-        // Only 1 session should exist (old one deleted)
-        assert_eq!(repo.get_sessions().len(), 1);
+        assert_eq!(repo.get_sessions().len(), 2);
     }
 
     #[tokio::test]
-    async fn reset_session_noop_when_no_existing() {
+    async fn create_session_when_no_existing_session() {
         let (mgr, repo) = make_manager();
-        let session = mgr.reset_session(OWNER_ID, "u1", "c1", "acp", None).await.unwrap();
+        let session = mgr.create_session(OWNER_ID, "u1", "c1", "acp", None).await.unwrap();
 
         assert_eq!(session.user_id, "u1");
         assert_eq!(repo.get_sessions().len(), 1);
