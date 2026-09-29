@@ -1510,8 +1510,13 @@ mod tests {
         assert_eq!(snapshot.agent_id, "632f31d2");
         assert_eq!(conversation.r#type, AgentType::Aionrs.serde_name());
         assert!(
-            conversation.name.ends_with("|其他|Weixin Aionrs"),
-            "unexpected channel conversation title: {}",
+            conversation.name.ends_with("|其他|Weixin Aionrs")
+                && conversation
+                    .name
+                    .split('|')
+                    .next()
+                    .is_some_and(|date| date.len() == 4 && date.chars().all(|ch| ch.is_ascii_digit())),
+            "channel conversation should use the dated assistant title shape: {}",
             conversation.name
         );
 

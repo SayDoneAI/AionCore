@@ -169,6 +169,16 @@ impl JobExecutor {
         self.validate_runtime_job_workspace(job).await?;
         let conversation_id = self.resolve_conversation(job, saved_skill.as_ref()).await?;
 
+        self.prepare_run_now_for_conversation(job, conversation_id, saved_skill)
+            .await
+    }
+
+    async fn prepare_run_now_for_conversation(
+        &self,
+        job: &CronJob,
+        conversation_id: String,
+        saved_skill: Option<SavedSkillContext>,
+    ) -> Result<PreparedRunNow, CronError> {
         if self.is_conversation_claimed(&conversation_id) {
             info!(
                 job_id = %job.id,

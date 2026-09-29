@@ -29,6 +29,9 @@ pub enum CronError {
     #[error("Invalid agent config: {0}")]
     InvalidAgentConfig(String),
 
+    #[error("Invalid run-now conversation: {0}")]
+    InvalidRunNowConversation(String),
+
     #[error("Cross-account reference: {0}")]
     CrossAccountReference(String),
 

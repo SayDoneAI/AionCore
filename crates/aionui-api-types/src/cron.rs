@@ -229,9 +229,17 @@ pub struct ListCronJobsQuery {
 // F. Other responses
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RunNowRequest {
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunNowResponse {
     pub conversation_id: String,
+    #[serde(default)]
+    pub already_running: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -864,6 +872,7 @@ mod tests {
     fn run_now_response_serialize() {
         let r = RunNowResponse {
             conversation_id: "conv_new".into(),
+            already_running: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         assert_eq!(json["conversation_id"], "conv_new");
@@ -873,6 +882,7 @@ mod tests {
     fn run_now_response_roundtrip() {
         let r = RunNowResponse {
             conversation_id: "conv_1".into(),
+            already_running: true,
         };
         let json = serde_json::to_string(&r).unwrap();
         let parsed: RunNowResponse = serde_json::from_str(&json).unwrap();

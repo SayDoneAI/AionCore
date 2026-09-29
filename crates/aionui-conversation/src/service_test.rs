@@ -4960,7 +4960,7 @@ async fn managed_runtime_restore_filters_preferences_without_confirming_defaults
                 "thinking_budget",
                 "thinking",
             ];
-            let mut selections = json!({"mode": "read-only"});
+            let mut selections = json!({"mode": "read-only", "model": "managed-model"});
             if let Some(value) = saved {
                 for key in keys {
                     selections[key] = json!(value);
@@ -5007,6 +5007,21 @@ async fn managed_runtime_restore_filters_preferences_without_confirming_defaults
             assert_eq!(
                 selections.get(&ConfigKey::new("mode")).map(|value| value.as_str()),
                 Some("read-only")
+            );
+            let expected_model = if backend == "pi" {
+                "saydone/managed-model"
+            } else {
+                "managed-model"
+            };
+            assert_eq!(
+                selections.get(&ConfigKey::new("model")).map(|value| value.as_str()),
+                Some(expected_model),
+                "{backend}/model"
+            );
+            assert_eq!(
+                context.config.current_model_id.as_deref(),
+                Some(expected_model),
+                "{backend}/current_model_id"
             );
         }
     }
