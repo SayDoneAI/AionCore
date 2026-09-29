@@ -272,7 +272,10 @@ async fn weixin_sends_one_complete_answer_after_tool_call() {
 
     let sends = recorder.take_sends();
     assert_eq!(sends.len(), 1, "WeChat must send only the final answer: {sends:?}");
-    assert_eq!(sends[0].text.as_deref(), Some("Here is the plan: Done."));
+    assert_eq!(
+        sends[0].text.as_deref(),
+        Some("你：Test question\n\nAI：Here is the plan: Done.")
+    );
 }
 
 #[tokio::test]
@@ -324,7 +327,47 @@ async fn weixin_waits_for_the_whole_turn_after_an_intermediate_finish() {
 
     let sends = recorder.take_sends();
     assert_eq!(sends.len(), 1);
-    assert_eq!(sends[0].text.as_deref(), Some("Preparing. Final answer."));
+    assert_eq!(
+        sends[0].text.as_deref(),
+        Some("你：Test question\n\nAI：Preparing. Final answer.")
+    );
+}
+
+#[tokio::test]
+async fn lark_final_edit_includes_original_prompt() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+    let relay = ChannelStreamRelay::new(
+        RelayConfig {
+            owner_user_id: "system_default_user".to_owned(),
+            session_id: "session_1".to_owned(),
+            conversation_id: "conversation_1".to_owned(),
+            platform: PluginType::Lark,
+            plugin_id: "lark".into(),
+            chat_id: "chat_1".into(),
+            prompt_text: "请总结这个文件".into(),
+            throttle_ms: 10_000,
+        },
+        recorder.clone(),
+    );
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData {
+            content: "文件已总结".into(),
+        }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    let edits = recorder.take_edits();
+    assert_eq!(
+        edits.last().and_then(|message| message.text.as_deref()),
+        Some("你：请总结这个文件\n\nAI：文件已总结")
+    );
 }
 
 #[tokio::test]

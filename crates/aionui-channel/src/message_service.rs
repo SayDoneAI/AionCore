@@ -470,35 +470,24 @@ fn parse_agent_type(s: &str) -> Result<AgentType, ChannelError> {
 }
 
 fn channel_conversation_name(
-    platform: PluginType,
+    _platform: PluginType,
     agent_type: &str,
     backend: Option<&str>,
-    chat_id: Option<&str>,
+    _chat_id: Option<&str>,
 ) -> String {
-    let short = match platform {
-        PluginType::Telegram => "tg",
-        PluginType::Lark => "lark",
-        PluginType::Dingtalk => "ding",
-        PluginType::Weixin => "wx",
-        PluginType::Wecom => "wecom",
-        PluginType::Slack => "slack",
-        PluginType::Discord => "discord",
+    let runtime_name = if agent_type == "acp" {
+        backend.filter(|name| !name.is_empty()).unwrap_or(agent_type)
+    } else if agent_type.is_empty() {
+        "Agent"
+    } else {
+        agent_type
     };
-
-    let mut parts = vec![short.to_owned()];
-    if !agent_type.is_empty() {
-        parts.push(agent_type.to_owned());
+    let date = chrono::Local::now().format("%m%d").to_string();
+    let mut display_name = runtime_name.to_owned();
+    if let Some(first) = display_name.get_mut(0..1) {
+        first.make_ascii_uppercase();
     }
-    if agent_type == "acp"
-        && let Some(b) = backend
-    {
-        parts.push(b.to_owned());
-    }
-    if let Some(cid) = chat_id {
-        let end = cid.len().min(8);
-        parts.push(cid[..end].to_owned());
-    }
-    parts.join("-")
+    format_channel_assistant_name(&display_name, date)
 }
 
 /// Channel assistant settings are also used as the initial conversation name.
@@ -919,37 +908,45 @@ mod tests {
     #[test]
     fn conv_name_telegram_acp_with_backend() {
         let name = channel_conversation_name(PluginType::Telegram, "acp", Some("claude"), Some("70880480"));
-        assert_eq!(name, "tg-acp-claude-70880480");
+        assert!(name.ends_with("|其他|Claude"));
+        assert!(
+            name.split('|')
+                .next()
+                .is_some_and(|date| date.len() == 4 && date.chars().all(|ch| ch.is_ascii_digit()))
+        );
     }
 
     #[test]
     fn conv_name_telegram_aionrs() {
         let name = channel_conversation_name(PluginType::Telegram, "aionrs", None, Some("70880480"));
-        assert_eq!(name, "tg-aionrs-70880480");
+        assert!(name.ends_with("|其他|Aionrs"));
     }
 
     #[test]
     fn conv_name_lark_acp_no_backend() {
         let name = channel_conversation_name(PluginType::Lark, "acp", None, Some("abcdef12"));
-        assert_eq!(name, "lark-acp-abcdef12");
+        assert!(name.ends_with("|其他|Acp"));
     }
 
     #[test]
     fn conv_name_dingtalk_truncates_long_chat_id() {
         let name = channel_conversation_name(PluginType::Dingtalk, "acp", Some("vertex"), Some("123456789abcdef"));
-        assert_eq!(name, "ding-acp-vertex-12345678");
+        assert!(name.ends_with("|其他|Vertex"));
+        assert!(!name.contains("12345678"));
     }
 
     #[test]
     fn conv_name_weixin_no_chat_id() {
         let name = channel_conversation_name(PluginType::Weixin, "acp", Some("gemini"), None);
-        assert_eq!(name, "wx-acp-gemini");
+        assert!(name.ends_with("|其他|Gemini"));
+        assert!(!name.contains("wx-acp"));
     }
 
     #[test]
     fn conv_name_non_acp_ignores_backend() {
         let name = channel_conversation_name(PluginType::Telegram, "aionrs", Some("claude"), Some("70880480"));
-        assert_eq!(name, "tg-aionrs-70880480");
+        assert!(name.ends_with("|其他|Aionrs"));
+        assert!(!name.contains("claude"));
     }
 
     #[test]

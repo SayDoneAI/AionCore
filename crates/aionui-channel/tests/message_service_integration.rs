@@ -605,11 +605,12 @@ async fn send_to_agent_without_saved_binding_defaults_to_bundled_pi_runtime() {
     // to the generated-assistant availability path.
     assert!(snapshot.is_none());
     assert_eq!(conversation.r#type, AgentType::Acp.serde_name());
-    assert_eq!(conversation.name, "tg-acp-pi-70880480");
+    assert!(conversation.name.ends_with("|其他|Pi"));
+    assert!(!conversation.name.contains("tg-acp-pi"));
 }
 
 #[tokio::test]
-async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name() {
+async fn send_to_agent_without_assistant_name_uses_dated_channel_name() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();
 
@@ -674,5 +675,17 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(conversation.name, "tg-acp-codex-70880480");
+    assert!(
+        conversation.name.ends_with("|其他|Codex"),
+        "channel conversation should not expose the transport id: {}",
+        conversation.name
+    );
+    assert!(
+        conversation
+            .name
+            .split('|')
+            .next()
+            .is_some_and(|date| date.len() == 4 && date.chars().all(|ch| ch.is_ascii_digit()))
+    );
+    assert!(!conversation.name.contains("tg-acp-codex"));
 }
