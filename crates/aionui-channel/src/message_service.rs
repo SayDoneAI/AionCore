@@ -200,14 +200,16 @@ impl ChannelMessageService {
         {
             extra["agent_source"] = serde_json::Value::String("builtin".to_owned());
         }
-        let name = assistant_name.unwrap_or_else(|| {
-            channel_conversation_name(
-                platform,
-                &agent_config.agent_type,
-                agent_config.backend.as_deref(),
-                session.chat_id.as_deref(),
-            )
-        });
+        let name = assistant_name
+            .map(|name| format_channel_assistant_name(&name, chrono::Local::now().format("%m%d").to_string()))
+            .unwrap_or_else(|| {
+                channel_conversation_name(
+                    platform,
+                    &agent_config.agent_type,
+                    agent_config.backend.as_deref(),
+                    session.chat_id.as_deref(),
+                )
+            });
 
         // Top-level `model` is only accepted for aionrs; other types pass via `extra`.
         let top_level_model = if agent_type == AgentType::Aionrs {
@@ -497,6 +499,13 @@ fn channel_conversation_name(
         parts.push(cid[..end].to_owned());
     }
     parts.join("-")
+}
+
+/// Channel assistant settings are also used as the initial conversation name.
+/// Keep that name in the same dated shape as renderer-generated titles so a
+/// remote conversation is identifiable by its creation day from the sidebar.
+fn format_channel_assistant_name(name: &str, date: String) -> String {
+    format!("{date}|其他|{}", name.replace(['|', '\r', '\n'], " ").trim())
 }
 
 fn managed_runtime_target(conversation: &ConversationResponse) -> Option<(&'static str, String)> {
@@ -941,5 +950,21 @@ mod tests {
     fn conv_name_non_acp_ignores_backend() {
         let name = channel_conversation_name(PluginType::Telegram, "aionrs", Some("claude"), Some("70880480"));
         assert_eq!(name, "tg-aionrs-70880480");
+    }
+
+    #[test]
+    fn assistant_name_uses_dated_auto_title_shape() {
+        assert_eq!(
+            format_channel_assistant_name("Casual Greeting", "0929".to_owned()),
+            "0929|其他|Casual Greeting"
+        );
+    }
+
+    #[test]
+    fn assistant_name_cleans_title_delimiters() {
+        assert_eq!(
+            format_channel_assistant_name("  Hello|World\n", "0929".to_owned()),
+            "0929|其他|Hello World"
+        );
     }
 }

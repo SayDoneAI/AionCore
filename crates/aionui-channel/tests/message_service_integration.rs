@@ -471,7 +471,11 @@ async fn send_to_agent_persists_assistant_snapshot_for_channel_bound_assistant()
     assert_eq!(snapshot.assistant_id, "bare-claude");
     assert_eq!(snapshot.agent_id, "2d23ff1c");
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("gpt-6-astra"));
-    assert_eq!(conversation.name, "Claude");
+    assert!(
+        conversation.name.ends_with("|其他|Claude"),
+        "channel assistant name should include the dated title prefix: {}",
+        conversation.name
+    );
 }
 
 #[tokio::test]
