@@ -1509,7 +1509,11 @@ mod tests {
         assert_eq!(snapshot.assistant_id, "bare-channel-aionrs");
         assert_eq!(snapshot.agent_id, "632f31d2");
         assert_eq!(conversation.r#type, AgentType::Aionrs.serde_name());
-        assert_eq!(conversation.name, "Weixin Aionrs");
+        assert!(
+            conversation.name.ends_with("|其他|Weixin Aionrs"),
+            "unexpected channel conversation title: {}",
+            conversation.name
+        );
 
         let second_session = AssistantSessionRow {
             conversation_id: Some(first.conversation_id.clone()),
