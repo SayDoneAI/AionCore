@@ -2664,6 +2664,60 @@ async fn run_now_on_running_existing_conversation_returns_active_conversation_wi
     drop(claim);
 }
 
+#[tokio::test]
+async fn prepare_run_now_resolves_conversation_without_starting_execution() {
+    let (svc, cron_repo, bc, _conv_repo, _conv_service) = setup_with_conv_runtime().await;
+    let job = svc
+        .add_job("u1", make_create_req("Prepare Only", every_60s()))
+        .await
+        .unwrap();
+    bc.take_events();
+
+    let response = svc.prepare_run_now("u1", &job.id).await.unwrap();
+
+    assert!(!response.already_running);
+    assert!(!response.conversation_id.is_empty());
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    let row = cron_repo.get_by_id_system(&job.id).await.unwrap().unwrap();
+    assert_eq!(row.run_count, 0);
+    assert!(row.last_status.is_none());
+    assert!(
+        bc.take_events().iter().all(|event| event.name != "cron.job-executed"),
+        "preparing a run-now request must not start the agent turn"
+    );
+}
+
+#[tokio::test]
+async fn run_now_with_prepared_conversation_consumes_the_preparation() {
+    let (svc, _cron_repo, bc, _conv_repo, _conv_service) = setup_with_conv_runtime().await;
+    let job = svc
+        .add_job("u1", make_create_req("Execute Prepared", every_60s()))
+        .await
+        .unwrap();
+    bc.take_events();
+
+    let prepared = svc.prepare_run_now("u1", &job.id).await.unwrap();
+    let response = svc
+        .run_now_with_conversation("u1", &job.id, Some(&prepared.conversation_id))
+        .await
+        .unwrap();
+
+    assert_eq!(response.conversation_id, prepared.conversation_id);
+    assert!(!response.already_running);
+    let second_attempt = svc
+        .run_now_with_conversation("u1", &job.id, Some(&prepared.conversation_id))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        second_attempt,
+        aionui_cron::error::CronError::InvalidRunNowConversation(message)
+            if message.contains("missing or expired")
+    ));
+}
+
 // ── Delete skill explicitly ───────────────────────────────────────
 
 #[tokio::test]

@@ -8,8 +8,8 @@ use axum::routing::{get, post, put};
 
 use aionui_api_types::{
     ApiResponse, ConversationResponse, CreateConversationCronRequest, CreateConversationCronResponse,
-    CreateCronJobRequest, CronJobResponse, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
-    UpdateConversationCronRequest, UpdateCronJobRequest,
+    CreateCronJobRequest, CronJobResponse, HasSkillResponse, ListCronJobsQuery, RunNowRequest, RunNowResponse,
+    SaveCronSkillRequest, UpdateConversationCronRequest, UpdateCronJobRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -41,6 +41,7 @@ impl From<CronError> for ApiError {
             CronError::InvalidTimezone(msg) => ApiError::BadRequest(msg),
             CronError::InvalidSkillContent(msg) => ApiError::BadRequest(msg),
             CronError::InvalidAgentConfig(msg) => ApiError::BadRequest(msg),
+            CronError::InvalidRunNowConversation(msg) => ApiError::BadRequest(msg),
             CronError::CrossAccountReference(msg) => {
                 ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", msg, None)
             }
@@ -58,6 +59,7 @@ pub fn cron_routes(state: CronRouterState) -> Router {
     Router::new()
         .route("/api/cron/jobs", get(list_jobs).post(create_job))
         .route("/api/cron/jobs/{id}", get(get_job).put(update_job).delete(delete_job))
+        .route("/api/cron/jobs/{id}/prepare", post(prepare_run_now))
         .route("/api/cron/jobs/{id}/run", post(run_now))
         .route("/api/internal/conversation-cron/create", post(create_conversation_cron))
         .route("/api/internal/conversation-cron/list", get(list_conversation_cron))
@@ -128,8 +130,22 @@ async fn run_now(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
+    body: Result<Json<RunNowRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RunNowResponse>>, ApiError> {
-    let resp = state.cron_service.run_now(&user.id, &id).await?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let resp = state
+        .cron_service
+        .run_now_with_conversation(&user.id, &id, req.conversation_id.as_deref())
+        .await?;
+    Ok(Json(ApiResponse::ok(resp)))
+}
+
+async fn prepare_run_now(
+    State(state): State<CronRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<RunNowResponse>>, ApiError> {
+    let resp = state.cron_service.prepare_run_now(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 

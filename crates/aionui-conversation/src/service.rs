@@ -5703,6 +5703,22 @@ impl ConversationService {
                 }
                 if let Some(snapshot) = context.session_snapshot.as_mut() {
                     snapshot.current_model_id = Some(aionui_ai_agent::shared_kernel::ModelId::new(wire_model));
+                    let model_key = snapshot
+                        .config_selections
+                        .keys()
+                        .find(|key| matches!(key.as_str(), "model" | "models"))
+                        .cloned()
+                        .unwrap_or_else(|| aionui_ai_agent::shared_kernel::ConfigKey::new("model"));
+                    snapshot.config_selections.insert(
+                        model_key,
+                        aionui_ai_agent::shared_kernel::ConfigValue::new(
+                            snapshot
+                                .current_model_id
+                                .as_ref()
+                                .map(aionui_ai_agent::shared_kernel::ModelId::as_str)
+                                .unwrap_or_default(),
+                        ),
+                    );
                 }
             }
             AgentSessionKind::Aionrs(_) => {

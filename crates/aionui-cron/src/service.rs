@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 use aionui_api_types::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronJobResponse,
@@ -22,7 +25,7 @@ use tracing::{debug, error, info, warn};
 use crate::events::CronEventEmitter;
 
 use crate::error::CronError;
-use crate::executor::{ExecutionResult, JobExecutor, PreparedRunNow, RETRY_INTERVAL_MS};
+use crate::executor::{ExecutionResult, JobExecutor, PreparedExecution, PreparedRunNow, RETRY_INTERVAL_MS};
 use crate::scheduler::{
     CronScheduler, compute_next_run, compute_next_run_after_occurrence, validate_schedule, validate_timezone,
 };
@@ -50,6 +53,15 @@ const PLACEHOLDER_PATTERNS: &[&str] = &[
 const RUN_LEASE_MS: i64 = 60_000;
 const RUN_LEASE_HEARTBEAT_MS: u64 = 20_000;
 const RUN_HISTORY_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+const RUN_NOW_PREPARE_TTL_MS: i64 = 60_000;
+
+struct PendingRunNow {
+    user_id: String,
+    job: CronJob,
+    prepared: PreparedExecution,
+    expires_at_ms: i64,
+}
+
 #[derive(Clone)]
 pub struct CronService {
     repo: Arc<dyn ICronRepository>,
@@ -62,6 +74,7 @@ pub struct CronService {
     emitter: CronEventEmitter,
     data_dir: PathBuf,
     instance_id: String,
+    pending_run_now: Arc<Mutex<HashMap<String, PendingRunNow>>>,
 }
 
 pub struct CronServiceDeps {
@@ -89,6 +102,7 @@ impl CronService {
             emitter: deps.emitter,
             data_dir: deps.data_dir,
             instance_id: generate_prefixed_id("cron-owner"),
+            pending_run_now: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -787,7 +801,107 @@ impl CronService {
         info!("System resume: all cron timers rescheduled");
     }
 
+    pub async fn prepare_run_now(&self, user_id: &str, job_id: &str) -> Result<RunNowResponse, CronError> {
+        let mut job = self.load_run_now_job(user_id, job_id).await?;
+        let prepared = match self.executor.prepare_run_now(&job).await? {
+            PreparedRunNow::Ready(prepared) => prepared,
+            PreparedRunNow::AlreadyRunning { conversation_id } => {
+                return Ok(RunNowResponse {
+                    conversation_id,
+                    already_running: true,
+                });
+            }
+        };
+        self.bind_materialized_existing_conversation_if_needed(&mut job, &prepared.conversation_id)
+            .await?;
+
+        let conversation_id = prepared.conversation_id.clone();
+        self.pending_run_now.lock().await.insert(
+            job.id.clone(),
+            PendingRunNow {
+                user_id: user_id.to_owned(),
+                job,
+                prepared,
+                expires_at_ms: now_ms() + RUN_NOW_PREPARE_TTL_MS,
+            },
+        );
+
+        Ok(RunNowResponse {
+            conversation_id,
+            already_running: false,
+        })
+    }
+
     pub async fn run_now(&self, user_id: &str, job_id: &str) -> Result<RunNowResponse, CronError> {
+        self.run_now_with_conversation(user_id, job_id, None).await
+    }
+
+    pub async fn run_now_with_conversation(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        requested_conversation_id: Option<&str>,
+    ) -> Result<RunNowResponse, CronError> {
+        let requested_conversation_id = requested_conversation_id
+            .map(str::trim)
+            .filter(|conversation_id| !conversation_id.is_empty());
+
+        let (job, prepared) = if let Some(requested_conversation_id) = requested_conversation_id {
+            let pending = {
+                let mut pending = self.pending_run_now.lock().await;
+                let now = now_ms();
+                pending.retain(|_, value| value.expires_at_ms > now);
+                pending.remove(job_id)
+            };
+            let Some(pending) = pending else {
+                return Err(CronError::InvalidRunNowConversation(format!(
+                    "run-now preparation for job {job_id} is missing or expired"
+                )));
+            };
+            if pending.user_id != user_id {
+                return Err(CronError::InvalidRunNowConversation(
+                    "prepared run-now conversation belongs to another user".into(),
+                ));
+            }
+            if pending.prepared.conversation_id != requested_conversation_id {
+                return Err(CronError::InvalidRunNowConversation(format!(
+                    "conversation {requested_conversation_id} was not prepared for job {job_id}"
+                )));
+            }
+            (pending.job, pending.prepared)
+        } else {
+            let mut job = self.load_run_now_job(user_id, job_id).await?;
+            let prepared = match self.executor.prepare_run_now(&job).await? {
+                PreparedRunNow::Ready(prepared) => prepared,
+                PreparedRunNow::AlreadyRunning { conversation_id } => {
+                    return Ok(RunNowResponse {
+                        conversation_id,
+                        already_running: true,
+                    });
+                }
+            };
+            self.bind_materialized_existing_conversation_if_needed(&mut job, &prepared.conversation_id)
+                .await?;
+            (job, prepared)
+        };
+
+        let conversation_id = prepared.conversation_id.clone();
+        let job_id = job.id.clone();
+        let user_id = user_id.to_owned();
+        let service = self.clone();
+
+        tokio::spawn(async move {
+            let result = service.executor.execute_prepared(&job, prepared).await;
+            service.handle_run_now_result(&user_id, &job_id, result).await;
+        });
+
+        Ok(RunNowResponse {
+            conversation_id,
+            already_running: false,
+        })
+    }
+
+    async fn load_run_now_job(&self, user_id: &str, job_id: &str) -> Result<CronJob, CronError> {
         let row = self
             .repo
             .get_by_id_for_user(user_id, job_id)
@@ -795,25 +909,7 @@ impl CronService {
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(row)?;
         job.agent_type = self.resolve_job_agent_type(&job).await?;
-        let prepared = match self.executor.prepare_run_now(&job).await? {
-            PreparedRunNow::Ready(prepared) => prepared,
-            PreparedRunNow::AlreadyRunning { conversation_id } => {
-                return Ok(RunNowResponse { conversation_id });
-            }
-        };
-        self.bind_materialized_existing_conversation_if_needed(&mut job, &prepared.conversation_id)
-            .await?;
-        let conversation_id = prepared.conversation_id.clone();
-        let service = self.clone();
-        let job_id = job.id.clone();
-        let user_id = user_id.to_owned();
-
-        tokio::spawn(async move {
-            let result = service.executor.execute_prepared(&job, prepared).await;
-            service.handle_run_now_result(&user_id, &job_id, result).await;
-        });
-
-        Ok(RunNowResponse { conversation_id })
+        Ok(job)
     }
 
     // -----------------------------------------------------------------------
