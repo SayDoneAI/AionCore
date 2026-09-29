@@ -173,7 +173,9 @@ impl ChannelStreamRelay {
                             continue;
                         }
                         if has_content && !text_buffer.trim().is_empty() {
-                            let formatted = format_text_for_platform(&text_buffer, self.config.platform);
+                            let reply =
+                                format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
+                            let formatted = format_text_for_platform(&reply, self.config.platform);
                             let final_msg = ChannelMessageService::build_final_message(&formatted);
                             if let Ok(receipt) = self
                                 .sender
@@ -200,7 +202,14 @@ impl ChannelStreamRelay {
                     Some(StreamAction::Error(msg)) => {
                         let error_msg = UnifiedOutgoingMessage {
                             message_type: OutgoingMessageType::Text,
-                            text: Some(format!("\u{274c} {msg}")),
+                            text: Some(format_text_for_platform(
+                                &format_remote_reply(
+                                    &self.config.prompt_text,
+                                    &format!("\u{274c} {msg}"),
+                                    self.config.platform,
+                                ),
+                                self.config.platform,
+                            )),
                             parse_mode: None,
                             buttons: None,
                             keyboard: None,
@@ -230,7 +239,8 @@ impl ChannelStreamRelay {
                 },
                 Err(broadcast::error::RecvError::Closed) => {
                     if has_content && !text_buffer.trim().is_empty() {
-                        let formatted = format_text_for_platform(&text_buffer, self.config.platform);
+                        let reply = format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
+                        let formatted = format_text_for_platform(&reply, self.config.platform);
                         let final_msg = ChannelMessageService::build_final_message(&formatted);
                         if let Ok(receipt) = self
                             .sender
@@ -301,7 +311,9 @@ impl ChannelStreamRelay {
                         text_buffer.push_str(&chunk);
                         has_content = true;
                         if last_edit.elapsed() >= throttle {
-                            let formatted = format_text_for_platform(&text_buffer, self.config.platform);
+                            let reply =
+                                format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
+                            let formatted = format_text_for_platform(&reply, self.config.platform);
                             let msg = ChannelMessageService::build_streaming_message(&formatted);
                             let _ = self
                                 .sender
@@ -352,7 +364,14 @@ impl ChannelStreamRelay {
                     Some(StreamAction::Error(msg)) => {
                         let error_msg = UnifiedOutgoingMessage {
                             message_type: OutgoingMessageType::Text,
-                            text: Some(format!("\u{274c} {msg}")),
+                            text: Some(format_text_for_platform(
+                                &format_remote_reply(
+                                    &self.config.prompt_text,
+                                    &format!("\u{274c} {msg}"),
+                                    self.config.platform,
+                                ),
+                                self.config.platform,
+                            )),
                             parse_mode: None,
                             buttons: None,
                             keyboard: None,
@@ -399,7 +418,8 @@ impl ChannelStreamRelay {
 
     async fn send_final_edit(&self, text_buffer: &str, has_content: bool, msg_id: &str) {
         if has_content {
-            let formatted = format_text_for_platform(text_buffer, self.config.platform);
+            let reply = format_remote_reply(&self.config.prompt_text, text_buffer, self.config.platform);
+            let formatted = format_text_for_platform(&reply, self.config.platform);
             let final_msg = ChannelMessageService::build_final_message(&formatted);
             let _ = self
                 .sender
@@ -448,6 +468,19 @@ impl ChannelStreamRelay {
         .chars()
         .take(240)
         .collect()
+    }
+}
+
+/// Include the original prompt in remote replies where users cannot reliably
+/// associate an answer with the originating message from the conversation list.
+/// Other platforms keep their existing answer-only message shape.
+fn format_remote_reply(prompt_text: &str, assistant_text: &str, platform: PluginType) -> String {
+    let prompt = prompt_text.trim();
+    let answer = assistant_text.trim();
+    if matches!(platform, PluginType::Weixin | PluginType::Wecom | PluginType::Lark) && !prompt.is_empty() {
+        format!("你：{prompt}\n\nAI：{answer}")
+    } else {
+        answer.to_owned()
     }
 }
 
