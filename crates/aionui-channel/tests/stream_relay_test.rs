@@ -274,7 +274,7 @@ async fn weixin_sends_one_complete_answer_after_tool_call() {
     assert_eq!(sends.len(), 1, "WeChat must send only the final answer: {sends:?}");
     assert_eq!(
         sends[0].text.as_deref(),
-        Some("你：Test question\n\nAI：Here is the plan: Done.")
+        Some("**你：** Test question\n\n**AI：** Here is the plan: Done.")
     );
 }
 
@@ -329,7 +329,7 @@ async fn weixin_waits_for_the_whole_turn_after_an_intermediate_finish() {
     assert_eq!(sends.len(), 1);
     assert_eq!(
         sends[0].text.as_deref(),
-        Some("你：Test question\n\nAI：Preparing. Final answer.")
+        Some("**你：** Test question\n\n**AI：** Preparing. Final answer.")
     );
 }
 
@@ -366,7 +366,7 @@ async fn lark_final_edit_includes_original_prompt() {
     let edits = recorder.take_edits();
     assert_eq!(
         edits.last().and_then(|message| message.text.as_deref()),
-        Some("你：请总结这个文件\n\nAI：文件已总结")
+        Some("**你：** 请总结这个文件\n\n**AI：** 文件已总结")
     );
 }
 

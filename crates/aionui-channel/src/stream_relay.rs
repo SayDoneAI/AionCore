@@ -478,9 +478,32 @@ fn format_remote_reply(prompt_text: &str, assistant_text: &str, platform: Plugin
     let prompt = prompt_text.trim();
     let answer = assistant_text.trim();
     if matches!(platform, PluginType::Weixin | PluginType::Wecom | PluginType::Lark) && !prompt.is_empty() {
-        format!("你：{prompt}\n\nAI：{answer}")
+        format!("**你：** {prompt}\n\n**AI：** {answer}")
     } else {
         answer.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_remote_reply;
+    use crate::types::PluginType;
+
+    #[test]
+    fn remote_reply_uses_markdown_bold_context_labels() {
+        assert_eq!(
+            format_remote_reply("原始问题", "回答内容", PluginType::Wecom),
+            "**你：** 原始问题\n\n**AI：** 回答内容"
+        );
+    }
+
+    #[test]
+    fn remote_reply_omits_context_without_prompt_or_for_other_platforms() {
+        assert_eq!(format_remote_reply("   ", "回答内容", PluginType::Weixin), "回答内容");
+        assert_eq!(
+            format_remote_reply("原始问题", "回答内容", PluginType::Telegram),
+            "回答内容"
+        );
     }
 }
 
