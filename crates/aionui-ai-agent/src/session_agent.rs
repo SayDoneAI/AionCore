@@ -442,6 +442,7 @@ impl SessionAgentTask {
             // No broadcaster: this ctor is the test/simple path, which has no
             // conversation WebSocket to push a late usage frame to.
             None,
+            None,
         )
     }
 
@@ -461,35 +462,9 @@ impl SessionAgentTask {
         handshake: &aionui_api_types::AgentHandshake,
         prompt_dump: Option<SessionPromptDump>,
         broadcaster: Option<Arc<dyn EventBroadcaster>>,
-    ) -> Arc<Self> {
-        Self::new_with_preload_and_effort(
-            agent_type,
-            conversation_id,
-            user_id,
-            workspace,
-            backend,
-            session_repo,
-            handshake,
-            None,
-            prompt_dump,
-            broadcaster,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn new_with_preload_and_effort(
-        agent_type: AgentType,
-        conversation_id: String,
-        user_id: String,
-        workspace: String,
-        backend: Arc<dyn SessionBackend>,
-        session_repo: Option<Arc<dyn IAcpSessionRepository>>,
-        handshake: &aionui_api_types::AgentHandshake,
         initial_effort: Option<String>,
-        prompt_dump: Option<SessionPromptDump>,
-        broadcaster: Option<Arc<dyn EventBroadcaster>>,
     ) -> Arc<Self> {
-        let task = Self::build(
+        Self::build(
             agent_type,
             conversation_id,
             user_id,
@@ -499,11 +474,8 @@ impl SessionAgentTask {
             CatalogPreload::from_handshake(handshake),
             prompt_dump,
             broadcaster,
-        );
-        if let Some(effort) = initial_effort {
-            task.runtime.set_effort_override(effort);
-        }
-        task
+            initial_effort,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -517,6 +489,7 @@ impl SessionAgentTask {
         catalog_preload: CatalogPreload,
         prompt_dump: Option<SessionPromptDump>,
         broadcaster: Option<Arc<dyn EventBroadcaster>>,
+        initial_effort: Option<String>,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
@@ -527,7 +500,7 @@ impl SessionAgentTask {
             session_id: std::sync::Mutex::new(None),
             mode_override: std::sync::Mutex::new(None),
             model_override: std::sync::Mutex::new(None),
-            effort_override: std::sync::Mutex::new(None),
+            effort_override: std::sync::Mutex::new(initial_effort),
             last_catalog: std::sync::Mutex::new(None),
             caps_fallback: std::sync::Mutex::new(CapsFallback::default()),
         });
@@ -1807,6 +1780,7 @@ pub async fn build_antigravity_instance(
         &metadata.handshake,
         None,
         Some(broadcaster),
+        None,
     );
     Ok(crate::agent_task::AgentInstance::Session(task))
 }
@@ -2095,7 +2069,7 @@ pub async fn build_session_instance(
         backend: if backend_label == "claude" { "claude" } else { "codex" },
     });
 
-    let task = SessionAgentTask::new_with_preload_and_effort(
+    let task = SessionAgentTask::new_with_preload(
         AgentType::Acp,
         conversation_id,
         user_id,
@@ -2103,11 +2077,11 @@ pub async fn build_session_instance(
         backend,
         acp_session_repo,
         &metadata.handshake,
-        applied_effort,
         prompt_dump,
         // Lets the pump push a usage frame that arrives after the turn's relay has
         // already stopped listening — the claude case (usage rides `result`).
         Some(broadcaster),
+        applied_effort,
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
@@ -6559,6 +6533,30 @@ mod persist_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_open_effort_is_visible_before_backend_echo() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(EffortCapsBackend);
+        let task = SessionAgentTask::new_with_preload(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            &aionui_api_types::AgentHandshake::default(),
+            None,
+            None,
+            Some("max".into()),
+        );
+        let snapshot = task.get_config_options().await.unwrap();
+        let effort = snapshot
+            .config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("thought_level"))
+            .expect("effort option");
+        assert_eq!(effort.current_value.as_deref(), Some("max"));
+    }
+
     // A model with no advertised efforts (claude `haiku`) must NOT get an effort option —
     // an empty select would render a dead, choice-less group.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7788,6 +7786,7 @@ mod pump_tests {
                 backend: "claude",
             }),
             None,
+            None,
         );
         crate::agent_task::IAgentTask::send_message(
             task.as_ref(),
@@ -7831,6 +7830,7 @@ mod pump_tests {
                 backend: "codex",
             }),
             None,
+            None,
         );
         // Inject an image directly onto the task's dump path via a content slice
         // containing an Image block.
@@ -7865,6 +7865,7 @@ mod pump_tests {
             backend,
             None,
             CatalogPreload::default(),
+            None,
             None,
             None,
         );
@@ -9886,46 +9887,6 @@ mod pump_tests {
         }
     }
 
-    fn handshake_with_effort_catalog() -> aionui_api_types::AgentHandshake {
-        aionui_api_types::AgentHandshake {
-            available_models: Some(serde_json::json!({
-                "available_models": [
-                    {
-                        "id": "gpt-6-astra",
-                        "label": "GPT-6 Astra",
-                        "reasoning_efforts": ["low", "medium", "high"]
-                    }
-                ],
-                "current_model_id": "gpt-6-astra",
-            })),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn restored_startup_effort_is_visible_in_config_options() {
-        let backend: Arc<dyn SessionBackend> = Arc::new(ScriptBackend(Vec::new()));
-        let task = SessionAgentTask::new_with_preload_and_effort(
-            AgentType::Acp,
-            "conv-effort".into(),
-            "user-1".into(),
-            "/w".into(),
-            backend,
-            None,
-            &handshake_with_effort_catalog(),
-            Some("low".into()),
-            None,
-            None,
-        );
-
-        let options = task.get_config_options().await.unwrap().config_options;
-        let effort = options
-            .iter()
-            .find(|option| option.category.as_deref() == Some("thought_level"))
-            .expect("reasoning effort option");
-        assert_eq!(effort.current_value.as_deref(), Some("low"));
-    }
-
     // Cold-start resume: the backend's live capabilities() is still empty (initialize
     // round-trip not landed), but the persisted-handshake preload populates the picker
     // so it is NOT blank. This is the fix for "session-port history-open shows an empty
@@ -9942,6 +9903,7 @@ mod pump_tests {
             backend,
             None,
             &handshake_with_catalog(),
+            None,
             None,
             None,
         );
@@ -10004,6 +9966,7 @@ mod pump_tests {
             &stale,
             None,
             None,
+            None,
         );
         let m = task.get_model().await.unwrap().model_info.expect("model_info");
         assert_eq!(
@@ -10058,6 +10021,7 @@ mod pump_tests {
             backend,
             None,
             &handshake_with_catalog(),
+            None,
             None,
             None,
         );

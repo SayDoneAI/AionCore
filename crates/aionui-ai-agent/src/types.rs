@@ -106,6 +106,7 @@ pub const SAYDONE_MANAGED_PROTOCOL_ENV: &str = "SAYDONE_MANAGED_PROTOCOL";
 pub const SAYDONE_MANAGED_MODEL_ENV: &str = "SAYDONE_MANAGED_MODEL";
 pub const SAYDONE_MANAGED_BASE_URL_ENV: &str = "SAYDONE_MANAGED_BASE_URL";
 pub const SAYDONE_MANAGED_API_KEY_ENV: &str = "SAYDONE_MANAGED_API_KEY";
+pub const SAYDONE_MANAGED_REASONING_POLICY_ENV: &str = "SAYDONE_MANAGED_REASONING_POLICY";
 /// Pi resolves the API key from this dedicated environment variable. Keep it
 /// separate from the generic managed key so Pi's models.json can reference it
 /// without exposing the host runtime contract to other CLIs.
@@ -138,6 +139,7 @@ pub struct AionrsCompatOverrides {
     pub(crate) image_input: Option<ImageInputCapability>,
     pub max_tokens_field: Option<String>,
     pub api_path: Option<String>,
+    pub reasoning_effort_levels: Option<Vec<String>>,
 }
 
 /// Fully resolved Aionrs configuration passed to the agent manager.

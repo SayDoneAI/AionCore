@@ -506,7 +506,6 @@ mod tests {
         );
     }
 }
-
 /// WeChat / WeCom channels cannot edit messages in place. Their relay buffers
 /// the whole turn and sends one final answer.
 fn is_weixin_platform(platform: PluginType) -> bool {

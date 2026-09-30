@@ -29,6 +29,7 @@ use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{
     AionrsCompatOverrides, AionrsResolvedConfig, SAYDONE_MANAGED_API_KEY_ENV, SAYDONE_MANAGED_BACKEND_ENV,
     SAYDONE_MANAGED_BASE_URL_ENV, SAYDONE_MANAGED_MODEL_ENV, SAYDONE_MANAGED_PROTOCOL_ENV,
+    SAYDONE_MANAGED_REASONING_POLICY_ENV,
 };
 
 const SAYDONE_IMAGE_MCP_SERVER_NAME: &str = "saydone-image-generation";
@@ -139,6 +140,9 @@ pub(super) async fn build(
             model_overrides.openai_api_mode,
         )
     };
+    if managed_for_model.is_some() {
+        compat_overrides.reasoning_effort_levels = Some(managed_reasoning_effort_levels(&ctx.runtime_env)?);
+    }
     compat_overrides.image_input = model_overrides.image_input;
     let image_input_capability = compat_overrides
         .image_input
@@ -258,6 +262,25 @@ fn managed_runtime_from_env(env: &[(String, String)]) -> Option<ManagedRuntimeEn
         base_url: (*values.get(SAYDONE_MANAGED_BASE_URL_ENV)?).to_owned(),
         api_key: (*values.get(SAYDONE_MANAGED_API_KEY_ENV)?).to_owned(),
     })
+}
+
+fn managed_reasoning_effort_levels(env: &[(String, String)]) -> Result<Vec<String>, AgentError> {
+    let policy = env
+        .iter()
+        .find_map(|(key, value)| (key == SAYDONE_MANAGED_REASONING_POLICY_ENV).then_some(value))
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|policy| policy.get("efforts").and_then(Value::as_array).cloned())
+        .ok_or_else(|| AgentError::internal("SayDoneAI managed reasoning policy is missing or invalid"))?;
+    policy
+        .into_iter()
+        .map(|effort| {
+            effort
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| AgentError::internal("SayDoneAI managed reasoning policy is missing or invalid"))
+        })
+        .collect()
 }
 
 /// Resolve the session an aionrs build starts from.
@@ -2088,6 +2111,31 @@ mod tests {
 
         let result = resolve_mcp_servers(&overrides);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn managed_reasoning_policy_preserves_admin_levels() {
+        let env = vec![(
+            SAYDONE_MANAGED_REASONING_POLICY_ENV.to_owned(),
+            r#"{"efforts":["off","medium","max"],"default_effort":"max"}"#.to_owned(),
+        )];
+
+        assert_eq!(
+            managed_reasoning_effort_levels(&env).unwrap(),
+            vec!["off", "medium", "max"]
+        );
+    }
+
+    #[test]
+    fn managed_reasoning_policy_rejects_missing_or_malformed_levels() {
+        assert!(managed_reasoning_effort_levels(&[]).is_err());
+        assert!(
+            managed_reasoning_effort_levels(&[(
+                SAYDONE_MANAGED_REASONING_POLICY_ENV.to_owned(),
+                r#"{"efforts":["high",null]}"#.to_owned(),
+            )])
+            .is_err()
+        );
     }
 
     #[tokio::test]
