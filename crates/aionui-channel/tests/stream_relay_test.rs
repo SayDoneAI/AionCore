@@ -4,6 +4,7 @@ use aionui_ai_agent::AgentStreamEvent;
 use aionui_ai_agent::protocol::events::{
     ErrorEventData, FinishEventData, TextEventData, ToolCallEventData, ToolCallStatus,
 };
+use aionui_channel::constants::WEIXIN_MESSAGE_LIMIT;
 use aionui_channel::session::SessionManager;
 use aionui_channel::stream_relay::{ChannelStreamRelay, MessageRecorder, RelayConfig, throttle_ms_for_platform};
 use aionui_channel::types::PluginType;
@@ -91,6 +92,11 @@ async fn relay_sends_thinking_then_final_message() {
     let last = edits.last().unwrap();
     assert!(last.text.as_deref().unwrap().contains("Hello World"));
     assert!(last.buttons.is_some());
+    assert!(
+        edits
+            .iter()
+            .any(|message| { message.text.as_deref().is_some_and(|text| text.contains("正在生成")) })
+    );
 }
 
 #[tokio::test]
@@ -276,6 +282,54 @@ async fn weixin_sends_one_complete_answer_after_tool_call() {
         sends[0].text.as_deref(),
         Some("**你：** Test question\n\n**AI：** Here is the plan: Done.")
     );
+}
+
+#[tokio::test]
+async fn weixin_splits_long_answers_and_keeps_buttons_on_the_final_chunk() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+    let answer = "答".repeat(WEIXIN_MESSAGE_LIMIT);
+    let expected = format!("**你：** Test question\n\n**AI：** {answer}");
+
+    let relay = ChannelStreamRelay::new(
+        RelayConfig {
+            owner_user_id: "system_default_user".to_owned(),
+            session_id: "session_1".to_owned(),
+            conversation_id: "conversation_1".to_owned(),
+            platform: PluginType::Weixin,
+            plugin_id: "weixin".into(),
+            chat_id: "chat_1".into(),
+            prompt_text: "Test question".into(),
+            throttle_ms: 10_000,
+        },
+        recorder.clone(),
+    );
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData { content: answer }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    let sends = recorder.take_sends();
+    assert!(sends.len() > 1, "long WeChat replies must be split: {sends:?}");
+    assert!(sends.iter().all(|message| {
+        message
+            .text
+            .as_deref()
+            .is_some_and(|text| text.chars().count() <= WEIXIN_MESSAGE_LIMIT)
+    }));
+    let joined = sends
+        .iter()
+        .filter_map(|message| message.text.as_deref())
+        .collect::<String>();
+    assert_eq!(joined, expected);
+    assert!(sends[..sends.len() - 1].iter().all(|message| message.buttons.is_none()));
+    assert!(sends.last().is_some_and(|message| message.buttons.is_some()));
 }
 
 #[tokio::test]

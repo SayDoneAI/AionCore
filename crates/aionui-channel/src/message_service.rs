@@ -361,8 +361,8 @@ impl ChannelMessageService {
         }
     }
 
-    /// Builds an intermediate streaming message (for editMessage calls).
-    pub fn build_streaming_message(text: &str) -> UnifiedOutgoingMessage {
+    /// Builds a plain text message without streaming status or action buttons.
+    pub fn build_text_message(text: &str) -> UnifiedOutgoingMessage {
         UnifiedOutgoingMessage {
             message_type: OutgoingMessageType::Text,
             text: Some(text.to_owned()),
@@ -376,6 +376,13 @@ impl ChannelMessageService {
             reply_to_message_id: None,
             silent: None,
         }
+    }
+
+    /// Builds an intermediate streaming message (for editMessage calls).
+    pub fn build_streaming_message(text: &str) -> UnifiedOutgoingMessage {
+        let mut message = Self::build_text_message(text);
+        message.text = Some(format!("{text}\n\n⏳ 正在生成…"));
+        message
     }
 
     /// Returns the stream throttle interval for editMessage calls.
@@ -823,7 +830,7 @@ mod tests {
     fn streaming_message_is_plain_text() {
         let msg = ChannelMessageService::build_streaming_message("partial...");
         assert_eq!(msg.message_type, OutgoingMessageType::Text);
-        assert_eq!(msg.text.as_deref(), Some("partial..."));
+        assert_eq!(msg.text.as_deref(), Some("partial...\n\n⏳ 正在生成…"));
         assert!(msg.buttons.is_none());
     }
 

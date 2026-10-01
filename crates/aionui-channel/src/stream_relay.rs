@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
+use crate::constants::WEIXIN_MESSAGE_LIMIT;
 use crate::error::ChannelError;
 use crate::formatter::format_text_for_platform;
 use crate::message_service::{ChannelMessageService, StreamAction};
@@ -176,20 +177,8 @@ impl ChannelStreamRelay {
                             let reply =
                                 format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
                             let formatted = format_text_for_platform(&reply, self.config.platform);
-                            let final_msg = ChannelMessageService::build_final_message(&formatted);
-                            if let Ok(receipt) = self
-                                .sender
-                                .send_message(
-                                    &self.config.owner_user_id,
-                                    &self.config.plugin_id,
-                                    &self.config.chat_id,
-                                    final_msg,
-                                )
-                                .await
-                            {
-                                let preview = self.route_preview(&formatted);
-                                self.register_message_route(&receipt, Some(&preview)).await;
-                            }
+                            let preview = self.route_preview(&formatted);
+                            self.send_weixin_message(&formatted, true, Some(&preview)).await;
                         }
                         info!(
                             plugin_id = %self.config.plugin_id,
@@ -200,39 +189,11 @@ impl ChannelStreamRelay {
                         break;
                     }
                     Some(StreamAction::Error(msg)) => {
-                        let error_msg = UnifiedOutgoingMessage {
-                            message_type: OutgoingMessageType::Text,
-                            text: Some(format_text_for_platform(
-                                &format_remote_reply(
-                                    &self.config.prompt_text,
-                                    &format!("\u{274c} {msg}"),
-                                    self.config.platform,
-                                ),
-                                self.config.platform,
-                            )),
-                            parse_mode: None,
-                            buttons: None,
-                            keyboard: None,
-                            image_url: None,
-                            file_url: None,
-                            file_name: None,
-                            media_actions: None,
-                            reply_to_message_id: None,
-                            silent: None,
-                        };
-                        if let Ok(receipt) = self
-                            .sender
-                            .send_message(
-                                &self.config.owner_user_id,
-                                &self.config.plugin_id,
-                                &self.config.chat_id,
-                                error_msg,
-                            )
-                            .await
-                        {
-                            let preview = self.route_preview(&format!("\u{274c} {msg}"));
-                            self.register_message_route(&receipt, Some(&preview)).await;
-                        }
+                        let error_text = format!("\u{274c} {msg}");
+                        let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
+                        let formatted = format_text_for_platform(&reply, self.config.platform);
+                        let preview = self.route_preview(&error_text);
+                        self.send_weixin_message(&formatted, false, Some(&preview)).await;
                         break;
                     }
                     None => {}
@@ -241,20 +202,8 @@ impl ChannelStreamRelay {
                     if has_content && !text_buffer.trim().is_empty() {
                         let reply = format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
                         let formatted = format_text_for_platform(&reply, self.config.platform);
-                        let final_msg = ChannelMessageService::build_final_message(&formatted);
-                        if let Ok(receipt) = self
-                            .sender
-                            .send_message(
-                                &self.config.owner_user_id,
-                                &self.config.plugin_id,
-                                &self.config.chat_id,
-                                final_msg,
-                            )
-                            .await
-                        {
-                            let preview = self.route_preview(&formatted);
-                            self.register_message_route(&receipt, Some(&preview)).await;
-                        }
+                        let preview = self.route_preview(&formatted);
+                        self.send_weixin_message(&formatted, true, Some(&preview)).await;
                     }
                     break;
                 }
@@ -434,6 +383,42 @@ impl ChannelStreamRelay {
         }
     }
 
+    async fn send_weixin_message(&self, formatted: &str, with_buttons: bool, preview: Option<&str>) {
+        let chunks = split_text_for_limit(formatted, WEIXIN_MESSAGE_LIMIT);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let is_last = index + 1 == chunks.len();
+            let message = if with_buttons && is_last {
+                ChannelMessageService::build_final_message(chunk)
+            } else {
+                ChannelMessageService::build_text_message(chunk)
+            };
+            match self
+                .sender
+                .send_message(
+                    &self.config.owner_user_id,
+                    &self.config.plugin_id,
+                    &self.config.chat_id,
+                    message,
+                )
+                .await
+            {
+                Ok(receipt) => {
+                    self.register_message_route(&receipt, if is_last { preview } else { None })
+                        .await;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        chunk_index = index,
+                        chunk_count = chunks.len(),
+                        "failed to send WeChat reply chunk"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     async fn register_message_route(&self, receipt: &ChannelDeliveryReceipt, preview_text: Option<&str>) {
         let Some(session_manager) = &self.session_manager else {
             return;
@@ -484,28 +469,33 @@ pub(crate) fn format_remote_reply(prompt_text: &str, assistant_text: &str, platf
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::format_remote_reply;
-    use crate::types::PluginType;
-
-    #[test]
-    fn remote_reply_uses_markdown_bold_context_labels() {
-        assert_eq!(
-            format_remote_reply("原始问题", "回答内容", PluginType::Wecom),
-            "**你：** 原始问题\n\n**AI：** 回答内容"
-        );
+fn split_text_for_limit(text: &str, limit: usize) -> Vec<String> {
+    if text.is_empty() || limit == 0 {
+        return Vec::new();
     }
 
-    #[test]
-    fn remote_reply_omits_context_without_prompt_or_for_other_platforms() {
-        assert_eq!(format_remote_reply("   ", "回答内容", PluginType::Weixin), "回答内容");
-        assert_eq!(
-            format_remote_reply("原始问题", "回答内容", PluginType::Telegram),
-            "回答内容"
-        );
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while remaining.chars().count() > limit {
+        let boundary = remaining
+            .char_indices()
+            .nth(limit)
+            .map(|(index, _)| index)
+            .unwrap_or(remaining.len());
+        let split_at = remaining[..boundary]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .filter(|index| *index > 0)
+            .unwrap_or(boundary);
+        chunks.push(remaining[..split_at].to_owned());
+        remaining = &remaining[split_at..];
     }
+    if !remaining.is_empty() {
+        chunks.push(remaining.to_owned());
+    }
+    chunks
 }
+
 /// WeChat / WeCom channels cannot edit messages in place. Their relay buffers
 /// the whole turn and sends one final answer.
 fn is_weixin_platform(platform: PluginType) -> bool {
@@ -570,5 +560,28 @@ impl ChannelSender for MessageRecorder {
     ) -> Result<(), ChannelError> {
         self.edits.lock().unwrap().push(message);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_remote_reply;
+    use crate::types::PluginType;
+
+    #[test]
+    fn remote_reply_uses_markdown_bold_context_labels() {
+        assert_eq!(
+            format_remote_reply("原始问题", "回答内容", PluginType::Wecom),
+            "**你：** 原始问题\n\n**AI：** 回答内容"
+        );
+    }
+
+    #[test]
+    fn remote_reply_omits_context_without_prompt_or_for_other_platforms() {
+        assert_eq!(format_remote_reply("   ", "回答内容", PluginType::Weixin), "回答内容");
+        assert_eq!(
+            format_remote_reply("原始问题", "回答内容", PluginType::Telegram),
+            "回答内容"
+        );
     }
 }

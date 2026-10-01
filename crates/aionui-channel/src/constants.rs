@@ -93,6 +93,12 @@ pub const DINGTALK_TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
 // WeChat (iLink Bot)
 // ---------------------------------------------------------------------------
 
+/// Maximum characters per WeChat iLink text message.
+///
+/// Keep a conservative application-side limit so a long Markdown reply is
+/// delivered as ordered text messages instead of being rejected as one request.
+pub const WEIXIN_MESSAGE_LIMIT: usize = 4000;
+
 /// Response timeout for WeChat message processing.
 pub const WEIXIN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
@@ -196,6 +202,7 @@ mod tests {
 
     #[test]
     fn weixin_constants() {
+        assert_eq!(WEIXIN_MESSAGE_LIMIT, 4000);
         assert_eq!(WEIXIN_RESPONSE_TIMEOUT, Duration::from_secs(300));
         assert_eq!(WEIXIN_MAX_FILE_SIZE, 200 * 1024 * 1024);
         assert_eq!(WEIXIN_POLL_TIMEOUT, Duration::from_secs(35));
