@@ -4818,7 +4818,7 @@ async fn managed_runtime_switch_replaces_and_clears_model_capabilities() {
             .collect();
         assert_eq!(policy_values, reasoning_policy.into_iter().collect::<Vec<_>>());
         for (key, expected) in [
-            ("SAYDONE_MANAGED_CONTEXT_WINDOW", context_window.map(|v| v.to_string())),
+            ("SAYDONE_MANAGED_CONTEXT_WINDOW", None),
             (
                 "SAYDONE_MANAGED_MAX_OUTPUT_TOKENS",
                 max_output_tokens.map(|v| v.to_string()),
@@ -4841,6 +4841,118 @@ async fn managed_runtime_switch_replaces_and_clears_model_capabilities() {
         }
     }
     assert_eq!(task_manager.build_count(), 5);
+}
+
+#[tokio::test]
+async fn managed_codex_runtime_leaves_context_window_to_codex() {
+    let workspace = tempfile::tempdir().unwrap();
+    let task_manager = Arc::new(RebuildingScriptedTaskManager::new(
+        (0..1)
+            .map(|_| {
+                let mut agent = MockAgent::new("managed-codex-test");
+                agent.workspace_override = Some(workspace.path().to_string_lossy().into_owned());
+                AgentInstance::Mock(Arc::new(agent))
+            })
+            .collect(),
+    ));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_manager_dyn.clone(),
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::with_session_id("sess-previous")),
+    );
+    let conversation = service
+        .create("user_1", make_create_req_with_backend("codex"))
+        .await
+        .unwrap();
+
+    service
+        .switch_managed_runtime(
+            "user_1",
+            &conversation.id,
+            serde_json::from_value(json!({
+                "model": "managed-model", "backend": "codex", "protocol": "openai",
+                "base_url": "https://example.test", "api_key": "test-key",
+                "supports_vision": false, "context_window": 1048576,
+                "max_output_tokens": 131072, "default_output_tokens": 8192,
+                "reasoning_policy": {"efforts": []},
+            }))
+            .unwrap(),
+            &task_manager_dyn,
+        )
+        .await
+        .unwrap();
+
+    let options = task_manager.captured_options();
+    let env = &options.last().unwrap().context.runtime_env;
+    assert!(
+        env.iter().all(|(key, _)| key != "SAYDONE_MANAGED_CONTEXT_WINDOW"),
+        "Codex must receive no external context-window override"
+    );
+    assert!(
+        env.iter()
+            .any(|(key, value)| { key == "SAYDONE_MANAGED_MAX_OUTPUT_TOKENS" && value == "131072" })
+    );
+    assert!(
+        env.iter()
+            .any(|(key, value)| { key == "SAYDONE_MANAGED_DEFAULT_OUTPUT_TOKENS" && value == "8192" })
+    );
+}
+
+#[tokio::test]
+async fn managed_pi_runtime_receives_context_window_for_provider_registration() {
+    let workspace = tempfile::tempdir().unwrap();
+    let task_manager = Arc::new(RebuildingScriptedTaskManager::new(
+        (0..1)
+            .map(|_| {
+                let mut agent = MockAgent::new("managed-pi-test");
+                agent.workspace_override = Some(workspace.path().to_string_lossy().into_owned());
+                AgentInstance::Mock(Arc::new(agent))
+            })
+            .collect(),
+    ));
+    let task_manager_dyn: Arc<dyn IWorkerTaskManager> = task_manager.clone();
+    let service = ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(MockBroadcaster::new()),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_manager_dyn.clone(),
+        Arc::new(MockRepo::new()),
+        Arc::new(StubAgentMetadataRepo),
+        Arc::new(StubAcpSessionRepo::with_session_id("sess-previous")),
+    );
+    let conversation = service
+        .create("user_1", make_create_req_with_backend("pi"))
+        .await
+        .unwrap();
+
+    service
+        .switch_managed_runtime(
+            "user_1",
+            &conversation.id,
+            serde_json::from_value(json!({
+                "model": "managed-model", "backend": "pi", "protocol": "openai",
+                "base_url": "https://example.test", "api_key": "test-key",
+                "supports_vision": false, "context_window": 1048576,
+                "max_output_tokens": 131072, "default_output_tokens": 8192,
+                "reasoning_policy": {"efforts": []},
+            }))
+            .unwrap(),
+            &task_manager_dyn,
+        )
+        .await
+        .unwrap();
+
+    let options = task_manager.captured_options();
+    let env = &options.last().unwrap().context.runtime_env;
+    assert!(
+        env.iter()
+            .any(|(key, value)| { key == "SAYDONE_MANAGED_CONTEXT_WINDOW" && value == "1048576" })
+    );
 }
 
 #[tokio::test]

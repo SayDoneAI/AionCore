@@ -11,7 +11,9 @@ use crate::action::{ActionExecutor, MessageResult};
 use crate::formatter::format_text_for_platform;
 use crate::message_service::ChannelMessageService;
 use crate::session::SessionManager;
-use crate::stream_relay::{ChannelSender, ChannelStreamRelay, RelayConfig, throttle_ms_for_platform};
+use crate::stream_relay::{
+    ChannelSender, ChannelStreamRelay, RelayConfig, format_remote_reply, throttle_ms_for_platform,
+};
 use crate::types::{ActionBehavior, OutgoingMessageType, UnifiedIncomingMessage, UnifiedOutgoingMessage};
 
 /// Orchestrates the full channel message lifecycle.
@@ -474,8 +476,7 @@ impl ChannelMirrorService {
 
     async fn handle_event(&self, event: WebSocketMessage<serde_json::Value>) {
         let conversation_id = event.data.get("conversation_id").and_then(serde_json::Value::as_str);
-        let owner_user_id = event.data.get("user_id").and_then(serde_json::Value::as_str);
-        let (Some(conversation_id), Some(owner_user_id)) = (conversation_id, owner_user_id) else {
+        let Some(conversation_id) = conversation_id else {
             return;
         };
 
@@ -483,6 +484,20 @@ impl ChannelMirrorService {
             if event.data.get("hidden").and_then(serde_json::Value::as_bool) == Some(true) {
                 return;
             }
+            // Desktop-created conversations do not always include `user_id` in
+            // realtime payloads. Resolve ownership only when a new mirror turn
+            // is created; stream chunks must not issue one query per token.
+            let owner_user_id = match event.data.get("user_id").and_then(serde_json::Value::as_str) {
+                Some(owner_user_id) if !owner_user_id.is_empty() => owner_user_id.to_owned(),
+                _ => match self.conversation_repo.owner_user_id(conversation_id).await {
+                    Ok(Some(owner_user_id)) => owner_user_id,
+                    Ok(None) => return,
+                    Err(error) => {
+                        warn!(conversation_id = %conversation_id, error = %error, "failed to resolve conversation owner for mirror");
+                        return;
+                    }
+                },
+            };
             let text = event
                 .data
                 .get("content")
@@ -566,11 +581,6 @@ impl ChannelMirrorService {
             return;
         }
 
-        let mirror_text = if state.latest_user_text.is_empty() {
-            answer
-        } else {
-            format!("你：{}\n\nAI：{}", state.latest_user_text, answer)
-        };
         let plugins = match self.channel_repo.get_all_plugins(&state.owner_user_id).await {
             Ok(plugins) => plugins,
             Err(error) => {
@@ -611,6 +621,7 @@ impl ChannelMirrorService {
             if !delivered.insert((plugin_id.clone(), user.platform_user_id.clone())) {
                 continue;
             }
+            let mirror_text = format_remote_reply(&state.latest_user_text, &answer, platform);
             let outgoing = UnifiedOutgoingMessage {
                 message_type: OutgoingMessageType::Text,
                 text: Some(mirror_text.clone()),
@@ -828,6 +839,10 @@ mod tests {
         )
     }
 
+    fn desktop_event_without_owner(name: &str, data: serde_json::Value) -> WebSocketMessage<serde_json::Value> {
+        WebSocketMessage::new(name, data)
+    }
+
     fn stream_event(kind: &str, content: Option<&str>) -> WebSocketMessage<serde_json::Value> {
         WebSocketMessage::new(
             "message.stream",
@@ -862,7 +877,11 @@ mod tests {
 
         let sends = sender.sends.lock().unwrap().clone();
         assert_eq!(sends.len(), 2);
-        assert!(sends.iter().all(|(_, _, text)| text == "你：Question\n\nAI：Answer"));
+        assert!(
+            sends
+                .iter()
+                .all(|(_, _, text)| text == "**你：** Question\n\n**AI：** Answer")
+        );
         assert_eq!(
             repo.resolve_conversation_route("system_default_user", "lark", "lark-user", "lark-lark-user",)
                 .await
@@ -877,6 +896,40 @@ mod tests {
                 .as_deref(),
             Some("desktop-conversation")
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_completion_without_realtime_owner_is_mirrored_using_conversation_owner() {
+        let (service, sender, _repo, _db) = setup_mirror().await;
+
+        service
+            .handle_event(desktop_event_without_owner(
+                "message.userCreated",
+                serde_json::json!({
+                    "conversation_id": "desktop-conversation",
+                    "content": "Question",
+                    "hidden": false,
+                }),
+            ))
+            .await;
+        service
+            .handle_event(desktop_event_without_owner(
+                "message.stream",
+                serde_json::json!({
+                    "conversation_id": "desktop-conversation",
+                    "type": "text",
+                    "data": { "content": "Answer" },
+                }),
+            ))
+            .await;
+        service
+            .handle_event(desktop_event_without_owner(
+                "turn.completed",
+                serde_json::json!({ "conversation_id": "desktop-conversation" }),
+            ))
+            .await;
+
+        assert_eq!(sender.sends.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -931,7 +984,7 @@ mod tests {
         assert!(
             sends
                 .iter()
-                .all(|(_, _, text)| text == "你：Question\n\nAI：Final answer")
+                .all(|(_, _, text)| text == "**你：** Question\n\n**AI：** Final answer")
         );
     }
 }

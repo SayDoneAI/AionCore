@@ -686,13 +686,15 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
 /// `ThreadResumeParams` (schema-full 0.137.0; developerInstructions verified:
 /// samples/codex-cli/0.146.0/schema/codex_app_server_protocol.v2.schemas.json)
 /// accepts the same field names as thread/start
-/// (`approvalPolicy`/`sandbox`/`cwd`/`config`/`developerInstructions`);
+/// (`approvalPolicy`/`sandbox`/`cwd`/`config`/`developerInstructions`). History is
+/// paginated separately, so resume explicitly opts out of full-history hydration.
 /// sandbox/instructions had no direct oracle in the probe — re-sending the
 /// start-time values is at worst a no-op, while dropping them is a confirmed loss
 /// on the probed axes.
 fn thread_resume_params(config: &SessionConfig, thread_id: &str) -> HandshakeParams {
     let HandshakeParams(mut params) = thread_start_params(config);
     params["threadId"] = json!(thread_id);
+    params["excludeTurns"] = json!(true);
     HandshakeParams(params)
 }
 
@@ -701,10 +703,11 @@ fn thread_resume_params(config: &SessionConfig, thread_id: &str) -> HandshakePar
 /// plus the PARENT threadId as the fork source and an optional `lastTurnId` —
 /// copy history only through that turn (inclusive) and drop later turns
 /// (app-server ThreadForkParams, exported from codex 0.145.0). Omitting
-/// `lastTurnId` forks at HEAD.
+/// `lastTurnId` forks at HEAD. The fork response uses paginated history as well.
 fn thread_fork_params(config: &SessionConfig, parent_thread_id: &str, last_turn_id: Option<&str>) -> HandshakeParams {
     let HandshakeParams(mut params) = thread_start_params(config);
     params["threadId"] = json!(parent_thread_id);
+    params["excludeTurns"] = json!(true);
     if let Some(turn_id) = last_turn_id {
         params["lastTurnId"] = json!(turn_id);
     }
@@ -8333,9 +8336,11 @@ mod tests {
         // resume and fork reuse the start surface and must inherit the channel.
         let resume = thread_resume_params(&config, "th-1").into_frame(2, "thread/resume");
         assert_eq!(resume["params"]["developerInstructions"], "Assistant rules");
+        assert_eq!(resume["params"]["excludeTurns"], true);
         assert!(resume["params"].get("baseInstructions").is_none());
         let fork = thread_fork_params(&config, "th-1", None).into_frame(3, "thread/fork");
         assert_eq!(fork["params"]["developerInstructions"], "Assistant rules");
+        assert_eq!(fork["params"]["excludeTurns"], true);
         assert!(fork["params"].get("baseInstructions").is_none());
         // No preset → neither key (byte-identical bare handshake).
         let bare = thread_start_params(&SessionConfig::default()).into_frame(4, "thread/start");
@@ -8373,6 +8378,7 @@ mod tests {
         let frame = thread_resume_params(&config, "th-1").into_frame(2, "thread/resume");
         assert_eq!(frame["method"], "thread/resume");
         assert_eq!(frame["params"]["threadId"], "th-1");
+        assert_eq!(frame["params"]["excludeTurns"], true);
         assert_eq!(frame["params"]["cwd"], "/work");
         assert_eq!(frame["params"]["approvalPolicy"], "never");
         assert_eq!(frame["params"]["sandbox"], "danger-full-access");
@@ -8385,6 +8391,7 @@ mod tests {
         // instructions keys (mirrors the bare thread/start shape).
         let bare = thread_resume_params(&SessionConfig::default(), "th-2").into_frame(3, "thread/resume");
         assert_eq!(bare["params"]["threadId"], "th-2");
+        assert_eq!(bare["params"]["excludeTurns"], true);
         assert!(bare["params"].get("config").is_none());
         assert!(bare["params"].get("developerInstructions").is_none());
         assert!(bare["params"].get("baseInstructions").is_none());

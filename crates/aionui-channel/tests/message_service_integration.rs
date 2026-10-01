@@ -605,8 +605,8 @@ async fn send_to_agent_without_saved_binding_defaults_to_bundled_pi_runtime() {
     // to the generated-assistant availability path.
     assert!(snapshot.is_none());
     assert_eq!(conversation.r#type, AgentType::Acp.serde_name());
-    assert!(conversation.name.ends_with("|其他|Pi"));
-    assert!(!conversation.name.contains("tg-acp-pi"));
+    assert!(conversation.name.ends_with("|其他|Telegram"));
+    assert!(!conversation.name.contains("Pi"));
 }
 
 #[tokio::test]
@@ -676,8 +676,8 @@ async fn send_to_agent_without_assistant_name_uses_dated_channel_name() {
         .unwrap()
         .unwrap();
     assert!(
-        conversation.name.ends_with("|其他|Codex"),
-        "channel conversation should not expose the transport id: {}",
+        conversation.name.ends_with("|其他|Telegram"),
+        "channel conversation should not expose the runtime backend: {}",
         conversation.name
     );
     assert!(
@@ -687,5 +687,5 @@ async fn send_to_agent_without_assistant_name_uses_dated_channel_name() {
             .next()
             .is_some_and(|date| date.len() == 4 && date.chars().all(|ch| ch.is_ascii_digit()))
     );
-    assert!(!conversation.name.contains("tg-acp-codex"));
+    assert!(!conversation.name.contains("codex"));
 }

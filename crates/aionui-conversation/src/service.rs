@@ -5753,10 +5753,6 @@ impl ConversationService {
             (SAYDONE_MANAGED_API_KEY_ENV.to_owned(), runtime.api_key.clone()),
             (SAYDONE_PI_API_KEY_ENV.to_owned(), runtime.api_key.clone()),
             (
-                "SAYDONE_MANAGED_CONTEXT_WINDOW".to_owned(),
-                runtime.context_window.to_string(),
-            ),
-            (
                 "SAYDONE_MANAGED_MAX_OUTPUT_TOKENS".to_owned(),
                 runtime.max_output_tokens.to_string(),
             ),
@@ -5765,6 +5761,15 @@ impl ConversationService {
                 runtime.default_output_tokens.to_string(),
             ),
         ];
+        // Pi needs the backend-declared window for its custom provider. Direct
+        // CLI backends own context accounting and must not receive an external
+        // override.
+        if runtime.backend == "pi" {
+            env.push((
+                "SAYDONE_MANAGED_CONTEXT_WINDOW".to_owned(),
+                runtime.context_window.to_string(),
+            ));
+        }
         if let Some(supports_vision) = runtime.supports_vision {
             env.push((
                 "SAYDONE_MANAGED_SUPPORTS_VISION".to_owned(),

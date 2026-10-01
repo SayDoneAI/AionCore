@@ -474,7 +474,7 @@ impl ChannelStreamRelay {
 /// Include the original prompt in remote replies where users cannot reliably
 /// associate an answer with the originating message from the conversation list.
 /// Other platforms keep their existing answer-only message shape.
-fn format_remote_reply(prompt_text: &str, assistant_text: &str, platform: PluginType) -> String {
+pub(crate) fn format_remote_reply(prompt_text: &str, assistant_text: &str, platform: PluginType) -> String {
     let prompt = prompt_text.trim();
     let answer = assistant_text.trim();
     if matches!(platform, PluginType::Weixin | PluginType::Wecom | PluginType::Lark) && !prompt.is_empty() {

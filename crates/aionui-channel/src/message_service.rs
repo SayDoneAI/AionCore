@@ -470,24 +470,28 @@ fn parse_agent_type(s: &str) -> Result<AgentType, ChannelError> {
 }
 
 fn channel_conversation_name(
-    _platform: PluginType,
-    agent_type: &str,
-    backend: Option<&str>,
+    platform: PluginType,
+    _agent_type: &str,
+    _backend: Option<&str>,
     _chat_id: Option<&str>,
 ) -> String {
-    let runtime_name = if agent_type == "acp" {
-        backend.filter(|name| !name.is_empty()).unwrap_or(agent_type)
-    } else if agent_type.is_empty() {
-        "Agent"
-    } else {
-        agent_type
-    };
     let date = chrono::Local::now().format("%m%d").to_string();
-    let mut display_name = runtime_name.to_owned();
-    if let Some(first) = display_name.get_mut(0..1) {
-        first.make_ascii_uppercase();
+    format_channel_assistant_name(channel_display_name(platform), date)
+}
+
+/// Runtime backends are implementation details and must not become the visible
+/// name of a channel conversation. The client replaces this dated placeholder
+/// with a content-derived title once the first turn is available.
+fn channel_display_name(platform: PluginType) -> &'static str {
+    match platform {
+        PluginType::Telegram => "Telegram",
+        PluginType::Lark => "Lark",
+        PluginType::Dingtalk => "DingTalk",
+        PluginType::Weixin => "WeChat",
+        PluginType::Wecom => "WeCom",
+        PluginType::Slack => "Slack",
+        PluginType::Discord => "Discord",
     }
-    format_channel_assistant_name(&display_name, date)
 }
 
 /// Channel assistant settings are also used as the initial conversation name.
@@ -908,7 +912,8 @@ mod tests {
     #[test]
     fn conv_name_telegram_acp_with_backend() {
         let name = channel_conversation_name(PluginType::Telegram, "acp", Some("claude"), Some("70880480"));
-        assert!(name.ends_with("|其他|Claude"));
+        assert!(name.ends_with("|其他|Telegram"));
+        assert!(!name.contains("Claude"));
         assert!(
             name.split('|')
                 .next()
@@ -919,33 +924,33 @@ mod tests {
     #[test]
     fn conv_name_telegram_aionrs() {
         let name = channel_conversation_name(PluginType::Telegram, "aionrs", None, Some("70880480"));
-        assert!(name.ends_with("|其他|Aionrs"));
+        assert!(name.ends_with("|其他|Telegram"));
     }
 
     #[test]
     fn conv_name_lark_acp_no_backend() {
         let name = channel_conversation_name(PluginType::Lark, "acp", None, Some("abcdef12"));
-        assert!(name.ends_with("|其他|Acp"));
+        assert!(name.ends_with("|其他|Lark"));
     }
 
     #[test]
     fn conv_name_dingtalk_truncates_long_chat_id() {
         let name = channel_conversation_name(PluginType::Dingtalk, "acp", Some("vertex"), Some("123456789abcdef"));
-        assert!(name.ends_with("|其他|Vertex"));
+        assert!(name.ends_with("|其他|DingTalk"));
         assert!(!name.contains("12345678"));
     }
 
     #[test]
     fn conv_name_weixin_no_chat_id() {
         let name = channel_conversation_name(PluginType::Weixin, "acp", Some("gemini"), None);
-        assert!(name.ends_with("|其他|Gemini"));
-        assert!(!name.contains("wx-acp"));
+        assert!(name.ends_with("|其他|WeChat"));
+        assert!(!name.contains("gemini"));
     }
 
     #[test]
     fn conv_name_non_acp_ignores_backend() {
         let name = channel_conversation_name(PluginType::Telegram, "aionrs", Some("claude"), Some("70880480"));
-        assert!(name.ends_with("|其他|Aionrs"));
+        assert!(name.ends_with("|其他|Telegram"));
         assert!(!name.contains("claude"));
     }
 
