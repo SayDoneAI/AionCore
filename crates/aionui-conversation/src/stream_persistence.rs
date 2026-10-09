@@ -12,6 +12,7 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tracing::{debug, error, warn};
 
+use crate::response_middleware::strip_think_tags_by_segment;
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::service::ConversationService;
@@ -48,6 +49,7 @@ pub(crate) struct TextSegmentState {
 #[derive(Debug, Clone)]
 pub(crate) struct PersistedTextSegment {
     pub id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -215,7 +217,8 @@ impl StreamPersistenceAdapter {
             return None;
         }
 
-        let content = json!({ "content": segment.buffer }).to_string();
+        let segment_text = segment.buffer.clone();
+        let content = json!({ "content": &segment_text }).to_string();
         if segment.record_created {
             let update = MessageRowUpdate {
                 content: Some(content),
@@ -249,7 +252,10 @@ impl StreamPersistenceAdapter {
             }
         }
 
-        Some(PersistedTextSegment { id: segment.id })
+        Some(PersistedTextSegment {
+            id: segment.id,
+            text: segment_text,
+        })
     }
 
     #[tracing::instrument(skip_all)]
@@ -268,43 +274,63 @@ impl StreamPersistenceAdapter {
         let mut overrides = Vec::new();
         if let Some(primary_segment) = text_segments.first() {
             if rewrite_segments {
-                let content = json!({ "content": final_text }).to_string();
-                let update = MessageRowUpdate {
-                    content: Some(content),
-                    status: Some(Some(status.to_owned())),
-                    hidden: Some(hidden),
-                };
-                if let Err(e) = self
-                    .repo
-                    .update_message(&self.user_id, &self.conversation_id, &primary_segment.id, &update)
-                    .await
-                {
-                    log_persist_error(&e, "Failed to rewrite finalized text segment");
-                }
-                overrides.push(FinalTextOverride {
-                    msg_id: primary_segment.id.clone(),
-                    text: final_text.to_owned(),
-                    hidden,
-                });
-
-                for segment in text_segments.iter().skip(1) {
-                    let hide_update = MessageRowUpdate {
-                        content: None,
+                if text_segments.len() == 1 {
+                    let content = json!({ "content": final_text }).to_string();
+                    let update = MessageRowUpdate {
+                        content: Some(content),
                         status: Some(Some(status.to_owned())),
-                        hidden: Some(true),
+                        hidden: Some(hidden),
                     };
                     if let Err(e) = self
                         .repo
-                        .update_message(&self.user_id, &self.conversation_id, &segment.id, &hide_update)
+                        .update_message(&self.user_id, &self.conversation_id, &primary_segment.id, &update)
                         .await
                     {
-                        log_persist_error(&e, "Failed to hide superseded text segment");
+                        log_persist_error(&e, "Failed to rewrite finalized text segment");
                     }
                     overrides.push(FinalTextOverride {
-                        msg_id: segment.id.clone(),
-                        text: String::new(),
-                        hidden: true,
+                        msg_id: primary_segment.id.clone(),
+                        text: final_text.to_owned(),
+                        hidden,
                     });
+                } else if let Some(segment_texts) = rewritten_segment_texts(text_segments, final_text) {
+                    for (segment, text) in text_segments.iter().zip(segment_texts) {
+                        let hidden = text.trim().is_empty();
+                        let update = MessageRowUpdate {
+                            content: Some(json!({ "content": &text }).to_string()),
+                            status: Some(Some(status.to_owned())),
+                            hidden: Some(hidden),
+                        };
+                        if let Err(e) = self
+                            .repo
+                            .update_message(&self.user_id, &self.conversation_id, &segment.id, &update)
+                            .await
+                        {
+                            log_persist_error(&e, "Failed to rewrite finalized text segment");
+                        }
+                        overrides.push(FinalTextOverride {
+                            msg_id: segment.id.clone(),
+                            text,
+                            hidden,
+                        });
+                    }
+                } else {
+                    // Do not collapse multiple streamed paragraphs into the first
+                    // row when a middleware rewrite cannot be mapped to segments.
+                    for segment in text_segments {
+                        let status_update = MessageRowUpdate {
+                            content: None,
+                            status: Some(Some(status.to_owned())),
+                            hidden: Some(false),
+                        };
+                        if let Err(e) = self
+                            .repo
+                            .update_message(&self.user_id, &self.conversation_id, &segment.id, &status_update)
+                            .await
+                        {
+                            log_persist_error(&e, "Failed to finalize text segment status");
+                        }
+                    }
                 }
             } else {
                 for segment in text_segments {
@@ -664,4 +690,10 @@ impl StreamPersistenceAdapter {
             }
         }
     }
+}
+
+fn rewritten_segment_texts(segments: &[PersistedTextSegment], final_text: &str) -> Option<Vec<String>> {
+    let segment_refs: Vec<&str> = segments.iter().map(|segment| segment.text.as_str()).collect();
+    let texts = strip_think_tags_by_segment(&segment_refs);
+    (texts.concat().trim() == final_text).then_some(texts)
 }

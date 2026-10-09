@@ -7,12 +7,12 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
-use crate::constants::WEIXIN_MESSAGE_LIMIT;
+use crate::constants::{LARK_MESSAGE_LIMIT, WEIXIN_MESSAGE_LIMIT};
 use crate::error::ChannelError;
 use crate::formatter::format_text_for_platform;
 use crate::message_service::{ChannelMessageService, StreamAction};
 use crate::session::SessionManager;
-use crate::types::{OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
+use crate::types::{PluginType, UnifiedOutgoingMessage};
 
 /// Configuration for a stream relay session.
 #[derive(Debug, Clone)]
@@ -25,6 +25,12 @@ pub struct RelayConfig {
     pub chat_id: String,
     pub prompt_text: String,
     pub throttle_ms: u64,
+}
+
+enum ContinuationOutcome {
+    Event(Box<AgentStreamEvent>),
+    Complete,
+    Interrupted,
 }
 
 /// Per-platform minimum interval between streaming `edit_message` calls.
@@ -111,27 +117,28 @@ impl ChannelStreamRelay {
         self
     }
 
-    async fn next_continuation_event(&self, rx: &mut AgentStreamReceiver) -> Option<AgentStreamEvent> {
-        let runtime_state = self.runtime_state.as_ref()?;
-        loop {
-            match rx.try_recv() {
-                Ok(event) => return Some(event),
-                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    warn!(skipped, "channel stream relay lagged while awaiting continuation");
-                    return None;
-                }
-                Err(broadcast::error::TryRecvError::Closed) => return None,
-                Err(broadcast::error::TryRecvError::Empty) => {}
+    async fn next_continuation_event(&self, rx: &mut AgentStreamReceiver) -> ContinuationOutcome {
+        let Some(runtime_state) = self.runtime_state.as_ref() else {
+            return ContinuationOutcome::Complete;
+        };
+        match rx.try_recv() {
+            Ok(event) => ContinuationOutcome::Event(Box::new(event)),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                warn!(skipped, "channel stream relay lagged while awaiting continuation");
+                ContinuationOutcome::Interrupted
             }
-            tokio::select! {
-                _ = runtime_state.wait_until_unclaimed(&self.config.conversation_id) => return None,
-                event = rx.recv() => match event {
-                    Ok(event) => return Some(event),
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "channel stream relay lagged while awaiting continuation");
-                        return None;
+            Err(broadcast::error::TryRecvError::Closed) => ContinuationOutcome::Interrupted,
+            Err(broadcast::error::TryRecvError::Empty) => {
+                tokio::select! {
+                    _ = runtime_state.wait_until_unclaimed(&self.config.conversation_id) => ContinuationOutcome::Complete,
+                    event = rx.recv() => match event {
+                        Ok(event) => ContinuationOutcome::Event(Box::new(event)),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(skipped, "channel stream relay lagged while awaiting continuation");
+                            ContinuationOutcome::Interrupted
+                        }
+                        Err(broadcast::error::RecvError::Closed) => ContinuationOutcome::Interrupted,
                     }
-                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
             }
         }
@@ -143,16 +150,16 @@ impl ChannelStreamRelay {
         R: Into<AgentStreamReceiver>,
     {
         let rx = rx.into();
-        if is_weixin_platform(self.config.platform) {
-            self.run_weixin(rx).await;
+        if is_buffered_platform(self.config.platform) {
+            self.run_buffered(rx).await;
         } else {
             self.run_editable(rx).await;
         }
     }
 
-    /// WeChat-specific relay: accumulate text because the platform does not
-    /// support editing messages in place, marking intermediate replies.
-    async fn run_weixin(self, mut rx: AgentStreamReceiver) {
+    /// Buffered relay for channels where intermediate messages should not be
+    /// exposed as separate user-facing messages.
+    async fn run_buffered(self, mut rx: AgentStreamReceiver) {
         let mut text_buffer = String::new();
         let mut has_content = false;
         let mut pending_event = None;
@@ -171,46 +178,67 @@ impl ChannelStreamRelay {
                     Some(StreamAction::Thinking(_)) => {}
                     Some(StreamAction::ToolCall { .. }) => {}
                     Some(StreamAction::Finish) => {
-                        if let Some(event) = self.next_continuation_event(&mut rx).await {
-                            pending_event = Some(event);
-                            continue;
+                        match self.next_continuation_event(&mut rx).await {
+                            ContinuationOutcome::Event(event) => {
+                                pending_event = Some(*event);
+                                continue;
+                            }
+                            ContinuationOutcome::Interrupted => {
+                                let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
+                                let reply =
+                                    format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
+                                let formatted = format_text_for_platform(&reply, self.config.platform);
+                                let preview = self.route_preview(&error_text);
+                                self.send_buffered_message(&formatted, false, Some(&preview)).await;
+                                break;
+                            }
+                            ContinuationOutcome::Complete => {}
                         }
                         if has_content && !text_buffer.trim().is_empty() {
                             let reply =
                                 format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
                             let formatted = format_text_for_platform(&reply, self.config.platform);
-                            let preview = self.route_preview(&formatted);
-                            self.send_weixin_message(&formatted, true, Some(&preview)).await;
+                            let preview = self.route_preview(&text_buffer);
+                            self.send_buffered_message(&formatted, true, Some(&preview)).await;
                         }
                         info!(
                             plugin_id = %self.config.plugin_id,
                             chat_id = %self.config.chat_id,
                             text_len = text_buffer.len(),
-                            "channel stream relay finished (weixin)"
+                            platform = %self.config.platform,
+                            "channel stream relay finished (buffered)"
                         );
                         break;
                     }
                     Some(StreamAction::Error(msg)) => {
-                        let error_text = format!("\u{274c} {msg}");
+                        let error_text = stream_error_text(&text_buffer, &msg);
                         let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
                         let formatted = format_text_for_platform(&reply, self.config.platform);
                         let preview = self.route_preview(&error_text);
-                        self.send_weixin_message(&formatted, false, Some(&preview)).await;
+                        self.send_buffered_message(&formatted, false, Some(&preview)).await;
                         break;
                     }
                     None => {}
                 },
                 Err(broadcast::error::RecvError::Closed) => {
-                    if has_content && !text_buffer.trim().is_empty() {
-                        let reply = format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
-                        let formatted = format_text_for_platform(&reply, self.config.platform);
-                        let preview = self.route_preview(&formatted);
-                        self.send_weixin_message(&formatted, true, Some(&preview)).await;
-                    }
+                    let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
+                    let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
+                    let formatted = format_text_for_platform(&reply, self.config.platform);
+                    let preview = self.route_preview(&error_text);
+                    self.send_buffered_message(&formatted, false, Some(&preview)).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(lagged = n, "channel stream relay lagged (weixin)");
+                    warn!(
+                        lagged = n,
+                        platform = %self.config.platform,
+                        "channel stream relay lagged (buffered)"
+                    );
+                    let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
+                    let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
+                    let formatted = format_text_for_platform(&reply, self.config.platform);
+                    let preview = self.route_preview(&error_text);
+                    self.send_buffered_message(&formatted, false, Some(&preview)).await;
                     break;
                 }
             }
@@ -219,11 +247,12 @@ impl ChannelStreamRelay {
         debug!(
             plugin_id = %self.config.plugin_id,
             chat_id = %self.config.chat_id,
-            "channel stream relay exited (weixin)"
+            platform = %self.config.platform,
+            "channel stream relay exited (buffered)"
         );
     }
 
-    /// Standard relay for platforms that support edit (Telegram, Lark, DingTalk).
+    /// Standard relay for platforms that support edit (Telegram, DingTalk).
     async fn run_editable(self, mut rx: AgentStreamReceiver) {
         let throttle = Duration::from_millis(self.config.throttle_ms);
 
@@ -295,14 +324,23 @@ impl ChannelStreamRelay {
                             .await;
                     }
                     Some(StreamAction::Finish) => {
-                        if let Some(event) = self.next_continuation_event(&mut rx).await {
-                            pending_event = Some(event);
-                            continue;
+                        match self.next_continuation_event(&mut rx).await {
+                            ContinuationOutcome::Event(event) => {
+                                pending_event = Some(*event);
+                                continue;
+                            }
+                            ContinuationOutcome::Interrupted => {
+                                let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
+                                self.send_error_edit(&error_text, &thinking_msg_id).await;
+                                let preview = self.route_preview(&error_text);
+                                self.register_message_route(&thinking_receipt, Some(&preview)).await;
+                                break;
+                            }
+                            ContinuationOutcome::Complete => {}
                         }
                         self.send_final_edit(&text_buffer, has_content, &thinking_msg_id).await;
                         if has_content {
-                            let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                            let preview = self.route_preview(&formatted);
+                            let preview = self.route_preview(&text_buffer);
                             self.register_message_route(&thinking_receipt, Some(&preview)).await;
                         }
                         info!(
@@ -314,37 +352,9 @@ impl ChannelStreamRelay {
                         break;
                     }
                     Some(StreamAction::Error(msg)) => {
-                        let error_msg = UnifiedOutgoingMessage {
-                            message_type: OutgoingMessageType::Text,
-                            text: Some(format_text_for_platform(
-                                &format_remote_reply(
-                                    &self.config.prompt_text,
-                                    &format!("\u{274c} {msg}"),
-                                    self.config.platform,
-                                ),
-                                self.config.platform,
-                            )),
-                            parse_mode: None,
-                            buttons: None,
-                            keyboard: None,
-                            image_url: None,
-                            file_url: None,
-                            file_name: None,
-                            media_actions: None,
-                            reply_to_message_id: None,
-                            silent: None,
-                        };
-                        let _ = self
-                            .sender
-                            .edit_message(
-                                &self.config.owner_user_id,
-                                &self.config.plugin_id,
-                                &self.config.chat_id,
-                                &thinking_msg_id,
-                                error_msg,
-                            )
-                            .await;
-                        let preview = self.route_preview(&format!("\u{274c} {msg}"));
+                        let error_text = stream_error_text(&text_buffer, &msg);
+                        self.send_error_edit(&error_text, &thinking_msg_id).await;
+                        let preview = self.route_preview(&error_text);
                         self.register_message_route(&thinking_receipt, Some(&preview)).await;
                         break;
                     }
@@ -352,12 +362,18 @@ impl ChannelStreamRelay {
                 },
                 Err(broadcast::error::RecvError::Closed) => {
                     warn!("channel stream relay: broadcast closed without terminal event");
-                    self.send_final_edit(&text_buffer, has_content, &thinking_msg_id).await;
+                    let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
+                    self.send_error_edit(&error_text, &thinking_msg_id).await;
+                    let preview = self.route_preview(&error_text);
+                    self.register_message_route(&thinking_receipt, Some(&preview)).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(lagged = n, "channel stream relay lagged");
-                    self.send_final_edit(&text_buffer, has_content, &thinking_msg_id).await;
+                    let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
+                    self.send_error_edit(&error_text, &thinking_msg_id).await;
+                    let preview = self.route_preview(&error_text);
+                    self.register_message_route(&thinking_receipt, Some(&preview)).await;
                     break;
                 }
             }
@@ -388,8 +404,12 @@ impl ChannelStreamRelay {
         }
     }
 
-    async fn send_weixin_message(&self, formatted: &str, with_buttons: bool, preview: Option<&str>) {
-        let chunks = split_text_for_limit(formatted, WEIXIN_MESSAGE_LIMIT);
+    async fn send_buffered_message(&self, formatted: &str, with_buttons: bool, preview: Option<&str>) {
+        let limit = match self.config.platform {
+            PluginType::Lark => LARK_MESSAGE_LIMIT,
+            _ => WEIXIN_MESSAGE_LIMIT,
+        };
+        let chunks = split_text_for_limit(formatted, limit);
         for (index, chunk) in chunks.iter().enumerate() {
             let is_last = index + 1 == chunks.len();
             let message = if with_buttons && is_last {
@@ -416,12 +436,29 @@ impl ChannelStreamRelay {
                         error = %error,
                         chunk_index = index,
                         chunk_count = chunks.len(),
-                        "failed to send WeChat reply chunk"
+                        platform = %self.config.platform,
+                        "failed to send buffered channel reply chunk"
                     );
                     break;
                 }
             }
         }
+    }
+
+    async fn send_error_edit(&self, assistant_text: &str, msg_id: &str) {
+        let reply = format_remote_reply(&self.config.prompt_text, assistant_text, self.config.platform);
+        let formatted = format_text_for_platform(&reply, self.config.platform);
+        let error_msg = ChannelMessageService::build_text_message(&formatted);
+        let _ = self
+            .sender
+            .edit_message(
+                &self.config.owner_user_id,
+                &self.config.plugin_id,
+                &self.config.chat_id,
+                msg_id,
+                error_msg,
+            )
+            .await;
     }
 
     async fn register_message_route(&self, receipt: &ChannelDeliveryReceipt, preview_text: Option<&str>) {
@@ -501,10 +538,19 @@ fn split_text_for_limit(text: &str, limit: usize) -> Vec<String> {
     chunks
 }
 
-/// WeChat / WeCom channels cannot edit messages in place. Their relay buffers
-/// the whole turn and sends one final answer.
-fn is_weixin_platform(platform: PluginType) -> bool {
-    matches!(platform, PluginType::Weixin | PluginType::Wecom)
+fn stream_error_text(text_buffer: &str, reason: &str) -> String {
+    let error = format!("\u{274c} {reason}");
+    if text_buffer.trim().is_empty() {
+        error
+    } else {
+        format!("{}\n\n{error}", text_buffer.trim_end())
+    }
+}
+
+/// WeChat, WeCom, and Lark relays buffer the whole turn and send one final
+/// answer instead of exposing intermediate status messages.
+fn is_buffered_platform(platform: PluginType) -> bool {
+    matches!(platform, PluginType::Weixin | PluginType::Wecom | PluginType::Lark)
 }
 
 // ── Test helpers (pub so integration tests can use them) ─────────

@@ -17,6 +17,54 @@ pub fn strip_think_tags(text: &str) -> String {
     THINK_TAG_RE.replace_all(text, "").into_owned()
 }
 
+/// Strip complete think-tag ranges while preserving the original segment boundaries.
+pub(crate) fn strip_think_tags_by_segment(segments: &[&str]) -> Vec<String> {
+    let mut combined = String::new();
+    let mut boundaries = Vec::with_capacity(segments.len() + 1);
+    boundaries.push(0);
+    for segment in segments {
+        combined.push_str(segment);
+        boundaries.push(combined.len());
+    }
+
+    let removed_ranges: Vec<(usize, usize)> = THINK_TAG_RE
+        .find_iter(&combined)
+        .map(|matched| (matched.start(), matched.end()))
+        .collect();
+
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let start = boundaries[index];
+            let end = boundaries[index + 1];
+            let mut cursor = start;
+            let mut visible = String::new();
+
+            for &(remove_start, remove_end) in &removed_ranges {
+                if remove_end <= start {
+                    continue;
+                }
+                if remove_start >= end {
+                    break;
+                }
+
+                let overlap_start = remove_start.max(start);
+                let overlap_end = remove_end.min(end);
+                if cursor < overlap_start {
+                    visible.push_str(&combined[cursor..overlap_start]);
+                }
+                cursor = cursor.max(overlap_end);
+            }
+
+            if cursor < end {
+                visible.push_str(&combined[cursor..end]);
+            }
+            visible
+        })
+        .collect()
+}
+
 pub fn detect_skill_load_requests(text: &str) -> Vec<String> {
     let mut names = Vec::new();
     for cap in LOAD_SKILL_RE.captures_iter(text) {
@@ -135,6 +183,12 @@ mod tests {
     fn strip_think_tags_none() {
         let input = "No tags here at all.";
         assert_eq!(strip_think_tags(input), "No tags here at all.");
+    }
+
+    #[test]
+    fn strip_think_tags_across_segments() {
+        let segments = ["Visible<think>private", " content</think>answer"];
+        assert_eq!(strip_think_tags_by_segment(&segments), ["Visible", "answer"]);
     }
 
     #[test]

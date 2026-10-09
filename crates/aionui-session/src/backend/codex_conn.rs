@@ -23,7 +23,6 @@
 //! independently contract-tested via the `build_with_io` seam.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,7 +50,6 @@ const SAYDONE_MANAGED_BACKEND_ENV: &str = "SAYDONE_MANAGED_BACKEND";
 const SAYDONE_MANAGED_PROTOCOL_ENV: &str = "SAYDONE_MANAGED_PROTOCOL";
 const SAYDONE_MANAGED_MODEL_ENV: &str = "SAYDONE_MANAGED_MODEL";
 const SAYDONE_MANAGED_BASE_URL_ENV: &str = "SAYDONE_MANAGED_BASE_URL";
-const SAYDONE_MANAGED_REASONING_POLICY_ENV: &str = "SAYDONE_MANAGED_REASONING_POLICY";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// 仅在完整的 SayDone 托管 Codex 上保留服务端已授权的模型。
@@ -63,8 +61,6 @@ const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 struct SaydoneManagedCodexRuntime {
     model: String,
     base_url: String,
-    reasoning_efforts: Vec<String>,
-    default_reasoning_effort: Option<String>,
 }
 
 fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManagedCodexRuntime> {
@@ -80,26 +76,6 @@ fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManage
     let model = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_MODEL_ENV)?;
     let base_url = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BASE_URL_ENV)?;
     let api_key = unique_env_value(&config.spawn_env, OPENAI_API_KEY_ENV)?;
-    let reasoning_policy = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_REASONING_POLICY_ENV)
-        .and_then(|value| serde_json::from_str::<Value>(value).ok());
-    let reasoning_efforts = reasoning_policy
-        .as_ref()
-        .and_then(|policy| policy.get("efforts"))
-        .and_then(Value::as_array)
-        .map(|efforts| {
-            efforts
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let default_reasoning_effort = reasoning_policy
-        .as_ref()
-        .and_then(|policy| policy.get("default_effort"))
-        .and_then(Value::as_str)
-        .filter(|effort| reasoning_efforts.iter().any(|allowed| allowed == effort))
-        .map(str::to_owned);
     (unique_env_value(&config.spawn_env, SAYDONE_MANAGED_AGENT_ENV) == Some("1")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BACKEND_ENV) == Some("codex")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_PROTOCOL_ENV) == Some("openai")
@@ -108,45 +84,7 @@ fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManage
     .then(|| SaydoneManagedCodexRuntime {
         model: model.to_owned(),
         base_url: base_url.to_owned(),
-        reasoning_efforts,
-        default_reasoning_effort,
     })
-}
-
-fn write_saydone_managed_model_catalog(
-    runtime: &SaydoneManagedCodexRuntime,
-) -> Result<tempfile::TempPath, BackendError> {
-    let catalog = json!({
-        "models": [{
-            "slug": runtime.model,
-            "display_name": runtime.model,
-            "description": "SayDone managed model.",
-            "base_instructions": "You are a coding agent. Follow the user's instructions and work in the current workspace.",
-            "default_reasoning_level": runtime.default_reasoning_effort,
-            "supported_reasoning_levels": runtime.reasoning_efforts.iter().map(|effort| json!({
-                "effort": effort,
-                "description": effort,
-            })).collect::<Vec<_>>(),
-            "shell_type": "shell_command",
-            "visibility": "list",
-            "supported_in_api": true,
-            // Codex 0.147.0 requires this capability flag when parsing a
-            // model catalog. SayDone's managed endpoint does not expose a
-            // user-selectable verbosity parameter.
-            "support_verbosity": false,
-            "truncation_policy": { "mode": "bytes", "limit": 10000 },
-            "supports_parallel_tool_calls": true,
-            "experimental_supported_tools": [],
-            "priority": 1
-        }]
-    });
-    let body = serde_json::to_vec(&catalog).map_err(|error| BackendError::Transport(error.to_string()))?;
-    let mut file = tempfile::NamedTempFile::new()
-        .map_err(|error| BackendError::Transport(format!("codex managed model catalog: {error}")))?;
-    file.write_all(&body)
-        .and_then(|()| file.flush())
-        .map_err(|error| BackendError::Transport(format!("codex managed model catalog: {error}")))?;
-    Ok(file.into_temp_path())
 }
 
 /// Config overrides that make Codex command-execution children inherit the
@@ -163,7 +101,7 @@ pub fn codex_shell_environment_policy_args() -> [&'static str; 4] {
 /// Build the process-level app-server argv shared by initial open and idle
 /// wake. `codex app-server --help` documents the config override and uses
 /// `shell_environment_policy.inherit=all` as its example.
-fn codex_app_server_args(config: &SessionConfig, model_catalog_path: Option<&std::path::Path>) -> Vec<String> {
+fn codex_app_server_args(config: &SessionConfig) -> Vec<String> {
     let mut args = vec!["app-server".to_owned()];
     args.extend(config.extra_args.iter().cloned());
     if let Some(runtime) = saydone_managed_codex_runtime(config) {
@@ -186,13 +124,6 @@ fn codex_app_server_args(config: &SessionConfig, model_catalog_path: Option<&std
         }
         args.push(CODEX_CONFIG_FLAG.to_owned());
         args.push("model_providers.custom.requires_openai_auth=false".to_owned());
-        if let Some(path) = model_catalog_path {
-            args.push(CODEX_CONFIG_FLAG.to_owned());
-            args.push(format!(
-                "model_catalog_json={}",
-                serde_json::to_string(&path.to_string_lossy()).expect("catalog path serializes")
-            ));
-        }
     }
     // Append the compatibility policy after user/configured extras, matching
     // the former ACP launch policy and making these final overrides authoritative.
@@ -248,11 +179,7 @@ impl BackendConnection for CodexConnection {
             SessionSpec::Fork { session_id, .. } => session_id.clone(),
         };
         let managed_runtime = saydone_managed_codex_runtime(&config);
-        let model_catalog = managed_runtime
-            .as_ref()
-            .map(write_saydone_managed_model_catalog)
-            .transpose()?;
-        let args = codex_app_server_args(&config, model_catalog.as_deref());
+        let args = codex_app_server_args(&config);
         log_codex_runtime_policy(&config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Orchestration-resolved bundled CLI (packaged app) or bare "codex"
@@ -278,7 +205,6 @@ impl BackendConnection for CodexConnection {
         let wake = CodexWakeRecipe {
             spawner: Some(self.spawner.clone()),
             config: config.clone(),
-            model_catalog,
         };
         // Conversation titles are generated by the SayDone client now. Keep the
         // legacy latch disarmed and give it a source that can never spawn a
@@ -1078,7 +1004,6 @@ struct Discovered {
 struct CodexWakeRecipe {
     spawner: Option<Arc<dyn Spawner>>,
     config: SessionConfig,
-    model_catalog: Option<tempfile::TempPath>,
 }
 
 impl CodexWakeRecipe {
@@ -1089,7 +1014,6 @@ impl CodexWakeRecipe {
         Self {
             spawner: None,
             config: SessionConfig::default(),
-            model_catalog: None,
         }
     }
 }
@@ -1252,7 +1176,6 @@ impl CodexSessionBackend {
         let wake = CodexWakeRecipe {
             spawner: Some(spawner),
             config: SessionConfig::default(),
-            model_catalog: None,
         };
         Self::spawn_with_wake(
             session_id.into(),
@@ -1620,7 +1543,7 @@ impl CodexSessionBackend {
             .spawner
             .as_ref()
             .ok_or_else(|| BackendError::Transport("codex wake: no spawner (suspension not enabled)".into()))?;
-        let args = codex_app_server_args(&self.wake.config, self.wake.model_catalog.as_deref());
+        let args = codex_app_server_args(&self.wake.config);
         log_codex_runtime_policy(&self.wake.config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Same bundled-CLI resolution + spawn env as the initial spawn
@@ -7310,10 +7233,6 @@ mod tests {
                     value: "https://admin.saydone.ai/openai/v1".into(),
                 },
                 aionui_common::EnvVar {
-                    name: SAYDONE_MANAGED_REASONING_POLICY_ENV.into(),
-                    value: r#"{"efforts":["low","high"],"default_effort":"high"}"#.into(),
-                },
-                aionui_common::EnvVar {
                     name: "SAYDONE_MANAGED_CONTEXT_WINDOW".into(),
                     value: "1048576".into(),
                 },
@@ -7329,8 +7248,6 @@ mod tests {
             Some(SaydoneManagedCodexRuntime {
                 model: "deepseek-v4-flash".into(),
                 base_url: "https://admin.saydone.ai/openai/v1".into(),
-                reasoning_efforts: vec!["low".into(), "high".into()],
-                default_reasoning_effort: Some("high".into()),
             })
         );
 
@@ -7364,10 +7281,6 @@ mod tests {
                     value: "https://admin.saydone.ai/openai/v1".into(),
                 },
                 aionui_common::EnvVar {
-                    name: SAYDONE_MANAGED_REASONING_POLICY_ENV.into(),
-                    value: r#"{"efforts":["low","high"],"default_effort":"high"}"#.into(),
-                },
-                aionui_common::EnvVar {
                     name: "SAYDONE_MANAGED_CONTEXT_WINDOW".into(),
                     value: "1048576".into(),
                 },
@@ -7379,11 +7292,7 @@ mod tests {
             ..SessionConfig::default()
         };
 
-        let catalog = write_saydone_managed_model_catalog(
-            &saydone_managed_codex_runtime(&config).expect("managed config has runtime"),
-        )
-        .expect("catalog writes");
-        let args = codex_app_server_args(&config, Some(catalog.as_ref()));
+        let args = codex_app_server_args(&config);
 
         assert!(args.contains(&"model=\"deepseek-v4-flash\"".into()));
         assert!(args.contains(&"model_providers.custom.env_key=\"OPENAI_API_KEY\"".into()));
@@ -7393,70 +7302,7 @@ mod tests {
             !args.iter().any(|arg| arg == "model_context_window=1048576"),
             "managed Codex must keep context-window accounting and compaction in Codex"
         );
-        assert!(args.iter().any(|arg| arg.starts_with("model_catalog_json=")));
-    }
-
-    #[test]
-    fn managed_codex_model_catalog_declares_verbosity_capability() {
-        let runtime = SaydoneManagedCodexRuntime {
-            model: "deepseek-v4-flash".into(),
-            base_url: "https://admin.saydone.ai/openai/v1".into(),
-            reasoning_efforts: vec!["low".into(), "high".into()],
-            default_reasoning_effort: Some("high".into()),
-        };
-        let path = write_saydone_managed_model_catalog(&runtime).expect("catalog writes");
-        let body = std::fs::read_to_string(&*path).expect("catalog reads");
-        let catalog: Value = serde_json::from_str(&body).expect("catalog is valid JSON");
-        let model = &catalog["models"][0];
-        assert_eq!(model["slug"], "deepseek-v4-flash");
-        assert_eq!(model["support_verbosity"], false);
-        assert_eq!(model["truncation_policy"], json!({ "mode": "bytes", "limit": 10000 }));
-        assert_eq!(model["supports_parallel_tool_calls"], true);
-        assert_eq!(model["experimental_supported_tools"], json!([]));
-        assert!(
-            model["base_instructions"]
-                .as_str()
-                .is_some_and(|value| !value.is_empty())
-        );
-        assert_eq!(model["supported_in_api"], true);
-    }
-
-    #[test]
-    fn managed_codex_model_catalog_uses_only_admin_reasoning_policy() {
-        let runtime = SaydoneManagedCodexRuntime {
-            model: "same-model".into(),
-            base_url: "https://admin.saydone.ai/openai/v1".into(),
-            reasoning_efforts: vec!["off".into(), "ultra".into()],
-            default_reasoning_effort: Some("ultra".into()),
-        };
-        let path = write_saydone_managed_model_catalog(&runtime).expect("catalog writes");
-        let catalog: Value = serde_json::from_slice(&std::fs::read(&*path).unwrap()).unwrap();
-        let model = &catalog["models"][0];
-        assert_eq!(model["default_reasoning_level"], "ultra");
-        assert_eq!(
-            model["supported_reasoning_levels"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|level| level["effort"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["off", "ultra"]
-        );
-    }
-
-    #[test]
-    fn managed_codex_model_catalog_does_not_invent_reasoning_for_empty_policy() {
-        let runtime = SaydoneManagedCodexRuntime {
-            model: "gpt-5.6-sol".into(),
-            base_url: "https://admin.saydone.ai/openai/v1".into(),
-            reasoning_efforts: Vec::new(),
-            default_reasoning_effort: None,
-        };
-        let path = write_saydone_managed_model_catalog(&runtime).expect("catalog writes");
-        let catalog: Value = serde_json::from_slice(&std::fs::read(&*path).unwrap()).unwrap();
-        let model = &catalog["models"][0];
-        assert_eq!(model["default_reasoning_level"], Value::Null);
-        assert_eq!(model["supported_reasoning_levels"], json!([]));
+        assert!(!args.iter().any(|arg| arg.starts_with("model_catalog_json=")));
     }
 
     #[test]

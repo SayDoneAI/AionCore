@@ -220,6 +220,11 @@ async fn relay_handles_error_event() {
     let rx = event_tx.subscribe();
 
     event_tx
+        .send(AgentStreamEvent::Text(TextEventData {
+            content: "partial".into(),
+        }))
+        .unwrap();
+    event_tx
         .send(AgentStreamEvent::Error(ErrorEventData::legacy("timeout", None)))
         .unwrap();
 
@@ -227,7 +232,9 @@ async fn relay_handles_error_event() {
 
     let edits = recorder.take_edits();
     let last = edits.last().unwrap();
+    assert!(last.text.as_deref().unwrap().contains("partial"));
     assert!(last.text.as_deref().unwrap().contains("timeout"));
+    assert!(last.buttons.is_none());
 }
 
 #[tokio::test]
@@ -354,24 +361,25 @@ async fn weixin_waits_for_the_whole_turn_after_an_intermediate_finish() {
     )
     .with_runtime_state(runtime_state);
     let rx = event_tx.subscribe();
+    let producer_tx = event_tx.clone();
     let relay_task = tokio::spawn(relay.run(rx));
 
     let producer = tokio::spawn(async move {
-        event_tx
+        producer_tx
             .send(AgentStreamEvent::Text(TextEventData {
                 content: "Preparing. ".into(),
             }))
             .unwrap();
-        event_tx
+        producer_tx
             .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
             .unwrap();
         tokio::task::yield_now().await;
-        event_tx
+        producer_tx
             .send(AgentStreamEvent::Text(TextEventData {
                 content: "Final answer.".into(),
             }))
             .unwrap();
-        event_tx
+        producer_tx
             .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
             .unwrap();
         tokio::task::yield_now().await;
@@ -389,7 +397,7 @@ async fn weixin_waits_for_the_whole_turn_after_an_intermediate_finish() {
 }
 
 #[tokio::test]
-async fn lark_final_edit_includes_original_prompt() {
+async fn lark_sends_one_complete_answer_without_intermediate_state() {
     let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
     let recorder = Arc::new(MessageRecorder::new());
     let relay = ChannelStreamRelay::new(
@@ -418,18 +426,19 @@ async fn lark_final_edit_includes_original_prompt() {
 
     relay.run(rx).await;
 
-    let edits = recorder.take_edits();
+    let sends = recorder.take_sends();
+    assert_eq!(sends.len(), 1);
     assert_eq!(
-        edits.last().and_then(|message| message.text.as_deref()),
+        sends[0].text.as_deref(),
         Some("**你：** 请总结这个文件\n\n**AI：** 文件已总结")
     );
+    assert!(recorder.take_edits().is_empty());
 }
 
 #[tokio::test]
 async fn telegram_does_not_flush_text_before_tool_call() {
-    // Non-WeChat platforms support edit_message, so the TS flush rule does
-    // not apply — the relay should continue to edit the placeholder in
-    // place without issuing a new send_message for the buffered text.
+    // Editable platforms keep one placeholder and update it in place instead
+    // of issuing a new send_message for the buffered text.
     let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
     let recorder = Arc::new(MessageRecorder::new());
 
@@ -520,6 +529,90 @@ async fn weixin_skips_flush_when_buffer_is_empty() {
 }
 
 #[tokio::test]
+async fn lark_skips_flush_when_buffer_is_empty() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+
+    let relay = ChannelStreamRelay::new(
+        RelayConfig {
+            owner_user_id: "system_default_user".to_owned(),
+            session_id: "session_1".to_owned(),
+            conversation_id: "conversation_1".to_owned(),
+            platform: PluginType::Lark,
+            plugin_id: "lark".into(),
+            chat_id: "chat_1".into(),
+            prompt_text: "Test question".into(),
+            throttle_ms: 10_000,
+        },
+        recorder.clone(),
+    );
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "call-1".into(),
+            name: "read_file".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Running,
+            description: None,
+            parent_call_id: None,
+            input: None,
+            output: None,
+            files: None,
+        }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    assert!(recorder.take_sends().is_empty());
+    assert!(recorder.take_edits().is_empty());
+}
+
+#[tokio::test]
+async fn lark_reports_stream_lag_when_no_text_was_received() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(1);
+    let recorder = Arc::new(MessageRecorder::new());
+    let relay = ChannelStreamRelay::new(
+        RelayConfig {
+            owner_user_id: "system_default_user".to_owned(),
+            session_id: "session_1".to_owned(),
+            conversation_id: "conversation_1".to_owned(),
+            platform: PluginType::Lark,
+            plugin_id: "lark".into(),
+            chat_id: "chat_1".into(),
+            prompt_text: "Test question".into(),
+            throttle_ms: 10_000,
+        },
+        recorder.clone(),
+    );
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData {
+            content: "第一条事件".into(),
+        }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData {
+            content: "第二条事件".into(),
+        }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    let sends = recorder.take_sends();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(
+        sends[0].text.as_deref(),
+        Some("**你：** Test question\n\n**AI：** ❌ 回复流中断，请重试")
+    );
+    assert!(sends[0].buttons.is_none(), "interrupted replies must not look complete");
+}
+
+#[tokio::test]
 async fn relay_handles_channel_closed() {
     let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
     let recorder = Arc::new(MessageRecorder::new());
@@ -547,6 +640,53 @@ async fn relay_handles_channel_closed() {
     relay.run(rx).await;
 
     let edits = recorder.take_edits();
-    assert!(!edits.is_empty());
-    assert!(edits.last().unwrap().text.as_deref().unwrap().contains("partial"));
+    let last = edits
+        .last()
+        .expect("an interrupted stream must replace the placeholder");
+    assert!(last.text.as_deref().unwrap().contains("partial"));
+    assert!(last.text.as_deref().unwrap().contains("回复流中断"));
+    assert!(last.buttons.is_none(), "an interrupted reply must not look complete");
+}
+
+#[tokio::test]
+async fn relay_handles_closed_continuation_without_success_buttons() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+    let runtime_state = Arc::new(ConversationRuntimeStateService::default());
+    let _claim = runtime_state.try_claim_turn("conversation_1", "turn_1").unwrap();
+    let relay = ChannelStreamRelay::new(
+        RelayConfig {
+            owner_user_id: "system_default_user".to_owned(),
+            session_id: "session_1".to_owned(),
+            conversation_id: "conversation_1".to_owned(),
+            platform: PluginType::Telegram,
+            plugin_id: "telegram".into(),
+            chat_id: "chat_1".into(),
+            prompt_text: "Test question".into(),
+            throttle_ms: 10,
+        },
+        recorder.clone(),
+    )
+    .with_runtime_state(runtime_state);
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData {
+            content: "partial before finish".into(),
+        }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
+        .unwrap();
+    drop(event_tx);
+
+    relay.run(rx).await;
+
+    let edits = recorder.take_edits();
+    let last = edits
+        .last()
+        .expect("a closed continuation must replace the placeholder");
+    assert!(last.text.as_deref().unwrap().contains("partial before finish"));
+    assert!(last.text.as_deref().unwrap().contains("回复流中断"));
+    assert!(last.buttons.is_none(), "a closed continuation must not look complete");
 }

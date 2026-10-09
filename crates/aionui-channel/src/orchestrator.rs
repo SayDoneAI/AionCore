@@ -705,10 +705,17 @@ pub struct ChannelMirrorTargetRef {
 }
 
 #[derive(Debug, Default)]
+struct MirrorTextSegment {
+    msg_id: String,
+    text: String,
+}
+
+#[derive(Debug, Default)]
 struct MirrorTurnState {
     owner_user_id: String,
     latest_user_text: String,
     assistant_text: String,
+    assistant_segments: Vec<MirrorTextSegment>,
     excluded_target: Option<ChannelMirrorTargetRef>,
 }
 
@@ -749,6 +756,7 @@ impl ChannelMirrorService {
                 owner_user_id: owner_user_id.to_owned(),
                 latest_user_text: normalize_mirror_text(text),
                 assistant_text: String::new(),
+                assistant_segments: Vec::new(),
                 excluded_target: Some(excluded_target),
             },
         );
@@ -812,6 +820,7 @@ impl ChannelMirrorService {
                     owner_user_id: owner_user_id.to_owned(),
                     latest_user_text: normalize_mirror_text(text),
                     assistant_text: String::new(),
+                    assistant_segments: Vec::new(),
                     excluded_target: previous_exclusion,
                 },
             );
@@ -828,13 +837,37 @@ impl ChannelMirrorService {
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
                     let replace = event.data.get("replace").and_then(serde_json::Value::as_bool) == Some(true);
+                    let msg_id = event
+                        .data
+                        .get("msg_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
                     let mut turns = self.turns.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Some(state) = turns.get_mut(conversation_id) {
-                        if replace {
-                            state.assistant_text = chunk.to_owned();
+                        let segment_index = state
+                            .assistant_segments
+                            .iter()
+                            .position(|segment| segment.msg_id == msg_id)
+                            .or_else(|| {
+                                (replace && !msg_id.is_empty() && state.assistant_segments.len() == 1).then_some(0)
+                            });
+                        if let Some(index) = segment_index {
+                            if replace {
+                                state.assistant_segments[index].text = chunk.to_owned();
+                            } else {
+                                state.assistant_segments[index].text.push_str(chunk);
+                            }
                         } else {
-                            state.assistant_text.push_str(chunk);
+                            state.assistant_segments.push(MirrorTextSegment {
+                                msg_id: msg_id.to_owned(),
+                                text: chunk.to_owned(),
+                            });
                         }
+                        state.assistant_text = state
+                            .assistant_segments
+                            .iter()
+                            .map(|segment| segment.text.as_str())
+                            .collect();
                     }
                 }
                 // The conversation relay can emit a final `content` replacement
@@ -1316,6 +1349,52 @@ mod tests {
             sends
                 .iter()
                 .all(|(_, _, text)| text == "**你：** Question\n\n**AI：** Final answer")
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_segment_final_replacements_keep_the_complete_mirrored_answer() {
+        let (service, sender, _repo, _db) = setup_mirror().await;
+
+        service.handle_event(user_event("Question")).await;
+        for (msg_id, text) in [("segment-a", "Draft A"), ("segment-b", "Draft B")] {
+            service
+                .handle_event(WebSocketMessage::new(
+                    "message.stream",
+                    serde_json::json!({
+                        "user_id": "system_default_user",
+                        "conversation_id": "desktop-conversation",
+                        "msg_id": msg_id,
+                        "type": "text",
+                        "data": { "content": text },
+                    }),
+                ))
+                .await;
+        }
+        service.handle_event(stream_event("finish", None)).await;
+        for (msg_id, text) in [("segment-a", "Final A"), ("segment-b", "Final B")] {
+            service
+                .handle_event(WebSocketMessage::new(
+                    "message.stream",
+                    serde_json::json!({
+                        "user_id": "system_default_user",
+                        "conversation_id": "desktop-conversation",
+                        "msg_id": msg_id,
+                        "type": "content",
+                        "data": { "content": text },
+                        "replace": true,
+                    }),
+                ))
+                .await;
+        }
+        service.handle_event(completed_event()).await;
+
+        let sends = sender.sends.lock().unwrap().clone();
+        assert_eq!(sends.len(), 2);
+        assert!(
+            sends
+                .iter()
+                .all(|(_, _, text)| text == "**你：** Question\n\n**AI：** Final AFinal B")
         );
     }
 }

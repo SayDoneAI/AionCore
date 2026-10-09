@@ -1562,6 +1562,67 @@ mod tests {
         assert_ne!(text_event_msg_ids[0], text_event_msg_ids[1]);
     }
 
+    #[tokio::test]
+    async fn rewritten_text_keeps_later_agent_segments_visible() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let rx = tx.subscribe();
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+        );
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "第一段<think>内部内容".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tc-001".into(),
+            name: "read_file".into(),
+            args: json!({"path": "a.ts"}),
+            status: ToolCallStatus::Running,
+            input: None,
+            output: None,
+            description: None,
+            parent_call_id: None,
+            files: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "</think>第二段".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        assert!(
+            updates.iter().all(|(_, update)| update.hidden != Some(true)),
+            "a middleware rewrite must not hide a later agent paragraph: {updates:?}"
+        );
+        let rewritten_contents: Vec<String> = updates
+            .iter()
+            .filter_map(|(_, update)| update.content.as_deref())
+            .map(|content| {
+                serde_json::from_str::<serde_json::Value>(content)
+                    .expect("rewritten text content is JSON")
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("rewritten text content is a string")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(rewritten_contents, ["第一段", "第二段"]);
+    }
+
     // A SegmentBreak (emitted by the direct-CLI pump when it suppresses a
     // non-blocking Workflow's launch result) must split text into two bubbles
     // just like a tool call does — but WITHOUT terminating the relay and
