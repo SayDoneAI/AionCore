@@ -52,6 +52,7 @@ use aionui_team::{
     TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
     TeamSessionService,
 };
+use tokio::sync::broadcast;
 
 use crate::config::{IdentityMode, derive_encryption_key};
 use crate::router::team_capability_resolver::TeamCapabilityResolver;
@@ -196,7 +197,7 @@ pub struct ChannelOrchestratorComponents {
     pub plugin_factory: Arc<aionui_channel::manager::PluginFactory>,
     pub owner_user_id: Option<String>,
     pub mirror_service: Arc<aionui_channel::orchestrator::ChannelMirrorService>,
-    pub mirror_event_rx: tokio::sync::broadcast::Receiver<aionui_api_types::WebSocketMessage<serde_json::Value>>,
+    pub mirror_event_rx: broadcast::Receiver<aionui_api_types::WebSocketMessage<serde_json::Value>>,
 }
 
 /// Build all default `ModuleStates` from application services.
@@ -856,6 +857,7 @@ pub async fn build_channel_state(
         action_executor,
         message_service,
         Arc::clone(&session_manager),
+        repo.clone(),
         manager.clone() as Arc<dyn aionui_channel::stream_relay::ChannelSender>,
         Arc::clone(&mirror_service),
     );
@@ -893,15 +895,14 @@ const ASSISTANT_MCP_EVENT_QUEUE_SIZE: usize = 64;
 /// service.
 ///
 /// Two tasks rather than one on purpose. The receive loop must stay cheap: the
-/// bus is shared with every streaming WebSocket event and has a bounded backlog,
-/// so a slow consumer is dropped (`Lagged`) rather than waited for. Applying a
-/// binding change is NOT cheap — it re-resolves MCP against the database and can
-/// restart a runtime — so it runs on a separate worker and the receive loop only
-/// forwards. A `Lagged` gap means binding events were silently discarded, which
-/// would leave members on a stale MCP set; it is repaired by asking for a full
-/// reconcile instead of being ignored.
+/// bus is shared with every streaming WebSocket event, so a slow binding
+/// reconciliation must not block event delivery. Applying a binding change is
+/// NOT cheap — it re-resolves MCP against the database and can restart a runtime
+/// — so it runs on a separate worker and the receive loop only forwards. A full
+/// reconcile is still used when the worker queue is saturated because the
+/// latest state subsumes older binding changes.
 fn spawn_assistant_mcp_binding_watcher(
-    mut event_rx: tokio::sync::broadcast::Receiver<aionui_api_types::WebSocketMessage<serde_json::Value>>,
+    mut event_rx: broadcast::Receiver<aionui_api_types::WebSocketMessage<serde_json::Value>>,
     service: Arc<TeamSessionService>,
 ) {
     enum McpBindingWork {
@@ -933,14 +934,14 @@ fn spawn_assistant_mcp_binding_watcher(
                     }
                 }
                 Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::warn!(
                         skipped,
                         "assistant MCP binding watcher lagged; reconciling every active session"
                     );
                     McpBindingWork::ReconcileAll
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => break,
             };
             // A full queue means the worker is already behind on the same kind of
             // work; a trailing reconcile will cover whatever we drop here, so

@@ -7,6 +7,8 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use aionui_common::generate_id;
+
 use crate::constants::{LARK_EVENT_DEDUP_TTL, LARK_MESSAGE_LIMIT};
 use crate::error::ChannelError;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
@@ -149,11 +151,13 @@ impl ChannelPlugin for LarkPlugin {
         // Spawn the WebSocket connection loop
         let api_clone = Arc::clone(self.api.as_ref().expect("api set in initialize"));
         let dedup_cache = Arc::clone(&self.dedup_cache);
+        let bot_open_id = self.bot_info.as_ref().map(|info| info.id.clone());
         self.ws_handle = Some(tokio::spawn(ws_loop(
             api_clone,
             callbacks.message_tx,
             callbacks.confirm_tx,
             dedup_cache.clone(),
+            bot_open_id,
             shutdown_rx,
         )));
 
@@ -209,6 +213,10 @@ impl ChannelPlugin for LarkPlugin {
 
         let card_content = build_interactive_card(&text, message.buttons.as_deref());
         let data = api.send_card(chat_id, &card_content).await?;
+        self.dedup_cache
+            .lock()
+            .await
+            .insert(sent_message_cache_key(&data.message_id), Instant::now());
         Ok(data.message_id)
     }
 
@@ -263,6 +271,7 @@ async fn ws_loop(
     message_tx: mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: mpsc::Sender<(String, String)>,
     dedup_cache: Arc<Mutex<HashMap<String, Instant>>>,
+    bot_open_id: Option<String>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut consecutive_errors: u32 = 0;
@@ -307,6 +316,7 @@ async fn ws_loop(
             &message_tx,
             &confirm_tx,
             &dedup_cache,
+            bot_open_id.as_deref(),
             &mut shutdown_rx,
         )
         .await
@@ -342,6 +352,7 @@ async fn connect_and_listen(
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
     dedup_cache: &Arc<Mutex<HashMap<String, Instant>>>,
+    bot_open_id: Option<&str>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), ChannelError> {
     use futures_util::{SinkExt, StreamExt};
@@ -401,7 +412,15 @@ async fn connect_and_listen(
                                     let msg_type = get_header(&frame.headers, "type").unwrap_or("");
                                     if msg_type == "event" || msg_type == "card" {
                                         if let Ok(text) = String::from_utf8(merged) {
-                                            handle_ws_text(&text, msg_type, message_tx, confirm_tx, dedup_cache).await;
+                                            handle_ws_text_with_bot(
+                                                &text,
+                                                msg_type,
+                                                message_tx,
+                                                confirm_tx,
+                                                dedup_cache,
+                                                bot_open_id,
+                                            )
+                                            .await;
                                         } else {
                                             warn!("Lark frame payload is not valid UTF-8");
                                         }
@@ -474,12 +493,24 @@ fn handle_control_frame(frame: &super::frame::PbFrame) -> Option<Duration> {
 }
 
 /// Handle a decoded and reassembled Lark event payload.
+#[cfg(test)]
 async fn handle_ws_text(
     text: &str,
     frame_type: &str,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
     confirm_tx: &mpsc::Sender<(String, String)>,
     dedup_cache: &Arc<Mutex<HashMap<String, Instant>>>,
+) {
+    handle_ws_text_with_bot(text, frame_type, message_tx, confirm_tx, dedup_cache, None).await;
+}
+
+async fn handle_ws_text_with_bot(
+    text: &str,
+    frame_type: &str,
+    message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
+    confirm_tx: &mpsc::Sender<(String, String)>,
+    dedup_cache: &Arc<Mutex<HashMap<String, Instant>>>,
+    bot_open_id: Option<&str>,
 ) {
     match frame_type {
         "event" => {
@@ -511,12 +542,12 @@ async fn handle_ws_text(
             match event_type {
                 "im.message.receive_v1" => {
                     if let Some(event_data) = envelope.get("event").cloned() {
-                        handle_message_event(event_data, message_tx).await;
+                        handle_message_event(event_data, message_tx, bot_open_id, dedup_cache).await;
                     }
                 }
                 "application.bot.menu_v6" => {
                     if let Some(event_data) = envelope.get("event").cloned() {
-                        handle_bot_menu_event(event_data, message_tx).await;
+                        handle_bot_menu_event(event_data, message_tx, event_id).await;
                     }
                 }
                 _ => {
@@ -532,6 +563,12 @@ async fn handle_ws_text(
                     return;
                 }
             };
+            if let Some(dedup_key) = card_action_dedup_key(&data)
+                && is_duplicate(dedup_cache, &dedup_key).await
+            {
+                debug!(dedup_key, "Lark duplicate card callback, skipping");
+                return;
+            }
             handle_card_action(data, message_tx, confirm_tx).await;
         }
         _ => {
@@ -545,7 +582,12 @@ async fn handle_ws_text(
 // ---------------------------------------------------------------------------
 
 /// Handle an `im.message.receive_v1` event.
-async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::Sender<UnifiedIncomingMessage>) {
+async fn handle_message_event(
+    event_data: serde_json::Value,
+    message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
+    bot_open_id: Option<&str>,
+    dedup_cache: &Arc<Mutex<HashMap<String, Instant>>>,
+) {
     let evt: MessageEvent = match serde_json::from_value(event_data.clone()) {
         Ok(e) => e,
         Err(e) => {
@@ -553,6 +595,19 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
             return;
         }
     };
+
+    if is_sent_message(dedup_cache, &evt.message.message_id).await {
+        debug!(message_id = %evt.message.message_id, "Ignoring Lark message sent by this bot");
+        return;
+    }
+    if evt.sender.sender_type != "user" {
+        debug!(sender_type = %evt.sender.sender_type, "Ignoring non-user Lark message event");
+        return;
+    }
+    if bot_open_id.is_some_and(|bot_id| bot_id == evt.sender.sender_id.open_id) {
+        debug!(bot_open_id = %evt.sender.sender_id.open_id, "Ignoring Lark bot self-message");
+        return;
+    }
 
     let user = UnifiedUser {
         id: evt.sender.sender_id.open_id.clone(),
@@ -599,7 +654,7 @@ async fn handle_message_event(event_data: serde_json::Value, message_tx: &mpsc::
 async fn handle_card_action(
     data: serde_json::Value,
     message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
-    confirm_tx: &mpsc::Sender<(String, String)>,
+    _confirm_tx: &mpsc::Sender<(String, String)>,
 ) {
     let evt: CardActionEvent = match serde_json::from_value(data) {
         Ok(e) => e,
@@ -620,21 +675,14 @@ async fn handle_card_action(
 
     let parsed = parse_lark_callback(action_str);
 
-    // Check if this is a tool confirmation
-    if let Some((_, ref action, ref params)) = parsed
-        && action == "system.confirm"
-        && let Some(p) = params
-    {
-        let call_id = p.get("callId").cloned().unwrap_or_default();
-        let value = p.get("value").cloned().unwrap_or_default();
-        if !call_id.is_empty() {
-            let _ = confirm_tx.send((call_id, value)).await;
-        }
-    }
+    // Tool confirmations stay on the normal message queue. The orchestrator's
+    // durable claim then resolves the channel route and calls ConversationService
+    // exactly once; sending the same callback to confirm_tx would bypass both.
 
     let chat_id = evt.open_chat_id.as_deref().unwrap_or("").to_string();
 
     let message_id = evt.open_message_id.clone();
+    let incoming_id = card_action_message_id(&evt, action_str);
 
     let user = UnifiedUser {
         id: evt.operator.open_id.clone(),
@@ -665,7 +713,7 @@ async fn handle_card_action(
 
     let msg = UnifiedIncomingMessage {
         owner_user_id: None,
-        id: format!("card_{}", chrono_now()),
+        id: incoming_id,
         platform: PluginType::Lark,
         chat_id,
         user,
@@ -684,7 +732,11 @@ async fn handle_card_action(
 }
 
 /// Handle an `application.bot.menu_v6` event.
-async fn handle_bot_menu_event(event_data: serde_json::Value, message_tx: &mpsc::Sender<UnifiedIncomingMessage>) {
+async fn handle_bot_menu_event(
+    event_data: serde_json::Value,
+    message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
+    event_id: Option<&str>,
+) {
     let evt: BotMenuEvent = match serde_json::from_value(event_data) {
         Ok(e) => e,
         Err(e) => {
@@ -702,7 +754,10 @@ async fn handle_bot_menu_event(event_data: serde_json::Value, message_tx: &mpsc:
 
     let msg = UnifiedIncomingMessage {
         owner_user_id: None,
-        id: format!("menu_{}", chrono_now()),
+        id: event_id
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("event:{id}"))
+            .unwrap_or_else(|| format!("menu_{}", generate_id())),
         platform: PluginType::Lark,
         chat_id: evt.operator.operator_id.open_id.clone(),
         user,
@@ -813,6 +868,60 @@ async fn is_duplicate(cache: &Arc<Mutex<HashMap<String, Instant>>>, event_id: &s
     }
     map.insert(event_id.to_string(), Instant::now());
     false
+}
+
+fn sent_message_cache_key(message_id: &str) -> String {
+    format!("sent_message:{message_id}")
+}
+
+async fn is_sent_message(cache: &Arc<Mutex<HashMap<String, Instant>>>, message_id: &str) -> bool {
+    cache.lock().await.contains_key(&sent_message_cache_key(message_id))
+}
+
+/// Build a stable key for a Lark card callback. Lark retries can omit the
+/// event envelope ID, so card payload identity comes from its callback token
+/// and the action context instead.
+fn card_action_dedup_key(data: &serde_json::Value) -> Option<String> {
+    let token = data.get("token").and_then(|value| value.as_str()).unwrap_or("");
+    let message_id = data
+        .get("open_message_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let operator_id = data
+        .get("operator")
+        .and_then(|operator| operator.get("open_id"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let action = data
+        .get("action")
+        .and_then(|action| action.get("value"))
+        .and_then(|value| value.get("action"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    if token.is_empty() && message_id.is_empty() && operator_id.is_empty() && action.is_empty() {
+        return None;
+    }
+
+    Some(format!("card:{token}:{message_id}:{operator_id}:{action}"))
+}
+
+/// Use the same stable identity as the in-memory callback deduplication for
+/// durable orchestrator claims. A timestamp is only unique at second-level
+/// precision and could make two different button clicks in one second share a
+/// claim key. Payloads without any stable callback identity get a fresh local
+/// id; they cannot be safely deduplicated across reconnects, but must not
+/// suppress unrelated actions.
+fn card_action_message_id(event: &CardActionEvent, action: &str) -> String {
+    let token = event.token.as_deref().unwrap_or("");
+    let message_id = event.open_message_id.as_deref().unwrap_or("");
+    let operator_id = event.operator.open_id.as_str();
+
+    if token.is_empty() && message_id.is_empty() && operator_id.is_empty() && action.is_empty() {
+        return format!("card_{}", generate_id());
+    }
+
+    format!("card:{token}:{message_id}:{operator_id}:{action}")
 }
 
 /// Remove expired entries from the dedup cache.
@@ -1167,6 +1276,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_text_ignores_the_configured_bot_self_message() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = mpsc::channel(16);
+        let dedup_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        let payload = r#"{
+            "header": {
+                "event_id": "ev_bot_self_1",
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_bot", "user_id": "", "union_id": "" },
+                    "sender_type": "user",
+                    "tenant_key": "t1"
+                },
+                "message": {
+                    "message_id": "msg_bot_self_1",
+                    "chat_id": "oc_chat1",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"bot reply\"}"
+                }
+            }
+        }"#;
+
+        handle_ws_text_with_bot(payload, "event", &message_tx, &confirm_tx, &dedup_cache, Some("ou_bot")).await;
+
+        assert!(
+            message_rx.try_recv().is_err(),
+            "a bot reply must not re-enter the input queue"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_text_ignores_a_recently_sent_message_by_id() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = mpsc::channel(16);
+        let dedup_cache = Arc::new(Mutex::new(HashMap::new()));
+        dedup_cache
+            .lock()
+            .await
+            .insert(sent_message_cache_key("msg_sent_1"), Instant::now());
+
+        let payload = r#"{
+            "header": {
+                "event_id": "ev_sent_1",
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_user1", "user_id": "", "union_id": "" },
+                    "sender_type": "user",
+                    "tenant_key": "t1"
+                },
+                "message": {
+                    "message_id": "msg_sent_1",
+                    "chat_id": "oc_chat1",
+                    "chat_type": "p2p",
+                    "message_type": "text",
+                    "content": "{\"text\":\"bot reply\"}"
+                }
+            }
+        }"#;
+
+        handle_ws_text(payload, "event", &message_tx, &confirm_tx, &dedup_cache).await;
+
+        assert!(message_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn ws_text_quoted_reply_keeps_parent_message_id() {
         let (message_tx, mut message_rx) = mpsc::channel(16);
         let (confirm_tx, _confirm_rx) = mpsc::channel(16);
@@ -1259,8 +1439,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_text_card_confirm_sends_to_confirm_channel() {
-        let (message_tx, _message_rx) = mpsc::channel(16);
+    async fn card_actions_use_stable_distinct_message_ids() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
+        let (confirm_tx, _confirm_rx) = mpsc::channel(16);
+        let dedup_cache = Arc::new(Mutex::new(HashMap::new()));
+
+        let first = r#"{
+            "operator": { "open_id": "ou_actor" },
+            "action": { "tag": "button", "value": {"action": "chat:help.show"} },
+            "token": "tok_card",
+            "open_message_id": "om_card",
+            "open_chat_id": "oc_chat"
+        }"#;
+        let second = r#"{
+            "operator": { "open_id": "ou_actor" },
+            "action": { "tag": "button", "value": {"action": "chat:help.hide"} },
+            "token": "tok_card",
+            "open_message_id": "om_card",
+            "open_chat_id": "oc_chat"
+        }"#;
+
+        handle_ws_text(first, "card", &message_tx, &confirm_tx, &dedup_cache).await;
+        handle_ws_text(second, "card", &message_tx, &confirm_tx, &dedup_cache).await;
+
+        let first_message = message_rx.try_recv().unwrap();
+        let second_message = message_rx.try_recv().unwrap();
+        assert_eq!(first_message.id, "card:tok_card:om_card:ou_actor:chat:help.show");
+        assert_eq!(second_message.id, "card:tok_card:om_card:ou_actor:chat:help.hide");
+        assert_ne!(first_message.id, second_message.id);
+    }
+
+    #[tokio::test]
+    async fn ws_text_card_confirm_stays_on_message_channel() {
+        let (message_tx, mut message_rx) = mpsc::channel(16);
         let (confirm_tx, mut confirm_rx) = mpsc::channel(16);
         let dedup_cache = Arc::new(Mutex::new(HashMap::new()));
 
@@ -1272,15 +1483,36 @@ mod tests {
         let payload = r#"{
             "operator": { "open_id": "ou_actor" },
             "action": { "tag": "button", "value": {"action": "system:system.confirm:callId=call_123,value=approve"} },
+            "token": "tok_card_confirm",
             "open_message_id": "om_1",
             "open_chat_id": "oc_1"
         }"#;
 
         handle_ws_text(payload, "card", &message_tx, &confirm_tx, &dedup_cache).await;
+        handle_ws_text(payload, "card", &message_tx, &confirm_tx, &dedup_cache).await;
 
-        let (call_id, value) = confirm_rx.try_recv().unwrap();
-        assert_eq!(call_id, "call_123");
-        assert_eq!(value, "approve");
+        let message = message_rx.try_recv().unwrap();
+        assert_eq!(
+            message.action.as_ref().map(|action| action.action.as_str()),
+            Some("system.confirm")
+        );
+        assert_eq!(
+            message
+                .action
+                .as_ref()
+                .and_then(|action| action.params.as_ref())
+                .and_then(|params| params.get("callId"))
+                .map(String::as_str),
+            Some("call_123")
+        );
+        assert!(
+            confirm_rx.try_recv().is_err(),
+            "Lark confirmations must not bypass message routing"
+        );
+        assert!(
+            message_rx.try_recv().is_err(),
+            "duplicate card callbacks must not enqueue twice"
+        );
     }
 
     #[tokio::test]

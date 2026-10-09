@@ -2205,6 +2205,7 @@ fn parse_acp_tool_content(update: &Value) -> Vec<crate::event::ToolResultContent
                         };
                         out.push(ToolResultContent::FilePath {
                             path: path.to_string(),
+                            move_path: None,
                             mime: None,
                             old_text: pick("oldText", "old_text"),
                             new_text: pick("newText", "new_text"),
@@ -2225,6 +2226,7 @@ fn parse_acp_tool_content(update: &Value) -> Vec<crate::event::ToolResultContent
                 if !dup {
                     out.push(ToolResultContent::FilePath {
                         path: path.to_string(),
+                        move_path: None,
                         mime: None,
                         old_text: None,
                         new_text: None,
@@ -2605,6 +2607,7 @@ mod tests {
     use super::*;
     use crate::backend::{McpServerSpec, McpTransport};
     use crate::testing::FakeAgentIo;
+    use tokio::sync::broadcast;
 
     /// Verified backend matrix (task-1 brief): ACP MUST NOT advertise
     /// `supports_midturn_delivery` — one `session/prompt` at a time, no

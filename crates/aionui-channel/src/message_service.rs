@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::{AgentStreamEvent, IWorkerTaskManager};
+use aionui_ai_agent::{AgentStreamEvent, AgentStreamReceiver, IWorkerTaskManager};
 use aionui_api_types::{
-    AssistantConversationOverridesRequest, AssistantConversationRequest, ConversationResponse,
+    AssistantConversationOverridesRequest, AssistantConversationRequest, ConfirmRequest, ConversationResponse,
     CreateConversationRequest, SendMessageRequest,
 };
 use aionui_common::{AgentType, ConversationSource};
 use aionui_conversation::ConversationService;
 use aionui_db::models::AssistantSessionRow;
-use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use crate::channel_settings::{ChannelSettingsService, resolved_model_to_provider};
@@ -62,6 +61,33 @@ impl ChannelMessageService {
 
     pub fn runtime_state(&self) -> Arc<aionui_conversation::runtime_state::ConversationRuntimeStateService> {
         self.conversation_svc.runtime_state()
+    }
+
+    /// Deliver a channel-originated tool confirmation through the same
+    /// ConversationService path as the desktop UI.
+    pub async fn confirm(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+        call_id: &str,
+        value: &str,
+    ) -> Result<(), ChannelError> {
+        if call_id.trim().is_empty() {
+            return Err(ChannelError::InvalidConfig(
+                "tool confirmation is missing call_id".into(),
+            ));
+        }
+
+        let option = normalize_confirmation_value(value);
+        let request = ConfirmRequest {
+            msg_id: call_id.to_owned(),
+            data: serde_json::Value::String(option.clone()),
+            always_allow: option == "allow_always",
+        };
+        self.conversation_svc
+            .confirm(owner_user_id, conversation_id, call_id, request, &self.task_manager)
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(format!("tool confirmation failed: {error}")))
     }
 
     /// Sends a text message from a channel user to the AI agent.
@@ -132,7 +158,7 @@ impl ChannelMessageService {
 
         Ok(SendResult {
             conversation_id,
-            stream_rx: Some(stream_rx),
+            stream_rx: Some(AgentStreamReceiver::Broadcast(stream_rx)),
         })
     }
 
@@ -410,6 +436,15 @@ impl ChannelMessageService {
     }
 }
 
+fn normalize_confirmation_value(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "approve" | "approved" | "allow_once" | "yes" | "true" => "allow".into(),
+        "always" | "always_allow" | "allow_always" => "allow_always".into(),
+        "deny" | "denied" | "no" | "false" | "reject" => "reject".into(),
+        other => other.to_owned(),
+    }
+}
+
 /// Result of sending a message to the agent.
 #[derive(Debug)]
 pub struct SendResult {
@@ -417,7 +452,7 @@ pub struct SendResult {
     /// Agent event stream for the ChannelStreamRelay.
     /// `None` when the agent task could not be found after sending
     /// (should not happen in normal flow).
-    pub stream_rx: Option<broadcast::Receiver<AgentStreamEvent>>,
+    pub stream_rx: Option<AgentStreamReceiver>,
 }
 
 /// Actions derived from agent stream events.
@@ -785,6 +820,7 @@ mod tests {
             parent_call_id: None,
             input: None,
             output: None,
+            files: None,
         });
         let action = ChannelMessageService::process_stream_event(&event);
         match action {

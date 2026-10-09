@@ -11,6 +11,62 @@ use crate::models::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, Pai
 /// Object-safe via `async_trait` to support `Arc<dyn IChannelRepository>`.
 #[async_trait::async_trait]
 pub trait IChannelRepository: Send + Sync {
+    /// Atomically claims an incoming platform message for processing.
+    ///
+    /// Returns an owner token only for the first claim of the scoped message id. The
+    /// default keeps lightweight test repositories source-compatible; the
+    /// production SQLite repository overrides it with a durable claim.
+    async fn try_claim_incoming_message(
+        &self,
+        _owner_user_id: &str,
+        _platform_type: &str,
+        _chat_id: &str,
+        _message_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        Err(DbError::Init("incoming message claims are not implemented".into()))
+    }
+
+    /// Mark a claimed incoming message as fully handled. Returns `false` when
+    /// the claim token is no longer current, so a stale worker cannot report
+    /// success for a replacement claim.
+    async fn complete_incoming_message(
+        &self,
+        _owner_user_id: &str,
+        _platform_type: &str,
+        _chat_id: &str,
+        _message_id: &str,
+        _claim_token: &str,
+    ) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
+    /// Extend a processing claim. Returns `false` when the owner token is no
+    /// longer current, so a late worker cannot keep a replaced claim alive.
+    async fn renew_incoming_message(
+        &self,
+        _owner_user_id: &str,
+        _platform_type: &str,
+        _chat_id: &str,
+        _message_id: &str,
+        _claim_token: &str,
+    ) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
+    /// Release a claim after processing failed so a platform retry can be
+    /// accepted. Returns `false` when the claim token is no longer current.
+    async fn release_incoming_message(
+        &self,
+        _owner_user_id: &str,
+        _platform_type: &str,
+        _chat_id: &str,
+        _message_id: &str,
+        _claim_token: &str,
+        _error: Option<&str>,
+    ) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
     // ── Plugin CRUD ──────────────────────────────────────────────────
 
     /// Returns all registered plugins for an owner.

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use aion_agent::bootstrap::AgentBootstrap;
@@ -126,6 +126,13 @@ pub struct AionrsAgentManager {
     cancel_notify: Arc<Notify>,
     /// Signalled after an in-flight turn emits its terminal event.
     turn_finished_notify: Arc<Notify>,
+    /// Turn currently handed to the engine. This is separate from the
+    /// conversation runtime status because the manager is reusable across
+    /// turns and cancellation must not cross that boundary.
+    active_turn_id: Arc<StdMutex<Option<String>>>,
+    /// A cancellation received before `engine.run_with_blocks` starts. The
+    /// request is consumed only by the matching turn.
+    cancel_requested_turn: Arc<StdMutex<Option<String>>>,
 }
 
 impl Drop for AionrsAgentManager {
@@ -138,6 +145,31 @@ impl Drop for AionrsAgentManager {
     }
 }
 
+/// Await one engine turn while keeping cancellation listening continuously.
+///
+/// The cancellation branch must not be conditionally disabled by a separate
+/// flag check: a stop can set that flag after the check but before `Notify`
+/// registers its waiter. A stored `Notify` permit then has nobody to wake,
+/// leaving the engine future pending forever. Stale notifications are cheap;
+/// consume them and continue waiting for this turn's marker.
+async fn await_with_cancel<F, C, T>(future: F, cancel_notify: &Notify, mut is_cancelled: C) -> Result<T, ()>
+where
+    F: Future<Output = T>,
+    C: FnMut() -> bool,
+{
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return Ok(result),
+            _ = cancel_notify.notified() => {
+                if is_cancelled() {
+                    return Err(());
+                }
+            }
+        }
+    }
+}
+
 impl AionrsAgentManager {
     pub async fn new(
         conversation_id: String,
@@ -146,7 +178,7 @@ impl AionrsAgentManager {
         resume_session: Option<Session>,
     ) -> Result<Self, AgentError> {
         let runtime = AgentRuntime::new(conversation_id.clone(), workspace.clone(), 128);
-        let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let sink: Arc<dyn OutputSink> = Arc::new(BackendOutputSink::new(runtime.clone()));
         let runtime_env = config_extra.runtime_env.clone();
         let image_input_override = config_extra.compat_overrides.image_input;
         let image_input_capability = image_input_override.unwrap_or_else(|| {
@@ -271,7 +303,7 @@ impl AionrsAgentManager {
         }
 
         let confirmations = Arc::new(RwLock::new(Vec::new()));
-        let protocol_sink = BackendProtocolSink::new(runtime.event_sender(), confirmations.clone());
+        let protocol_sink = BackendProtocolSink::new(runtime.clone(), confirmations.clone());
         engine.set_approval_manager(approval_manager.clone());
         engine.set_protocol_writer(Arc::new(protocol_sink));
         let slash_commands = engine
@@ -300,29 +332,103 @@ impl AionrsAgentManager {
             final_input_dump,
             cancel_notify: Arc::new(Notify::new()),
             turn_finished_notify: Arc::new(Notify::new()),
+            active_turn_id: Arc::new(StdMutex::new(None)),
+            cancel_requested_turn: Arc::new(StdMutex::new(None)),
         })
     }
 
-    fn request_stop(&self, reason: Option<AgentKillReason>, operation: &'static str) -> bool {
+    fn request_stop(
+        &self,
+        reason: Option<AgentKillReason>,
+        operation: &'static str,
+        requested_turn_id: Option<&str>,
+    ) -> bool {
         let was_running = self.runtime.status() == Some(ConversationStatus::Running);
+        let active_turn_id = self.active_turn_id.lock().ok().and_then(|turn_id| turn_id.clone());
+        let target_turn_id = requested_turn_id.map(str::to_owned).or_else(|| active_turn_id.clone());
+        let matches_active_turn = match (requested_turn_id, active_turn_id.as_deref()) {
+            (Some(requested), Some(active)) => requested == active,
+            (Some(_), None) => self.runtime.status() == Some(ConversationStatus::Pending),
+            (None, _) => true,
+        };
+        let accepted = if was_running {
+            // A process-level kill can arrive during the small window between
+            // the runtime status transition and turn-id registration. It still
+            // has to wake the in-flight engine; requiring an id here made kill
+            // silently return before the turn could observe the stop signal.
+            requested_turn_id.is_none() || matches_active_turn
+        } else {
+            // A turn-scoped cancel before `send_message` registers its active
+            // id is allowed to leave a marker for that exact turn. An idle
+            // manager must not create a stale marker or notification permit.
+            self.runtime.status() == Some(ConversationStatus::Pending)
+                && requested_turn_id.is_some()
+                && matches_active_turn
+        };
 
         if let Ok(mut confs) = self.confirmations.write() {
             confs.clear();
         }
 
-        if was_running {
-            self.cancel_notify.notify_waiters();
+        if accepted {
+            if let Ok(mut pending) = self.cancel_requested_turn.lock() {
+                *pending = target_turn_id.clone();
+            }
+            if was_running {
+                self.cancel_notify.notify_one();
+            }
         }
 
         info!(
             conversation_id = %self.runtime.conversation_id(),
             ?reason,
             was_running,
+            accepted,
+            requested_turn_id,
+            active_turn_id,
             operation,
             "Aionrs stop signal requested"
         );
 
-        was_running
+        was_running && accepted
+    }
+
+    fn set_active_turn(&self, turn_id: &str) {
+        if let Ok(mut active) = self.active_turn_id.lock() {
+            *active = Some(turn_id.to_owned());
+        }
+    }
+
+    fn clear_active_turn(&self, turn_id: &str) {
+        if let Ok(mut active) = self.active_turn_id.lock()
+            && active.as_deref() == Some(turn_id)
+        {
+            *active = None;
+        }
+        if let Ok(mut pending) = self.cancel_requested_turn.lock()
+            && pending.as_deref() == Some(turn_id)
+        {
+            *pending = None;
+        }
+    }
+
+    fn has_cancel_request(&self, turn_id: &str) -> bool {
+        self.cancel_requested_turn
+            .lock()
+            .ok()
+            .and_then(|pending| pending.as_deref().map(|value| value == turn_id))
+            .unwrap_or(false)
+    }
+
+    fn take_cancel_request(&self, turn_id: &str) -> bool {
+        let Ok(mut pending) = self.cancel_requested_turn.lock() else {
+            return false;
+        };
+        if pending.as_deref() != Some(turn_id) {
+            return false;
+        }
+        *pending = None;
+        true
     }
 
     fn dump_aionrs_final_input(&self, data: &SendMessageData) {
@@ -399,6 +505,10 @@ impl IAgentTask for AionrsAgentManager {
     }
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        let turn_anchor = data
+            .turn_id
+            .clone()
+            .unwrap_or_else(|| format!("turn_{}", generate_short_id()));
         let started_at = now_ms();
         info!(
             conversation_id = %self.runtime.conversation_id(),
@@ -406,6 +516,7 @@ impl IAgentTask for AionrsAgentManager {
             turn_id = data.turn_id.as_deref().unwrap_or("none"),
             "Aionrs send_message started"
         );
+        self.set_active_turn(&turn_anchor);
         self.runtime.bump_activity();
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
         self.dump_aionrs_final_input(&data);
@@ -427,27 +538,38 @@ impl IAgentTask for AionrsAgentManager {
         // stream persistence, mirroring the codex reader) AND onto the
         // engine's session messages, so an at-turn fork can cut both at the
         // same point.
-        let turn_anchor = data
-            .turn_id
-            .clone()
-            .unwrap_or_else(|| format!("turn_{}", generate_short_id()));
-        let _ = self
-            .runtime
-            .event_sender()
-            .send(AgentStreamEvent::BackendTurnBound(turn_anchor.clone()));
+        self.runtime
+            .emit(AgentStreamEvent::BackendTurnBound(turn_anchor.clone()));
 
         let mut engine = self.engine.lock().await;
-        engine.set_next_turn_id(Some(turn_anchor));
+        engine.set_next_turn_id(Some(turn_anchor.clone()));
 
-        let result = tokio::select! {
-            res = engine.run_with_blocks(content_blocks, &data.msg_id) => Some(res),
-            _ = self.cancel_notify.notified() => {
-                info!(
-                    conversation_id = %self.runtime.conversation_id(),
-                    "Aionrs engine.run() cancelled by stop signal"
-                );
-                engine.abort_current_turn("Tool execution canceled by user");
-                None
+        let result = if self.take_cancel_request(&turn_anchor) {
+            info!(
+                conversation_id = %self.runtime.conversation_id(),
+                turn_id = %turn_anchor,
+                "Aionrs turn cancelled before engine.run() started"
+            );
+            None
+        } else {
+            match await_with_cancel(
+                engine.run_with_blocks(content_blocks, &data.msg_id),
+                &self.cancel_notify,
+                || self.has_cancel_request(&turn_anchor),
+            )
+            .await
+            {
+                Ok(res) => Some(res),
+                Err(()) => {
+                    info!(
+                        conversation_id = %self.runtime.conversation_id(),
+                        turn_id = %turn_anchor,
+                        "Aionrs engine.run() cancelled by stop signal"
+                    );
+                    self.take_cancel_request(&turn_anchor);
+                    engine.abort_current_turn("Tool execution canceled by user");
+                    None
+                }
             }
         };
 
@@ -495,24 +617,30 @@ impl IAgentTask for AionrsAgentManager {
                 Ok(())
             }
         };
+        self.clear_active_turn(&turn_anchor);
         self.turn_finished_notify.notify_waiters();
         send_result
     }
 
     async fn cancel(&self) -> Result<(), AgentError> {
-        self.request_stop(None, "cancel");
+        self.request_stop(None, "cancel", None);
+        Ok(())
+    }
+
+    async fn cancel_for_turn(&self, turn_id: &str) -> Result<(), AgentError> {
+        self.request_stop(None, "cancel_for_turn", Some(turn_id));
         Ok(())
     }
 
     fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
-        self.request_stop(reason, "kill");
+        self.request_stop(reason, "kill", None);
         Ok(())
     }
 }
 
 impl AionrsAgentManager {
     pub fn kill_and_wait(&self, reason: Option<AgentKillReason>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let was_running = self.request_stop(reason, "kill");
+        let was_running = self.request_stop(reason, "kill", None);
         let turn_finished_notify = Arc::clone(&self.turn_finished_notify);
         let runtime = self.runtime.clone();
         let conversation_id = self.runtime.conversation_id().to_owned();

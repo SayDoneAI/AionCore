@@ -98,10 +98,7 @@ impl PermissionRouter {
                     "ACP permission pending confirmation registered"
                 );
 
-                if runtime
-                    .event_sender()
-                    .send(AgentStreamEvent::AcpPermission(permission_event))
-                    .is_err()
+                if !runtime.emit(AgentStreamEvent::AcpPermission(permission_event))
                     && let Some(pending) = this.pending_permissions.lock().unwrap().remove(&call_id)
                 {
                     let _ = pending.responder.send(PermissionDecision::Cancelled);

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aionui_ai_agent::AgentStreamEvent;
+use aionui_ai_agent::{AgentStreamEvent, AgentStreamReceiver};
 use aionui_conversation::runtime_state::ConversationRuntimeStateService;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -73,8 +73,7 @@ pub trait ChannelSender: Send + Sync {
 /// Relays agent stream events to an IM platform.
 ///
 /// Responsibilities:
-/// - Send "Thinking..." placeholder on start
-/// - Accumulate text, throttled editMessage every N ms
+/// - Send a "Thinking..." placeholder and update it for editable platforms
 /// - Send final message with action buttons on Finish
 /// - Send error message on Error
 pub struct ChannelStreamRelay {
@@ -112,17 +111,14 @@ impl ChannelStreamRelay {
         self
     }
 
-    async fn next_continuation_event(
-        &self,
-        rx: &mut broadcast::Receiver<AgentStreamEvent>,
-    ) -> Option<AgentStreamEvent> {
+    async fn next_continuation_event(&self, rx: &mut AgentStreamReceiver) -> Option<AgentStreamEvent> {
         let runtime_state = self.runtime_state.as_ref()?;
         loop {
             match rx.try_recv() {
                 Ok(event) => return Some(event),
                 Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                     warn!(skipped, "channel stream relay lagged while awaiting continuation");
-                    continue;
+                    return None;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => return None,
                 Err(broadcast::error::TryRecvError::Empty) => {}
@@ -133,6 +129,7 @@ impl ChannelStreamRelay {
                     Ok(event) => return Some(event),
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "channel stream relay lagged while awaiting continuation");
+                        return None;
                     }
                     Err(broadcast::error::RecvError::Closed) => return None,
                 }
@@ -141,7 +138,11 @@ impl ChannelStreamRelay {
     }
 
     /// Run the relay loop until the agent stream ends.
-    pub async fn run(self, rx: broadcast::Receiver<AgentStreamEvent>) {
+    pub async fn run<R>(self, rx: R)
+    where
+        R: Into<AgentStreamReceiver>,
+    {
+        let rx = rx.into();
         if is_weixin_platform(self.config.platform) {
             self.run_weixin(rx).await;
         } else {
@@ -149,8 +150,9 @@ impl ChannelStreamRelay {
         }
     }
 
-    /// WeChat-specific relay: no edit support, accumulate text then send once.
-    async fn run_weixin(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
+    /// WeChat-specific relay: accumulate text because the platform does not
+    /// support editing messages in place, marking intermediate replies.
+    async fn run_weixin(self, mut rx: AgentStreamReceiver) {
         let mut text_buffer = String::new();
         let mut has_content = false;
         let mut pending_event = None;
@@ -209,6 +211,7 @@ impl ChannelStreamRelay {
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(lagged = n, "channel stream relay lagged (weixin)");
+                    break;
                 }
             }
         }
@@ -221,7 +224,7 @@ impl ChannelStreamRelay {
     }
 
     /// Standard relay for platforms that support edit (Telegram, Lark, DingTalk).
-    async fn run_editable(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
+    async fn run_editable(self, mut rx: AgentStreamReceiver) {
         let throttle = Duration::from_millis(self.config.throttle_ms);
 
         let thinking_msg = ChannelMessageService::build_thinking_message();
@@ -354,6 +357,8 @@ impl ChannelStreamRelay {
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(lagged = n, "channel stream relay lagged");
+                    self.send_final_edit(&text_buffer, has_content, &thinking_msg_id).await;
+                    break;
                 }
             }
         }

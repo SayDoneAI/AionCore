@@ -292,6 +292,38 @@ async fn aionrs_agent_kill_running_turn_sends_stop_signal() {
 }
 
 #[tokio::test]
+async fn aionrs_cancel_signal_arriving_before_wait_is_not_lost() {
+    let notify = tokio::sync::Notify::new();
+    let requested = std::sync::Arc::new(std::sync::Mutex::new(true));
+
+    // This is the timing window that the old guarded select had: the stop
+    // marker and Notify permit can both arrive before the engine future is
+    // first polled. A pending engine must still be interrupted.
+    notify.notify_one();
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(50),
+        await_with_cancel(std::future::pending::<()>(), &notify, {
+            let requested = std::sync::Arc::clone(&requested);
+            move || {
+                let Ok(mut requested) = requested.lock() else {
+                    return false;
+                };
+                if !*requested {
+                    return false;
+                }
+                *requested = false;
+                true
+            }
+        }),
+    )
+    .await
+    .expect("a pre-registered stop must wake the pending engine");
+
+    assert!(result.is_err(), "the pending engine should be cancelled");
+}
+
+#[tokio::test]
 async fn aionrs_agent_kill_and_wait_waits_for_running_turn_terminal() {
     let agent = AionrsAgentManager::new("conv-1".into(), "/project".into(), make_test_config(), None)
         .await
@@ -369,6 +401,35 @@ async fn stop_only_signals_in_flight_run() {
     assert_eq!(agent.status(), Some(ConversationStatus::Pending));
     assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     assert_no_stop_signal(&agent).await;
+}
+
+#[tokio::test]
+async fn cancel_for_pending_turn_is_consumed_before_engine_starts() {
+    let agent = AionrsAgentManager::new("conv-pending-stop".into(), "/project".into(), make_test_config(), None)
+        .await
+        .unwrap();
+    let mut rx = agent.subscribe();
+
+    agent.cancel_for_turn("turn-pending").await.unwrap();
+    agent
+        .send_message(SendMessageData {
+            content: "this turn must not reach the provider".into(),
+            msg_id: "msg-pending".into(),
+            turn_id: Some("turn-pending".into()),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(agent.status(), Some(ConversationStatus::Finished));
+    let mut saw_finish = false;
+    while let Ok(event) = rx.try_recv() {
+        if matches!(event, AgentStreamEvent::Finish(_)) {
+            saw_finish = true;
+        }
+    }
+    assert!(saw_finish, "pending cancellation must settle the subscribed turn");
 }
 
 #[tokio::test]

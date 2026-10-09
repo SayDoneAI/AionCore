@@ -1,18 +1,18 @@
 use aion_agent::output::OutputSink;
-use tokio::sync::broadcast;
 
+use crate::agent_runtime::AgentRuntime;
 use crate::protocol::events::{
     AgentStreamEvent, ErrorEventData, FinishEventData, StartEventData, TextEventData, ThinkingEventData, TipType,
     TipsEventData, ToolCallEventData, ToolCallStatus,
 };
 
 pub struct BackendOutputSink {
-    event_tx: broadcast::Sender<AgentStreamEvent>,
+    runtime: AgentRuntime,
 }
 
 impl BackendOutputSink {
-    pub fn new(event_tx: broadcast::Sender<AgentStreamEvent>) -> Self {
-        Self { event_tx }
+    pub fn new(runtime: AgentRuntime) -> Self {
+        Self { runtime }
     }
 
     fn internal_call_id(tool_use_id: &str) -> Option<String> {
@@ -27,13 +27,13 @@ impl BackendOutputSink {
 
 impl OutputSink for BackendOutputSink {
     fn emit_text_delta(&self, text: &str, _msg_id: &str) {
-        let _ = self.event_tx.send(AgentStreamEvent::Text(TextEventData {
+        self.runtime.emit(AgentStreamEvent::Text(TextEventData {
             content: text.to_owned(),
         }));
     }
 
     fn emit_thinking(&self, text: &str, _msg_id: &str) {
-        let _ = self.event_tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
+        self.runtime.emit(AgentStreamEvent::Thinking(ThinkingEventData {
             content: text.to_owned(),
             subject: None,
             duration: None,
@@ -68,7 +68,7 @@ impl OutputSink for BackendOutputSink {
             "Emitting aionrs tool_call event"
         );
 
-        let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+        self.runtime.emit(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id,
             name: name.to_owned(),
             args: parsed_input.clone(),
@@ -77,6 +77,7 @@ impl OutputSink for BackendOutputSink {
             output: None,
             description: None,
             parent_call_id: None,
+            files: None,
         }));
     }
 
@@ -104,7 +105,7 @@ impl OutputSink for BackendOutputSink {
             "Emitting aionrs tool_result event"
         );
 
-        let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+        self.runtime.emit(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id,
             name: name.to_owned(),
             args: serde_json::Value::Null,
@@ -117,13 +118,13 @@ impl OutputSink for BackendOutputSink {
             },
             description: None,
             parent_call_id: None,
+            files: None,
         }));
     }
 
     fn emit_stream_start(&self, _msg_id: &str) {
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Start(StartEventData { session_id: None }));
+        self.runtime
+            .emit(AgentStreamEvent::Start(StartEventData { session_id: None }));
     }
 
     fn emit_stream_end(
@@ -135,19 +136,17 @@ impl OutputSink for BackendOutputSink {
         _cache_creation_tokens: u64,
         _cache_read_tokens: u64,
     ) {
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
+        self.runtime
+            .emit(AgentStreamEvent::Finish(FinishEventData { session_id: None }));
     }
 
     fn emit_error(&self, msg: &str) {
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Error(ErrorEventData::legacy(msg, None)));
+        self.runtime
+            .emit(AgentStreamEvent::Error(ErrorEventData::legacy(msg, None)));
     }
 
     fn emit_info(&self, msg: &str) {
-        let _ = self.event_tx.send(AgentStreamEvent::Tips(TipsEventData {
+        self.runtime.emit(AgentStreamEvent::Tips(TipsEventData {
             content: msg.to_owned(),
             tip_type: TipType::Success,
             code: None,
@@ -161,9 +160,10 @@ impl OutputSink for BackendOutputSink {
 mod tests {
     use super::*;
 
-    fn make_sink() -> (BackendOutputSink, broadcast::Receiver<AgentStreamEvent>) {
-        let (tx, rx) = broadcast::channel(16);
-        (BackendOutputSink::new(tx), rx)
+    fn make_sink() -> (BackendOutputSink, tokio::sync::broadcast::Receiver<AgentStreamEvent>) {
+        let runtime = AgentRuntime::new("conv-test", "/tmp", 16);
+        let rx = runtime.subscribe();
+        (BackendOutputSink::new(runtime), rx)
     }
 
     #[test]
@@ -372,8 +372,7 @@ mod tests {
 
     #[test]
     fn no_panic_when_no_receivers() {
-        let (tx, _) = broadcast::channel(16);
-        let sink = BackendOutputSink::new(tx);
+        let sink = BackendOutputSink::new(AgentRuntime::new("conv-test", "/tmp", 16));
         sink.emit_text_delta("hello", "msg-1");
         sink.emit_thinking("thought", "msg-1");
         sink.emit_tool_call("call_read_1", "Read", "{}");

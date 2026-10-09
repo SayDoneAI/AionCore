@@ -42,7 +42,7 @@ use agent_client_protocol::{
 use aionui_common::ErrorChain;
 use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 use tracing::{debug, info, warn};
 
@@ -177,7 +177,7 @@ impl AcpProtocol {
     pub async fn connect(
         stdin: ChildStdin,
         stdout: ChildStdout,
-        event_tx: broadcast::Sender<AgentStreamEvent>,
+        runtime: crate::agent_runtime::AgentRuntime,
         permission_tx: mpsc::Sender<PermissionRequest>,
         notification_tx: mpsc::Sender<SessionNotification>,
         terminal_label: &str,
@@ -204,7 +204,7 @@ impl AcpProtocol {
         tokio::spawn(run_sdk_background(
             stdin,
             stdout,
-            event_tx,
+            runtime,
             permission_tx,
             notification_tx,
             init_tx,
@@ -610,7 +610,7 @@ impl Drop for ReplaySuppressionGuard<'_> {
 async fn run_sdk_background(
     stdin: ChildStdin,
     stdout: ChildStdout,
-    event_tx: broadcast::Sender<AgentStreamEvent>,
+    runtime: crate::agent_runtime::AgentRuntime,
     permission_tx: mpsc::Sender<PermissionRequest>,
     notification_tx: mpsc::Sender<SessionNotification>,
     init_tx: oneshot::Sender<Result<InitializeResponse, AcpError>>,
@@ -629,21 +629,18 @@ async fn run_sdk_background(
     // `ByteStreams` (which internally splits stdout on `\n` and appends `\n` on
     // writes). Only the two recognised shapes are absorbed; every other line,
     // including genuinely malformed input, is forwarded unchanged.
-    let dialect_event_tx = event_tx.clone();
+    let dialect_runtime = runtime.clone();
     let incoming = FramedRead::new(stdout, LinesCodec::new())
         .map_err(std::io::Error::other)
         .filter_map(move |line: std::io::Result<String>| {
-            let dialect_event_tx = dialect_event_tx.clone();
+            let dialect_runtime = dialect_runtime.clone();
             async move {
                 match line {
                     Ok(line) => match acp_dialect::classify_incoming_line(&line) {
                         acp_dialect::LineDisposition::Forward(line) => Some(Ok(line)),
                         acp_dialect::LineDisposition::Absorb(kind) => {
                             log_acp_dialect_absorbed(kind, &line);
-                            // `broadcast::send` is synchronous and non-blocking; a
-                            // send error only means no active subscriber for this
-                            // turn (nothing to correlate against), which is fine.
-                            let _ = dialect_event_tx.send(AgentStreamEvent::AcpDialectSignal(
+                            dialect_runtime.emit(AgentStreamEvent::AcpDialectSignal(
                                 stream_event::AcpDialectSignalData { kind },
                             ));
                             None
@@ -671,7 +668,7 @@ async fn run_sdk_background(
         .builder()
         .on_receive_notification(
             {
-                let event_tx = event_tx.clone();
+                let runtime = runtime.clone();
                 let notification_tx = notification_tx.clone();
                 let replay_suppression = Arc::clone(&replay_suppression);
                 async move |notification: SessionNotification, _cx: ConnectionTo<Agent>| {
@@ -689,7 +686,7 @@ async fn run_sdk_background(
                     // notification_tx (event_tracker still needs metadata like
                     // available_commands_update), but skip the UI broadcast.
                     if !replay_suppression.load(Ordering::Acquire) {
-                        handle_session_notification(notification, &event_tx).await;
+                        handle_session_notification(notification, &runtime).await;
                     }
                     Ok(())
                 }
@@ -708,9 +705,9 @@ async fn run_sdk_background(
         .on_receive_request(
             {
                 let registry = Arc::clone(&terminal_registry);
-                let event_tx = event_tx.clone();
+                let runtime = runtime.clone();
                 async move |request: CreateTerminalRequest, responder, _cx| {
-                    handle_terminal_create(request, responder, &registry, &event_tx).await;
+                    handle_terminal_create(request, responder, &registry, &runtime).await;
                     Ok(())
                 }
             },
@@ -729,9 +726,9 @@ async fn run_sdk_background(
         .on_receive_request(
             {
                 let registry = Arc::clone(&terminal_registry);
-                let event_tx = event_tx.clone();
+                let runtime = runtime.clone();
                 async move |request: WaitForTerminalExitRequest, responder, _cx| {
-                    handle_terminal_wait(request, responder, &registry, &event_tx).await;
+                    handle_terminal_wait(request, responder, &registry, &runtime).await;
                     Ok(())
                 }
             },
@@ -813,20 +810,12 @@ async fn run_sdk_background(
 }
 
 /// Fan out a CLI session notification to the event broadcast channel.
-async fn handle_session_notification(
-    notification: SessionNotification,
-    event_tx: &broadcast::Sender<AgentStreamEvent>,
-) {
+async fn handle_session_notification(notification: SessionNotification, runtime: &crate::agent_runtime::AgentRuntime) {
     log_agent_notify("session/update", &json_str(&notification));
 
     let events = stream_event::session_notification_to_events(&notification);
     for event in events {
-        if let Err(e) = event_tx.send(event) {
-            // broadcast::SendError means no active receivers — expected when
-            // no subscribers are attached to this agent. Log at debug so it
-            // doesn't spam after a turn finishes.
-            debug!(error = %e, "Dropping ACP event: no active broadcast receivers");
-        }
+        runtime.emit(event);
     }
 }
 
@@ -874,14 +863,14 @@ fn wire_exit_status(exit: crate::terminal::TerminalExit) -> TerminalExitStatus {
 async fn emit_terminal_snapshot(
     registry: &crate::terminal::TerminalRegistry,
     terminal_id: &str,
-    event_tx: &broadcast::Sender<AgentStreamEvent>,
+    runtime: &crate::agent_runtime::AgentRuntime,
 ) -> bool {
     let Some(snap) = registry.output(terminal_id).await else {
         return false;
     };
     let command = registry.command_line(terminal_id).await.unwrap_or_default();
     let done = snap.exit.is_some();
-    let _ = event_tx.send(AgentStreamEvent::AcpTerminalOutput(serde_json::json!({
+    runtime.emit(AgentStreamEvent::AcpTerminalOutput(serde_json::json!({
         "terminal_id": terminal_id,
         "command": command,
         "output": snap.output,
@@ -898,7 +887,7 @@ async fn handle_terminal_create(
     request: CreateTerminalRequest,
     responder: Responder<CreateTerminalResponse>,
     registry: &Arc<crate::terminal::TerminalRegistry>,
-    event_tx: &broadcast::Sender<AgentStreamEvent>,
+    runtime: &crate::agent_runtime::AgentRuntime,
 ) {
     log_agent_request("terminal/create", &json_str(&request));
     let params = crate::terminal::CreateTerminalParams {
@@ -914,11 +903,11 @@ async fn handle_terminal_create(
             // The agent-side contract stays pull-based (`terminal/output`);
             // this task only feeds our own frontend.
             let poll_registry = Arc::clone(registry);
-            let poll_event_tx = event_tx.clone();
+            let poll_runtime = runtime.clone();
             let poll_id = terminal_id.clone();
             tokio::spawn(async move {
                 loop {
-                    let done = emit_terminal_snapshot(&poll_registry, &poll_id, &poll_event_tx).await;
+                    let done = emit_terminal_snapshot(&poll_registry, &poll_id, &poll_runtime).await;
                     if done {
                         break;
                     }
@@ -957,14 +946,14 @@ async fn handle_terminal_wait(
     request: WaitForTerminalExitRequest,
     responder: Responder<WaitForTerminalExitResponse>,
     registry: &Arc<crate::terminal::TerminalRegistry>,
-    event_tx: &broadcast::Sender<AgentStreamEvent>,
+    runtime: &crate::agent_runtime::AgentRuntime,
 ) {
     let terminal_id = request.terminal_id.to_string();
     match registry.wait_for_exit(&terminal_id).await {
         Some(exit) => {
             // Make sure the UI sees the terminal frame even if the poller
             // lost a race with process exit.
-            emit_terminal_snapshot(registry, &terminal_id, event_tx).await;
+            emit_terminal_snapshot(registry, &terminal_id, runtime).await;
             let response = WaitForTerminalExitResponse::new(wire_exit_status(exit));
             let _ = responder.respond(response);
         }

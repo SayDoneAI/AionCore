@@ -3389,6 +3389,7 @@ mod tests {
     use crate::backend::{McpServerSpec, McpTransport, SessionInit};
     use crate::testing::FakeAgentIo;
     use futures_util::StreamExt;
+    use tokio::sync::broadcast;
 
     /// The seam MUST hand claude a bare valid UUID for `--session-id`/`--resume`
     /// (a non-UUID makes claude exit 1 "Invalid session ID"). A prefixed logical

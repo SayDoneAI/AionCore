@@ -13,7 +13,7 @@
 //!   so the View Steps spinner never stopped after a reload.
 //!
 //! One watcher per live Session instance closes both gaps. It subscribes to the
-//! instance's broadcast channel permanently and acts ONLY while no user turn is
+//! instance's broadcast stream permanently and acts ONLY while no user turn is
 //! active (the per-turn relay owns everything else):
 //!
 //! - `WorkflowProgress` → forwarded + persisted inline (a card refresh is not a
@@ -25,13 +25,14 @@
 
 use std::sync::Arc;
 
+use aionui_ai_agent::AgentStreamReceiver;
 use aionui_ai_agent::protocol::events::MessageLifecyclePhase;
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, WorkflowProgressData};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case};
 use aionui_db::IConversationRepository;
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
@@ -44,6 +45,7 @@ use crate::stream_relay::StreamRelay;
 /// content frame with no terminal); the feeder closes and the relay finalizes
 /// with what it has, so the watcher can never be wedged forever.
 const ORPHAN_TURN_IDLE_MS: u64 = 180_000;
+const ORPHAN_FEED_CAPACITY: usize = 4096;
 
 /// How long a `MessageLifecycle{Started}` echo stays armed as "the next
 /// agent-started turn serves a user message" before it is presumed lost.
@@ -101,7 +103,11 @@ impl BackgroundStreamWatcher {
         // everything once a turn is open.
     }
 
-    pub async fn run(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
+    pub async fn run<R>(self, rx: R)
+    where
+        R: Into<AgentStreamReceiver>,
+    {
+        let mut rx = rx.into();
         info!(
             conversation_id = %self.conversation_id,
             "background stream watcher started"
@@ -122,7 +128,7 @@ impl BackgroundStreamWatcher {
                         lagged = n,
                         "background stream watcher lagged; frames dropped"
                     );
-                    continue;
+                    break;
                 }
                 // Instance torn down (conversation deleted / process replaced).
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -351,7 +357,7 @@ impl BackgroundStreamWatcher {
     async fn run_orphan_turn(
         &self,
         first: AgentStreamEvent,
-        rx: &mut broadcast::Receiver<AgentStreamEvent>,
+        rx: &mut AgentStreamReceiver,
         serving_client_msg_id: Option<String>,
     ) {
         let msg_id = ConversationService::mint_msg_id();
@@ -386,9 +392,11 @@ impl BackgroundStreamWatcher {
         .with_runtime_state(Arc::clone(&self.runtime_state))
         .with_persistence(self.persistence.clone());
 
-        let (feed_tx, feed_rx) = broadcast::channel::<AgentStreamEvent>(256);
-        let mut relay_task = tokio::spawn(relay.consume(feed_rx));
-        let _ = feed_tx.send(first);
+        let (feed_tx, feed_rx) = mpsc::channel::<AgentStreamEvent>(ORPHAN_FEED_CAPACITY);
+        let mut relay_task = tokio::spawn(relay.consume(AgentStreamReceiver::from(feed_rx)));
+        if feed_tx.send(first).await.is_err() {
+            return;
+        }
 
         let idle = std::time::Duration::from_millis(ORPHAN_TURN_IDLE_MS);
         let outcome = loop {
@@ -413,7 +421,9 @@ impl BackgroundStreamWatcher {
                             drop(feed_tx);
                             break relay_task.await;
                         }
-                        let _ = feed_tx.send(ev);
+                        if feed_tx.send(ev).await.is_err() {
+                            break relay_task.await;
+                        }
                     }
                     // Source closed (instance torn down) or idle too long: close
                     // the feed so the relay finalizes with what it has.
@@ -423,7 +433,8 @@ impl BackgroundStreamWatcher {
                     }
                     Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
                         warn!(lagged = n, "background stream: orphan turn feed lagged");
-                        continue;
+                        drop(feed_tx);
+                        break relay_task.await;
                     }
                 },
             }
@@ -584,6 +595,7 @@ mod tests {
                 output: None,
                 description: Some("sleep 30 · bg task b1 · 00:01".into()),
                 parent_call_id: None,
+                files: None,
             },
             agents: vec![],
             settle_only: false,
@@ -601,6 +613,7 @@ mod tests {
                 output: None,
                 description: Some("sleep 30 · bg task b1 · 00:30".into()),
                 parent_call_id: None,
+                files: None,
             },
             agents: vec![ToolGroupEntry {
                 call_id: "toolu_bg:1".into(),
@@ -720,6 +733,7 @@ mod tests {
                     output: None,
                     description: None,
                     parent_call_id: None,
+                    files: None,
                 },
                 agents: vec![],
                 settle_only: true,
@@ -737,6 +751,7 @@ mod tests {
                     output: None,
                     description: None,
                     parent_call_id: None,
+                    files: None,
                 },
                 agents: vec![],
                 settle_only: true,

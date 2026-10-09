@@ -270,7 +270,7 @@ async fn spawn_and_connect_acp_once(
     let connect_fut = AcpProtocol::connect(
         stdin,
         stdout,
-        runtime.event_sender(),
+        runtime.clone(),
         permission_tx,
         notification_tx,
         &params.conversation_id,

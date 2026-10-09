@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use aionui_common::{AgentKillReason, AgentType, ConversationStatus, TimestampMs};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::error::AgentError;
 use crate::manager::acp::{AcpAgentManager, RequiredFullAutoApplication};
@@ -30,6 +30,46 @@ use aionui_api_types::{
 
 #[cfg(any(test, feature = "test-support"))]
 use aionui_common::Confirmation;
+
+/// A stream receiver shared by relays that may consume either an agent's
+/// broadcast stream or a bounded local feeder.
+#[derive(Debug)]
+pub enum AgentStreamReceiver {
+    Broadcast(broadcast::Receiver<AgentStreamEvent>),
+    Bounded(mpsc::Receiver<AgentStreamEvent>),
+}
+
+impl From<broadcast::Receiver<AgentStreamEvent>> for AgentStreamReceiver {
+    fn from(receiver: broadcast::Receiver<AgentStreamEvent>) -> Self {
+        Self::Broadcast(receiver)
+    }
+}
+
+impl From<mpsc::Receiver<AgentStreamEvent>> for AgentStreamReceiver {
+    fn from(receiver: mpsc::Receiver<AgentStreamEvent>) -> Self {
+        Self::Bounded(receiver)
+    }
+}
+
+impl AgentStreamReceiver {
+    pub async fn recv(&mut self) -> Result<AgentStreamEvent, broadcast::error::RecvError> {
+        match self {
+            Self::Broadcast(receiver) => receiver.recv().await,
+            Self::Bounded(receiver) => receiver.recv().await.ok_or(broadcast::error::RecvError::Closed),
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Result<AgentStreamEvent, broadcast::error::TryRecvError> {
+        match self {
+            Self::Broadcast(receiver) => receiver.try_recv(),
+            Self::Bounded(receiver) => match receiver.try_recv() {
+                Ok(event) => Ok(event),
+                Err(mpsc::error::TryRecvError::Empty) => Err(broadcast::error::TryRecvError::Empty),
+                Err(mpsc::error::TryRecvError::Disconnected) => Err(broadcast::error::TryRecvError::Closed),
+            },
+        }
+    }
+}
 
 /// Ten-method public surface every agent type implements identically.
 ///
@@ -91,6 +131,13 @@ pub trait IAgentTask: Send + Sync {
 
     /// Stop the current streaming response without killing the agent.
     async fn cancel(&self) -> Result<(), AgentError>;
+
+    /// Stop the requested turn without allowing a late cancel to affect a
+    /// subsequent turn on a reusable agent. Backends that do not need a
+    /// separate turn token retain the historical cancellation behavior.
+    async fn cancel_for_turn(&self, _turn_id: &str) -> Result<(), AgentError> {
+        self.cancel().await
+    }
 
     /// Terminate the agent process.
     ///
@@ -295,6 +342,11 @@ impl AgentInstance {
     /// Cancel the current streaming response without killing the agent.
     pub async fn cancel(&self) -> Result<(), AgentError> {
         self.as_task().cancel().await
+    }
+
+    /// Cancel one specific active turn.
+    pub async fn cancel_for_turn(&self, turn_id: &str) -> Result<(), AgentError> {
+        self.as_task().cancel_for_turn(turn_id).await
     }
 
     /// Terminate the agent process.

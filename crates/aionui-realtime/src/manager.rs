@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use aionui_api_types::WebSocketMessage;
 use dashmap::DashMap;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -40,12 +40,29 @@ impl WebSocketManager {
 
     /// Register a new authenticated client connection for an internal user ID.
     pub fn add_client_for_user(&self, user_id: String, token: String, tx: mpsc::Sender<WsOutbound>) -> ConnectionId {
+        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        self.add_client_for_user_with_disconnect(user_id, token, tx, disconnect_tx)
+    }
+
+    /// Register a client with an explicit manager-side disconnect signal.
+    ///
+    /// The WebSocket handler keeps a receiver for this signal so manager-side
+    /// removal (backpressure, heartbeat expiry, auth revocation, or resync)
+    /// also terminates the receive loop and reaches the browser.
+    pub fn add_client_for_user_with_disconnect(
+        &self,
+        user_id: String,
+        token: String,
+        tx: mpsc::Sender<WsOutbound>,
+        disconnect_tx: watch::Sender<bool>,
+    ) -> ConnectionId {
         let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let info = ClientInfo {
             user_id,
             token,
             last_ping: Instant::now(),
             tx,
+            disconnect_tx,
         };
         self.connections.insert(id, info);
         debug!(%id, "client added");
@@ -54,7 +71,8 @@ impl WebSocketManager {
 
     /// Remove a client connection by ID.
     pub fn remove_client(&self, conn_id: ConnectionId) {
-        if self.connections.remove(&conn_id).is_some() {
+        if let Some((_, client)) = self.connections.remove(&conn_id) {
+            let _ = client.disconnect_tx.send(true);
             debug!(%conn_id, "client removed");
         }
     }
@@ -122,6 +140,20 @@ impl WebSocketManager {
         removed
     }
 
+    /// Remove every active connection so clients reconnect and reload state
+    /// after an ordered event stream loses its delivery window.
+    pub fn disconnect_all(&self, reason: &str) -> usize {
+        let connection_ids = self.connections.iter().map(|entry| *entry.key()).collect::<Vec<_>>();
+        let removed = connection_ids.len();
+        for conn_id in connection_ids {
+            self.remove_client(conn_id);
+        }
+        if removed > 0 {
+            warn!(removed, reason, "websocket connections disconnected for resync");
+        }
+        removed
+    }
+
     /// Send a message to all connected clients.
     ///
     /// Uses `try_send` for backpressure. A saturated channel cannot reliably
@@ -157,6 +189,16 @@ impl WebSocketManager {
 
         for conn_id in disconnected {
             self.remove_client(conn_id);
+        }
+    }
+
+    /// Send an ordered global event to every connection. A saturated or closed
+    /// connection is removed so the next client connection can resynchronize
+    /// instead of silently continuing with a missing frame.
+    pub fn broadcast_all_or_disconnect(&self, msg: WebSocketMessage<serde_json::Value>) {
+        let connection_ids = self.connections.iter().map(|entry| *entry.key()).collect::<Vec<_>>();
+        for conn_id in connection_ids {
+            self.send_to_or_disconnect(conn_id, msg.clone());
         }
     }
 
@@ -196,6 +238,24 @@ impl WebSocketManager {
 
         for conn_id in disconnected {
             self.remove_client(conn_id);
+        }
+    }
+
+    /// Send an ordered event to every connection for a user.
+    ///
+    /// A full per-connection queue means that connection can no longer apply
+    /// an ordered stream safely. Close it so the client reconnects and
+    /// re-synchronizes instead of silently continuing with a missing frame.
+    pub fn broadcast_to_user_or_disconnect(&self, user_id: &str, msg: WebSocketMessage<serde_json::Value>) {
+        let connection_ids = self
+            .connections
+            .iter()
+            .filter(|entry| entry.value().user_id == user_id)
+            .map(|entry| *entry.key())
+            .collect::<Vec<_>>();
+
+        for conn_id in connection_ids {
+            self.send_to_or_disconnect(conn_id, msg.clone());
         }
     }
 
@@ -317,7 +377,7 @@ impl EventBroadcaster for WebSocketManager {
             );
             return;
         };
-        self.broadcast_to_user(&user_id, event);
+        self.broadcast_to_user_or_disconnect(&user_id, event);
     }
 }
 
@@ -382,8 +442,10 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
     }
 
     for conn_id in to_remove {
-        connections.remove(&conn_id);
-        debug!(%conn_id, "connection removed by heartbeat");
+        if let Some((_, client)) = connections.remove(&conn_id) {
+            let _ = client.disconnect_tx.send(true);
+            debug!(%conn_id, "connection removed by heartbeat");
+        }
     }
 }
 
@@ -532,6 +594,19 @@ mod tests {
         assert!(rx1.try_recv().is_ok());
         assert!(rx2.try_recv().is_err());
         assert!(rx3.try_recv().is_ok());
+    }
+
+    #[test]
+    fn ordered_user_broadcast_disconnects_saturated_connections() {
+        let mgr = WebSocketManager::new();
+        let (tx, _rx) = mpsc::channel(1);
+        mgr.add_client_for_user("user-a".into(), "token".into(), tx);
+
+        mgr.broadcast_to_user_or_disconnect("user-a", WebSocketMessage::new("stream", json!({"seq": 1})));
+        assert_eq!(mgr.client_count_for_user("user-a"), 1);
+
+        mgr.broadcast_to_user_or_disconnect("user-a", WebSocketMessage::new("stream", json!({"seq": 2})));
+        assert_eq!(mgr.client_count_for_user("user-a"), 0);
     }
 
     #[test]
@@ -700,6 +775,7 @@ mod tests {
                 token: "valid".into(),
                 last_ping: Instant::now(),
                 tx,
+                disconnect_tx: watch::channel(false).0,
             },
         );
 
@@ -735,6 +811,7 @@ mod tests {
                 token: "valid".into(),
                 last_ping: old_ping,
                 tx,
+                disconnect_tx: watch::channel(false).0,
             },
         );
 
@@ -767,6 +844,7 @@ mod tests {
                 token: "expired-token".into(),
                 last_ping: Instant::now(),
                 tx,
+                disconnect_tx: watch::channel(false).0,
             },
         );
 
@@ -801,6 +879,7 @@ mod tests {
                 token: "expired-token".into(),
                 last_ping: Instant::now(),
                 tx,
+                disconnect_tx: watch::channel(false).0,
             },
         );
 
@@ -825,6 +904,7 @@ mod tests {
                 token: "expired".into(),
                 last_ping: old_ping,
                 tx,
+                disconnect_tx: watch::channel(false).0,
             },
         );
 
@@ -859,6 +939,7 @@ mod tests {
                 token: "good".into(),
                 last_ping: Instant::now(),
                 tx: tx1,
+                disconnect_tx: watch::channel(false).0,
             },
         );
 
@@ -871,6 +952,7 @@ mod tests {
                 token: "good".into(),
                 last_ping: Instant::now() - (HEARTBEAT_TIMEOUT * 2),
                 tx: tx2,
+                disconnect_tx: watch::channel(false).0,
             },
         );
 

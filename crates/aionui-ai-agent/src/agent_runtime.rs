@@ -67,15 +67,6 @@ impl AgentRuntime {
         self.event_tx.subscribe()
     }
 
-    /// Crate-private accessor for the broadcast sender, exposed so
-    /// managers can clone it where a `broadcast::Sender<..>` clone is
-    /// needed directly (e.g. passing into an SDK builder). Prefer
-    /// `emit` / `emit_finish` / `emit_error` for event emission.
-    #[allow(dead_code)]
-    pub(crate) fn event_sender(&self) -> broadcast::Sender<AgentStreamEvent> {
-        self.event_tx.clone()
-    }
-
     // ── Write (see target §6.4 SM1 "single-writer" invariant) ───────────
 
     pub fn bump_activity(&self) {
@@ -102,8 +93,8 @@ impl AgentRuntime {
         *guard = Some(status);
     }
 
-    pub fn emit(&self, event: AgentStreamEvent) {
-        let _ = self.event_tx.send(event);
+    pub fn emit(&self, event: AgentStreamEvent) -> bool {
+        self.event_tx.send(event).is_ok()
     }
 
     /// Atomic: set status ← Finished AND broadcast `Finish(session_id)`.
@@ -120,9 +111,7 @@ impl AgentRuntime {
         if already_finished {
             return;
         }
-        let _ = self
-            .event_tx
-            .send(AgentStreamEvent::Finish(FinishEventData { session_id }));
+        let _ = self.emit(AgentStreamEvent::Finish(FinishEventData { session_id }));
     }
 
     /// Atomic: set status ← Finished AND broadcast `Error { message }`.
@@ -145,7 +134,7 @@ impl AgentRuntime {
         if already_finished {
             return;
         }
-        let _ = self.event_tx.send(AgentStreamEvent::Error(data));
+        let _ = self.emit(AgentStreamEvent::Error(data));
     }
 }
 

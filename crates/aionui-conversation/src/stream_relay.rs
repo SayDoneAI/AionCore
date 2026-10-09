@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use aionui_ai_agent::protocol::events::{ErrorEventData, TipType, TipsEventData};
-use aionui_ai_agent::{AgentSendError, AgentStreamEvent, protocol::events::ThinkingEventData};
+use aionui_ai_agent::{AgentSendError, AgentStreamEvent, AgentStreamReceiver, protocol::events::ThinkingEventData};
 
 use crate::response_middleware::{ISkillLoadService, MessageMiddleware, MiddlewareResult};
 use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
@@ -255,8 +255,11 @@ impl StreamRelay {
             turn_id = %self.turn_id,
         )
     )]
-    pub async fn consume(self, rx: broadcast::Receiver<AgentStreamEvent>) -> RelayOutcome {
-        self.consume_inner(rx, None).await
+    pub async fn consume<R>(self, rx: R) -> RelayOutcome
+    where
+        R: Into<AgentStreamReceiver>,
+    {
+        self.consume_inner(rx.into(), None).await
     }
 
     /// Run the relay loop while also accepting a typed send failure from the
@@ -269,17 +272,20 @@ impl StreamRelay {
             turn_id = %self.turn_id,
         )
     )]
-    pub async fn consume_with_send_error(
+    pub async fn consume_with_send_error<R>(
         self,
-        rx: broadcast::Receiver<AgentStreamEvent>,
+        rx: R,
         send_error_rx: oneshot::Receiver<AgentSendError>,
-    ) -> RelayOutcome {
-        self.consume_inner(rx, Some(send_error_rx)).await
+    ) -> RelayOutcome
+    where
+        R: Into<AgentStreamReceiver>,
+    {
+        self.consume_inner(rx.into(), Some(send_error_rx)).await
     }
 
     async fn consume_inner(
         self,
-        mut rx: broadcast::Receiver<AgentStreamEvent>,
+        mut rx: AgentStreamReceiver,
         mut send_error_rx: Option<oneshot::Receiver<AgentSendError>>,
     ) -> RelayOutcome {
         let started_at = now_ms();
@@ -344,8 +350,23 @@ impl StreamRelay {
                 }
             };
 
+            let recv_result = match recv_result {
+                Ok(event) => Some(event),
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        lagged = skipped,
+                        "Stream relay lagged, converting to a terminal stream error"
+                    );
+                    Some(AgentStreamEvent::Error(ErrorEventData::legacy(
+                        format!("Agent stream lost {skipped} events; please retry."),
+                        Some(AgentErrorCode::AionuiStreamBroken),
+                    )))
+                }
+                Err(broadcast::error::RecvError::Closed) => None,
+            };
+
             match recv_result {
-                Ok(event) => {
+                Some(event) => {
                     let deleting = self.is_deleting();
                     if deleting && !matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_)) {
                         debug!(
@@ -415,7 +436,7 @@ impl StreamRelay {
                             // This also delivers the live/reload parity that
                             // `persist_thinking_segment` used to chase by STORING the empty
                             // row: both sides now agree, with no blank card on either.
-                            if data.content.is_empty() && data.subject.is_none() {
+                            if data.content.is_empty() {
                                 continue;
                             }
 
@@ -689,7 +710,7 @@ impl StreamRelay {
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => {
+                None => {
                     let elapsed_ms = now_ms() - started_at;
                     warn!(
                         target: "aionui_feedback_diagnostics",
@@ -742,9 +763,6 @@ impl StreamRelay {
                             .await;
                     }
                     break outcome;
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(lagged = n, "Stream relay lagged, some events dropped");
                 }
             }
         }
@@ -1380,6 +1398,7 @@ mod tests {
                     output: Some("Phase 1  Run   [0/1]".into()),
                     description: Some("Run [0/1] · run:A · 1 agents".into()),
                     parent_call_id: None,
+                    files: None,
                 },
                 agents: vec![ToolGroupEntry {
                     call_id: "1".into(),
@@ -1433,6 +1452,7 @@ mod tests {
             output: None,
             description: None,
             parent_call_id: None,
+            files: None,
         }))
         .await;
         assert_eq!(
@@ -1516,6 +1536,7 @@ mod tests {
             parent_call_id: None,
             input: None,
             output: None,
+            files: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Text(TextEventData { content: "Beta".into() }))
@@ -1873,6 +1894,7 @@ mod tests {
             output: None,
             description: None,
             parent_call_id: None,
+            files: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData {
@@ -2134,6 +2156,7 @@ mod tests {
             parent_call_id: None,
             input: None,
             output: None,
+            files: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -2201,6 +2224,7 @@ mod tests {
             parent_call_id: None,
             input: None,
             output: None,
+            files: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
@@ -2325,6 +2349,43 @@ mod tests {
         assert_eq!(inserts.len(), 1);
         let content: serde_json::Value = serde_json::from_str(&inserts[0].content).unwrap();
         assert_eq!(content["content"], "partial");
+    }
+
+    #[tokio::test]
+    async fn run_lagged_stream_reports_an_error_instead_of_finishing() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(1);
+        let rx = tx.subscribe();
+
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo,
+            bus,
+        );
+
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "first".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "second".into(),
+        }))
+        .unwrap();
+        drop(tx);
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(
+            outcome.terminal,
+            RelayTerminal::Error {
+                code: Some(AgentErrorCode::AionuiStreamBroken),
+                retryable: None,
+            }
+        );
     }
 
     #[tokio::test]
@@ -2467,6 +2528,7 @@ mod tests {
             output: None,
             description: Some("Generate image".into()),
             parent_call_id: None,
+            files: None,
         }))
         .unwrap();
         // Second event: Completed with output but no input
@@ -2479,6 +2541,7 @@ mod tests {
             output: Some("image.png".into()),
             description: None,
             parent_call_id: None,
+            files: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();

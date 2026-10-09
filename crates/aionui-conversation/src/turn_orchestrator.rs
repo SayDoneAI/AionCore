@@ -99,17 +99,38 @@ impl ConversationTurnOrchestrator {
         let build_started_at = now_ms();
         let availability_agent_id = availability_agent_id(&input.build_options);
         let backend = acp_backend_from_build_options(&input.build_options).map(str::to_owned);
+        let runtime_state = self.service.runtime_state();
         info!(
             conversation_id = %input.conv_id,
             turn_id = %input.turn_id,
             "Agent task build started"
         );
 
-        let agent = match self
-            .task_manager
-            .get_or_build_task(&input.conv_id, input.build_options)
-            .await
-        {
+        let build_result = tokio::select! {
+            result = self
+                .task_manager
+                .get_or_build_task(&input.conv_id, input.build_options) => result,
+            _ = runtime_state.wait_for_deferred_cancel(&input.conv_id, &input.turn_id) => {
+                runtime_state.take_deferred_cancel(&input.conv_id, &input.turn_id);
+                info!(
+                    conversation_id = %input.conv_id,
+                    turn_id = %input.turn_id,
+                    "Agent task build cancelled before the agent was ready"
+                );
+                self.service.broadcast_turn_settled_without_relay(
+                    &input.user_id,
+                    &input.conv_id,
+                    &input.turn_id,
+                    &input.msg_id,
+                );
+                return Err(ConversationTurnResult {
+                    status: ConversationTurnStatus::Completed,
+                    error_message: None,
+                });
+            }
+        };
+
+        let agent = match build_result {
             Ok(agent) => agent,
             Err(err) => {
                 let top_level_code = agent_error_top_level_code(&err);
@@ -228,8 +249,6 @@ impl ConversationTurnOrchestrator {
             .ensure_background_watcher(&input.user_id, &input.conv_id, &agent);
 
         let persistence = self.service.runtime_persistence();
-        let runtime_state = self.service.runtime_state();
-
         // A cancel may have arrived while the task was still being built, when
         // there was no agent to hand it to (see `ConversationService::cancel`).
         // Honour it here, BEFORE the prompt goes out: the user withdrew this

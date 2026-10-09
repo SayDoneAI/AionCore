@@ -10,6 +10,8 @@ pub struct SqliteChannelRepository {
     pool: SqlitePool,
 }
 
+const INCOMING_MESSAGE_CLAIM_LEASE_MS: i64 = 10 * 60 * 1000;
+
 impl SqliteChannelRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -28,6 +30,120 @@ fn normalize_route_preview(value: &str) -> String {
 
 #[async_trait::async_trait]
 impl IChannelRepository for SqliteChannelRepository {
+    async fn try_claim_incoming_message(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        let now = aionui_common::now_ms();
+        let claim_token = aionui_common::generate_id();
+        let result = sqlx::query(
+            "INSERT INTO channel_incoming_message_claims \
+                (owner_user_id, platform_type, chat_id, message_id, claimed_at, claim_token, status, lease_until, attempts) \
+             VALUES (?, ?, ?, ?, ?, ?, 'processing', ?, 1) \
+             ON CONFLICT(owner_user_id, platform_type, chat_id, message_id) DO UPDATE SET \
+                claimed_at = excluded.claimed_at, \
+                claim_token = excluded.claim_token, \
+                status = 'processing', \
+                lease_until = excluded.lease_until, \
+                attempts = channel_incoming_message_claims.attempts + 1, \
+                completed_at = NULL, \
+                last_error = NULL \
+             WHERE channel_incoming_message_claims.status <> 'succeeded' \
+               AND channel_incoming_message_claims.lease_until <= ?",
+        )
+        .bind(owner_user_id)
+        .bind(platform_type)
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(now)
+        .bind(&claim_token)
+        .bind(now + INCOMING_MESSAGE_CLAIM_LEASE_MS)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok((result.rows_affected() == 1).then_some(claim_token))
+    }
+
+    async fn complete_incoming_message(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+        claim_token: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE channel_incoming_message_claims \
+             SET status = 'succeeded', lease_until = 0, completed_at = ?, last_error = NULL \
+             WHERE owner_user_id = ? AND platform_type = ? AND chat_id = ? AND message_id = ? AND claim_token = ? AND status = 'processing'",
+        )
+        .bind(aionui_common::now_ms())
+        .bind(owner_user_id)
+        .bind(platform_type)
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn renew_incoming_message(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+        claim_token: &str,
+    ) -> Result<bool, DbError> {
+        let now = aionui_common::now_ms();
+        let result = sqlx::query(
+            "UPDATE channel_incoming_message_claims \
+             SET lease_until = ? \
+             WHERE owner_user_id = ? AND platform_type = ? AND chat_id = ? AND message_id = ? \
+               AND claim_token = ? AND status = 'processing'",
+        )
+        .bind(now + INCOMING_MESSAGE_CLAIM_LEASE_MS)
+        .bind(owner_user_id)
+        .bind(platform_type)
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn release_incoming_message(
+        &self,
+        owner_user_id: &str,
+        platform_type: &str,
+        chat_id: &str,
+        message_id: &str,
+        claim_token: &str,
+        error: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE channel_incoming_message_claims \
+             SET status = 'failed', lease_until = 0, last_error = ? \
+             WHERE owner_user_id = ? AND platform_type = ? AND chat_id = ? AND message_id = ? \
+               AND claim_token = ? AND status <> 'succeeded'",
+        )
+        .bind(error)
+        .bind(owner_user_id)
+        .bind(platform_type)
+        .bind(chat_id)
+        .bind(message_id)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     // ── Plugin CRUD ──────────────────────────────────────────────────
 
     async fn get_all_plugins(&self, owner_user_id: &str) -> Result<Vec<ChannelPluginRow>, DbError> {
@@ -1408,6 +1524,154 @@ mod tests {
     async fn get_session_not_found() {
         let (repo, _db) = setup().await;
         assert!(repo.get_session(OWNER_A, "nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn incoming_message_claim_is_durable_and_scoped() {
+        let (repo, _db) = setup().await;
+
+        let first_token = repo
+            .try_claim_incoming_message(OWNER_A, "lark", "chat-abc", "om-1")
+            .await
+            .unwrap()
+            .expect("first claim should return its owner token");
+        assert!(
+            repo.try_claim_incoming_message(OWNER_A, "lark", "chat-abc", "om-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.release_incoming_message(OWNER_A, "lark", "chat-abc", "om-1", &first_token, Some("retry me"),)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .complete_incoming_message(OWNER_A, "lark", "chat-abc", "om-1", &first_token)
+                .await
+                .unwrap()
+        );
+        let second_token = repo
+            .try_claim_incoming_message(OWNER_A, "lark", "chat-abc", "om-1")
+            .await
+            .unwrap()
+            .expect("released claim should be retryable");
+        assert!(
+            repo.complete_incoming_message(OWNER_A, "lark", "chat-abc", "om-1", &second_token)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.try_claim_incoming_message(OWNER_A, "lark", "chat-abc", "om-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.try_claim_incoming_message(OWNER_A, "lark", "chat-abc", "om-2")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.try_claim_incoming_message(OWNER_A, "lark", "chat-other", "om-1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.try_claim_incoming_message(OWNER_B, "lark", "chat-abc", "om-1")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_incoming_message_claims_allow_only_one_winner() {
+        let (repo, _db) = setup().await;
+        let repo = std::sync::Arc::new(repo);
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let repo = std::sync::Arc::clone(&repo);
+            tasks.push(tokio::spawn(async move {
+                repo.try_claim_incoming_message(OWNER_A, "lark", "chat-abc", "om-race")
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut winners = 0;
+        for task in tasks {
+            if task.await.unwrap().is_some() {
+                winners += 1;
+            }
+        }
+        assert_eq!(winners, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_claim_cannot_complete_a_replacement_claim() {
+        let (repo, db) = setup().await;
+        let first_token = repo
+            .try_claim_incoming_message(OWNER_A, "lark", "chat-abc", "om-stale")
+            .await
+            .unwrap()
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE channel_incoming_message_claims SET lease_until = 0 \
+             WHERE owner_user_id = ? AND platform_type = ? AND chat_id = ? AND message_id = ?",
+        )
+        .bind(OWNER_A)
+        .bind("lark")
+        .bind("chat-abc")
+        .bind("om-stale")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let replacement_token = repo
+            .try_claim_incoming_message(OWNER_A, "lark", "chat-abc", "om-stale")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first_token, replacement_token);
+
+        assert!(
+            !repo
+                .complete_incoming_message(OWNER_A, "lark", "chat-abc", "om-stale", &first_token)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM channel_incoming_message_claims \
+                 WHERE owner_user_id = ? AND platform_type = ? AND chat_id = ? AND message_id = ?",
+            )
+            .bind(OWNER_A)
+            .bind("lark")
+            .bind("chat-abc")
+            .bind("om-stale")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            "processing"
+        );
+
+        assert!(
+            repo.complete_incoming_message(OWNER_A, "lark", "chat-abc", "om-stale", &replacement_token)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.try_claim_incoming_message(OWNER_A, "lark", "chat-abc", "om-stale")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

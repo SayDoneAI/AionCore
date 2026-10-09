@@ -642,6 +642,10 @@ pub enum ToolResultContent {
     Text(String),
     FilePath {
         path: String,
+        /// Destination path for a rename. `path` remains the source path so
+        /// the backend-neutral event preserves both sides of the operation.
+        #[serde(default)]
+        move_path: Option<String>,
         #[serde(default)]
         mime: Option<String>,
         #[serde(default)]
@@ -1606,6 +1610,7 @@ mod additive_tests {
                     ToolResultContent::Text("out".into()),
                     ToolResultContent::FilePath {
                         path: "/w/a.png".into(),
+                        move_path: None,
                         mime: Some("image/png".into()),
                         old_text: None,
                         new_text: None,

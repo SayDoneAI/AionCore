@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use aionui_api_types::WebSocketMessage;
 use aionui_db::{IChannelRepository, IConversationRepository, UpsertChannelConversationRouteParams};
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use crate::action::{ActionExecutor, MessageResult};
@@ -28,9 +29,169 @@ pub struct ChannelOrchestrator {
     action_executor: Arc<ActionExecutor>,
     message_service: Arc<ChannelMessageService>,
     session_manager: Arc<SessionManager>,
+    channel_repo: Arc<dyn IChannelRepository>,
     sender: Arc<dyn ChannelSender>,
     mirror_service: Arc<ChannelMirrorService>,
     conversation_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+struct IncomingMessageClaim {
+    repository: Arc<dyn IChannelRepository>,
+    owner_user_id: String,
+    platform_type: String,
+    chat_id: String,
+    message_id: String,
+    claim_token: String,
+    renewal_task: Option<tokio::task::JoinHandle<()>>,
+    completed: bool,
+}
+
+impl IncomingMessageClaim {
+    fn start_renewal(mut self) -> Self {
+        let repository = Arc::clone(&self.repository);
+        let owner_user_id = self.owner_user_id.clone();
+        let platform_type = self.platform_type.clone();
+        let chat_id = self.chat_id.clone();
+        let message_id = self.message_id.clone();
+        let claim_token = self.claim_token.clone();
+        self.renewal_task = Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                match repository
+                    .renew_incoming_message(&owner_user_id, &platform_type, &chat_id, &message_id, &claim_token)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(message_id = %message_id, "channel message claim was replaced while processing");
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(message_id = %message_id, error = %error, "failed to renew channel message claim");
+                        break;
+                    }
+                }
+            }
+        }));
+        self
+    }
+
+    async fn complete(mut self) {
+        if let Some(task) = self.renewal_task.take() {
+            task.abort();
+        }
+        let result = self
+            .repository
+            .complete_incoming_message(
+                &self.owner_user_id,
+                &self.platform_type,
+                &self.chat_id,
+                &self.message_id,
+                &self.claim_token,
+            )
+            .await;
+        match result {
+            Ok(true) => self.completed = true,
+            Ok(false) => {
+                warn!(
+                    message_id = %self.message_id,
+                    "channel message claim was replaced before completion"
+                );
+                self.completed = true;
+            }
+            Err(error) => {
+                warn!(
+                    message_id = %self.message_id,
+                    error = %error,
+                    "failed to complete channel message claim; releasing it"
+                );
+                let release_reason = format!("failed to complete channel message claim: {error}");
+                self.release(Some(&release_reason)).await;
+            }
+        }
+    }
+
+    async fn release(mut self, error: Option<&str>) {
+        if let Some(task) = self.renewal_task.take() {
+            task.abort();
+        }
+        match self
+            .repository
+            .release_incoming_message(
+                &self.owner_user_id,
+                &self.platform_type,
+                &self.chat_id,
+                &self.message_id,
+                &self.claim_token,
+                error,
+            )
+            .await
+        {
+            Ok(true) => self.completed = true,
+            Ok(false) => {
+                warn!(
+                    message_id = %self.message_id,
+                    "channel message claim was already replaced before release"
+                );
+                self.completed = true;
+            }
+            Err(release_error) => {
+                warn!(
+                    message_id = %self.message_id,
+                    error = %release_error,
+                    "failed to release channel message claim"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for IncomingMessageClaim {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        let repository = Arc::clone(&self.repository);
+        let owner_user_id = self.owner_user_id.clone();
+        let platform_type = self.platform_type.clone();
+        let chat_id = self.chat_id.clone();
+        let message_id = self.message_id.clone();
+        let claim_token = self.claim_token.clone();
+        if let Some(task) = self.renewal_task.take() {
+            task.abort();
+        }
+        tokio::spawn(async move {
+            match repository
+                .release_incoming_message(
+                    &owner_user_id,
+                    &platform_type,
+                    &chat_id,
+                    &message_id,
+                    &claim_token,
+                    Some("channel message processing did not complete"),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(message_id = %message_id, "channel message claim was already replaced before release")
+                }
+                Err(error) => {
+                    warn!(message_id = %message_id, error = %error, "failed to release channel message claim")
+                }
+            }
+        });
+    }
+}
+
+async fn settle_incoming_claim(claim: IncomingMessageClaim, result: Result<(), String>) {
+    match result {
+        Ok(()) => claim.complete().await,
+        Err(error) => claim.release(Some(&error)).await,
+    }
 }
 
 impl ChannelOrchestrator {
@@ -38,6 +199,7 @@ impl ChannelOrchestrator {
         action_executor: Arc<ActionExecutor>,
         message_service: Arc<ChannelMessageService>,
         session_manager: Arc<SessionManager>,
+        channel_repo: Arc<dyn IChannelRepository>,
         sender: Arc<dyn ChannelSender>,
         mirror_service: Arc<ChannelMirrorService>,
     ) -> Self {
@@ -45,6 +207,7 @@ impl ChannelOrchestrator {
             action_executor,
             message_service,
             session_manager,
+            channel_repo,
             sender,
             mirror_service,
             conversation_locks: Arc::new(DashMap::new()),
@@ -89,16 +252,70 @@ impl ChannelOrchestrator {
         let msg_svc = Arc::clone(&self.message_service);
         let session_mgr = Arc::clone(&self.session_manager);
         let sender = Arc::clone(&self.sender);
+        let channel_repo = Arc::clone(&self.channel_repo);
         let mirror_service = Arc::clone(&self.mirror_service);
         let conversation_locks = Arc::clone(&self.conversation_locks);
 
         tokio::spawn(async move {
+            let Some(owner_user_id) = message_owner_user_id.as_deref() else {
+                error!(message_id = %msg.id, "dropping channel message without owner user");
+                return;
+            };
+            if msg.id.trim().is_empty() {
+                error!(platform = %platform, chat_id = %chat_id, "dropping channel message without stable message id");
+                return;
+            }
+            let claim_token = match channel_repo
+                .try_claim_incoming_message(owner_user_id, &plugin_id, &chat_id, &msg.id)
+                .await
+            {
+                Ok(Some(claim_token)) => claim_token,
+                Ok(None) => {
+                    info!(
+                        platform = %platform,
+                        chat_id = %chat_id,
+                        message_id = %msg.id,
+                        "channel message ignored: already claimed"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    error!(
+                        platform = %platform,
+                        chat_id = %chat_id,
+                        message_id = %msg.id,
+                        error = %error,
+                        "dropping channel message because durable idempotency claim failed"
+                    );
+                    return;
+                }
+            };
+
+            let claim = IncomingMessageClaim {
+                repository: Arc::clone(&channel_repo),
+                owner_user_id: owner_user_id.to_owned(),
+                platform_type: plugin_id.clone(),
+                chat_id: chat_id.clone(),
+                message_id: msg.id.clone(),
+                claim_token,
+                renewal_task: None,
+                completed: false,
+            }
+            .start_renewal();
+
             match executor.handle_incoming_message(&msg).await {
                 Ok(MessageResult::Action(response)) => {
-                    if let Some(owner_user_id) = message_owner_user_id.as_deref() {
-                        send_action_response(&sender, owner_user_id, &plugin_id, &chat_id, &response).await;
-                    } else {
-                        warn!("dropping channel action response without owner user");
+                    if let Some(owner_user_id) = message_owner_user_id.as_deref()
+                        && let Err(error) =
+                            send_action_response(&sender, owner_user_id, &plugin_id, &chat_id, &response).await
+                    {
+                        warn!(
+                            message_id = %msg.id,
+                            error = %error,
+                            "failed to deliver channel action response"
+                        );
+                        settle_incoming_claim(claim, Err(error.to_string())).await;
+                        return;
                     }
                 }
                 Ok(MessageResult::RoutedAction {
@@ -112,10 +329,12 @@ impl ChannelOrchestrator {
                             Ok(Some(session)) => session,
                             Ok(None) => {
                                 warn!(session_id = %session_id, "routed channel session not found");
+                                settle_incoming_claim(claim, Err("routed channel session not found".to_owned())).await;
                                 return;
                             }
                             Err(error) => {
                                 warn!(session_id = %session_id, error = %error, "failed to load routed channel session");
+                                settle_incoming_claim(claim, Err(error.to_string())).await;
                                 return;
                             }
                         };
@@ -128,18 +347,56 @@ impl ChannelOrchestrator {
                                         .await
                                     {
                                         warn!(error = %error, "failed to bind new channel conversation");
+                                        settle_incoming_claim(claim, Err(error.to_string())).await;
                                         return;
                                     }
                                     conversation_id
                                 }
                                 Err(error) => {
                                     warn!(error = %error, "failed to create new channel conversation");
+                                    settle_incoming_claim(claim, Err(error.to_string())).await;
                                     return;
                                 }
                             },
                         };
+                        if msg
+                            .action
+                            .as_ref()
+                            .is_some_and(|action| action.action == "system.confirm")
+                        {
+                            let Some(action) = msg.action.as_ref() else {
+                                unreachable!("system.confirm action was checked above");
+                            };
+                            let Some(call_id) = action
+                                .params
+                                .as_ref()
+                                .and_then(|params| params.get("callId"))
+                                .filter(|call_id| !call_id.trim().is_empty())
+                            else {
+                                warn!(message_id = %msg.id, "dropping tool confirmation without call_id");
+                                settle_incoming_claim(claim, Err("tool confirmation is missing call_id".to_owned()))
+                                    .await;
+                                return;
+                            };
+                            let value = action
+                                .params
+                                .as_ref()
+                                .and_then(|params| params.get("value"))
+                                .map(String::as_str)
+                                .unwrap_or("allow");
+                            if let Err(error) = msg_svc.confirm(owner_user_id, &conversation_id, call_id, value).await {
+                                warn!(
+                                    message_id = %msg.id,
+                                    call_id,
+                                    error = %error,
+                                    "failed to deliver channel tool confirmation"
+                                );
+                                settle_incoming_claim(claim, Err(error.to_string())).await;
+                                return;
+                            }
+                        }
                         if let Some(follow_up_text) = follow_up_text {
-                            handle_dispatched(
+                            if let Err(error) = handle_dispatched(
                                 &msg_svc,
                                 &session_mgr,
                                 &sender,
@@ -154,26 +411,47 @@ impl ChannelOrchestrator {
                                 &mirror_service,
                                 &conversation_locks,
                             )
-                            .await;
-                        } else if let Some(receipt) =
-                            send_action_response(&sender, owner_user_id, &plugin_id, &chat_id, &response).await
-                            && let Err(e) = session_mgr
-                                .register_conversation_route(
-                                    owner_user_id,
-                                    &aionui_db::UpsertChannelConversationRouteParams {
-                                        conversation_id: &conversation_id,
-                                        platform_type: &platform.to_string(),
-                                        chat_id: &chat_id,
-                                        message_id: &receipt.message_id,
-                                        preview_text: response.text.as_deref(),
-                                        sent_at: receipt.completed_at,
-                                        delivery_started_at: Some(receipt.started_at),
-                                        delivery_completed_at: Some(receipt.completed_at),
-                                    },
-                                )
-                                .await
-                        {
-                            warn!(error = %e, "failed to register channel action conversation route");
+                            .await
+                            {
+                                warn!(message_id = %msg.id, error = %error, "failed to dispatch routed channel message");
+                                settle_incoming_claim(claim, Err(error)).await;
+                                return;
+                            }
+                        } else {
+                            let receipt =
+                                match send_action_response(&sender, owner_user_id, &plugin_id, &chat_id, &response)
+                                    .await
+                                {
+                                    Ok(receipt) => receipt,
+                                    Err(error) => {
+                                        warn!(
+                                            message_id = %msg.id,
+                                            error = %error,
+                                            "failed to deliver routed channel action response"
+                                        );
+                                        settle_incoming_claim(claim, Err(error.to_string())).await;
+                                        return;
+                                    }
+                                };
+                            if let Some(receipt) = receipt
+                                && let Err(error) = session_mgr
+                                    .register_conversation_route(
+                                        owner_user_id,
+                                        &aionui_db::UpsertChannelConversationRouteParams {
+                                            conversation_id: &conversation_id,
+                                            platform_type: &platform.to_string(),
+                                            chat_id: &chat_id,
+                                            message_id: &receipt.message_id,
+                                            preview_text: response.text.as_deref(),
+                                            sent_at: receipt.completed_at,
+                                            delivery_started_at: Some(receipt.started_at),
+                                            delivery_completed_at: Some(receipt.completed_at),
+                                        },
+                                    )
+                                    .await
+                            {
+                                warn!(error = %error, "failed to register channel action conversation route");
+                            }
                         }
                     } else {
                         warn!("dropping routed channel action response without owner user");
@@ -184,7 +462,7 @@ impl ChannelOrchestrator {
                     session_id,
                     conversation_id,
                 }) => {
-                    handle_dispatched(
+                    if let Err(error) = handle_dispatched(
                         &msg_svc,
                         &session_mgr,
                         &sender,
@@ -199,15 +477,23 @@ impl ChannelOrchestrator {
                         &mirror_service,
                         &conversation_locks,
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(message_id = %msg.id, error = %error, "failed to dispatch channel message");
+                        settle_incoming_claim(claim, Err(error)).await;
+                        return;
+                    }
                 }
                 Ok(MessageResult::AlreadyProcessing) => {
                     info!(chat_id = %chat_id, "message ignored: already processing");
                 }
                 Err(e) => {
                     error!(error = %e, "failed to handle incoming message");
+                    settle_incoming_claim(claim, Err(e.to_string())).await;
+                    return;
                 }
             }
+            settle_incoming_claim(claim, Ok(())).await;
         });
     }
 }
@@ -218,7 +504,7 @@ async fn send_action_response(
     plugin_id: &str,
     chat_id: &str,
     response: &crate::types::ActionResponse,
-) -> Option<crate::stream_relay::ChannelDeliveryReceipt> {
+) -> Result<Option<crate::stream_relay::ChannelDeliveryReceipt>, crate::error::ChannelError> {
     if let Some(text) = &response.text {
         let platform = crate::types::PluginType::from_str_opt(plugin_id);
         let formatted_text = platform.map_or_else(|| text.clone(), |platform| format_text_for_platform(text, platform));
@@ -239,28 +525,28 @@ async fn send_action_response(
 
         match response.behavior {
             ActionBehavior::Edit => {
-                if let Some(ref edit_id) = response.edit_message_id
-                    && sender
-                        .edit_message(owner_user_id, plugin_id, chat_id, edit_id, outgoing)
-                        .await
-                        .is_ok()
-                {
-                    return Some(crate::stream_relay::ChannelDeliveryReceipt {
-                        message_id: edit_id.clone(),
-                        started_at,
-                        completed_at: aionui_common::now_ms(),
-                    });
-                }
+                let Some(edit_id) = response.edit_message_id.as_ref() else {
+                    return Err(crate::error::ChannelError::MessageSendFailed(
+                        "edit response is missing its target message id".into(),
+                    ));
+                };
+                sender
+                    .edit_message(owner_user_id, plugin_id, chat_id, edit_id, outgoing)
+                    .await?;
+                Ok(Some(crate::stream_relay::ChannelDeliveryReceipt {
+                    message_id: edit_id.clone(),
+                    started_at,
+                    completed_at: aionui_common::now_ms(),
+                }))
             }
-            _ => {
-                return sender
-                    .send_message(owner_user_id, plugin_id, chat_id, outgoing)
-                    .await
-                    .ok();
-            }
+            _ => sender
+                .send_message(owner_user_id, plugin_id, chat_id, outgoing)
+                .await
+                .map(Some),
         }
+    } else {
+        Ok(None)
     }
-    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -278,16 +564,16 @@ async fn handle_dispatched(
     platform_user_id: &str,
     mirror_service: &Arc<ChannelMirrorService>,
     conversation_locks: &Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-) {
+) -> Result<(), String> {
     let session = match session_mgr.get_session_by_id(owner_user_id, session_id).await {
         Ok(Some(s)) => s,
         Ok(None) => {
             warn!(session_id = %session_id, "session not found after dispatch");
-            return;
+            return Err(format!("session {session_id} not found after dispatch"));
         }
         Err(e) => {
             error!(error = %e, "failed to get session");
-            return;
+            return Err(e.to_string());
         }
     };
 
@@ -334,39 +620,43 @@ async fn handle_dispatched(
                 reply_to_message_id: None,
                 silent: None,
             };
-            if let Ok(receipt) = sender.send_message(owner_user_id, plugin_id, chat_id, err_msg).await {
-                let route_result = if let Some(conversation_id) = route_conversation_id.as_deref() {
-                    session_mgr
-                        .register_conversation_route(
-                            owner_user_id,
-                            &aionui_db::UpsertChannelConversationRouteParams {
-                                conversation_id,
-                                platform_type: &platform.to_string(),
-                                chat_id,
-                                message_id: &receipt.message_id,
-                                preview_text: Some("❌ 处理失败"),
-                                sent_at: receipt.completed_at,
-                                delivery_started_at: Some(receipt.started_at),
-                                delivery_completed_at: Some(receipt.completed_at),
-                            },
-                        )
-                        .await
-                } else {
-                    session_mgr
-                        .register_reply_route(
-                            owner_user_id,
-                            session_id,
-                            &platform.to_string(),
+            let receipt = sender
+                .send_message(owner_user_id, plugin_id, chat_id, err_msg)
+                .await
+                .map_err(|send_error| {
+                    format!("agent dispatch failed: {e}; failed to deliver error response: {send_error}")
+                })?;
+            let route_result = if let Some(conversation_id) = route_conversation_id.as_deref() {
+                session_mgr
+                    .register_conversation_route(
+                        owner_user_id,
+                        &aionui_db::UpsertChannelConversationRouteParams {
+                            conversation_id,
+                            platform_type: &platform.to_string(),
                             chat_id,
-                            &receipt.message_id,
-                        )
-                        .await
-                };
-                if let Err(route_error) = route_result {
-                    warn!(error = %route_error, "failed to register channel error reply route");
-                }
+                            message_id: &receipt.message_id,
+                            preview_text: Some("❌ 处理失败"),
+                            sent_at: receipt.completed_at,
+                            delivery_started_at: Some(receipt.started_at),
+                            delivery_completed_at: Some(receipt.completed_at),
+                        },
+                    )
+                    .await
+            } else {
+                session_mgr
+                    .register_reply_route(
+                        owner_user_id,
+                        session_id,
+                        &platform.to_string(),
+                        chat_id,
+                        &receipt.message_id,
+                    )
+                    .await
+            };
+            if let Err(route_error) = route_result {
+                warn!(error = %route_error, "failed to register channel error reply route");
             }
-            return;
+            return Ok(());
         }
     };
 
@@ -399,7 +689,12 @@ async fn handle_dispatched(
             conversation_id = %send_result.conversation_id,
             "no agent task for stream subscription"
         );
+        return Err(format!(
+            "agent task missing stream subscription for conversation {}",
+            send_result.conversation_id
+        ));
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -459,17 +754,21 @@ impl ChannelMirrorService {
         );
     }
 
-    pub async fn run(
-        self: Arc<Self>,
-        mut event_rx: tokio::sync::broadcast::Receiver<WebSocketMessage<serde_json::Value>>,
-    ) {
+    pub async fn run(self: Arc<Self>, mut event_rx: broadcast::Receiver<WebSocketMessage<serde_json::Value>>) {
         loop {
             match event_rx.recv().await {
                 Ok(event) => self.handle_event(event).await,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "channel mirror event listener lagged");
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        skipped,
+                        "channel mirror event bus lagged; dropping partial mirror state"
+                    );
+                    self.turns
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     }
@@ -825,6 +1124,38 @@ mod tests {
             sender.clone() as Arc<dyn ChannelSender>,
         ));
         (service, sender, channel_repo, db)
+    }
+
+    #[tokio::test]
+    async fn failed_incoming_claim_is_released_for_retry() {
+        let db = init_database_memory().await.unwrap();
+        let repository: Arc<dyn IChannelRepository> = Arc::new(SqliteChannelRepository::new(db.pool().clone()));
+        let claim_token = repository
+            .try_claim_incoming_message("owner", "lark", "chat", "message")
+            .await
+            .unwrap()
+            .expect("first delivery should claim the message");
+        let claim = IncomingMessageClaim {
+            repository: Arc::clone(&repository),
+            owner_user_id: "owner".to_owned(),
+            platform_type: "lark".to_owned(),
+            chat_id: "chat".to_owned(),
+            message_id: "message".to_owned(),
+            claim_token,
+            renewal_task: None,
+            completed: false,
+        };
+
+        settle_incoming_claim(claim, Err("agent failed".to_owned())).await;
+
+        assert!(
+            repository
+                .try_claim_incoming_message("owner", "lark", "chat", "message")
+                .await
+                .unwrap()
+                .is_some(),
+            "a failed delivery must remain retryable"
+        );
     }
 
     fn user_event(content: &str) -> WebSocketMessage<serde_json::Value> {

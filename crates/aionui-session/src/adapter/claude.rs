@@ -2497,7 +2497,7 @@ mod tests {
             .as_bytes(),
         );
         let think = evs.iter().find_map(|e| match e {
-            SessionEvent::ThoughtDelta { item_id, text } => Some((item_id.clone(), text.clone())),
+            SessionEvent::ThoughtDelta { item_id, text, .. } => Some((item_id.clone(), text.clone())),
             _ => None,
         });
         let msg = evs.iter().find_map(|e| match e {
@@ -2556,7 +2556,7 @@ mod tests {
             .as_bytes(),
         );
         let think = evs.iter().find_map(|e| match e {
-            SessionEvent::ThoughtDelta { item_id, text } => Some((item_id.clone(), text.clone())),
+            SessionEvent::ThoughtDelta { item_id, text, .. } => Some((item_id.clone(), text.clone())),
             _ => None,
         });
         assert_eq!(

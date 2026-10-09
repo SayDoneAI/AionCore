@@ -30,6 +30,29 @@ pub struct ToolCallEventData {
     /// would DELETE the stored attribution).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_call_id: Option<String>,
+    /// File changes produced by the tool. Direct-CLI backends use this field
+    /// because their terminal tool frames otherwise only carry textual output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<ToolCallFileChange>>,
+}
+
+/// A file change attached to a terminal tool-call frame.
+///
+/// `diff` is a precomputed unified diff (Codex's `fileChange` shape). The
+/// `old_text`/`new_text` pair is for protocols that provide before/after file
+/// contents and lets the renderer build the same unified diff preview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFileChange {
+    pub path: String,
+    /// Destination path for a rename. `path` remains the source path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

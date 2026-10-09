@@ -101,6 +101,7 @@ fn tool_call(call_id: &str) -> AgentStreamEvent {
         parent_call_id: None,
         input: None,
         output: None,
+        files: None,
     })
 }
 

@@ -1253,6 +1253,7 @@ mod tests {
             output: None,
             description: None,
             parent_call_id: None,
+            files: None,
         }))
         .unwrap();
 

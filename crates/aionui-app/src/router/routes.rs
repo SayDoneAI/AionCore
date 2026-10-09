@@ -39,6 +39,7 @@ use aionui_shell::shell_routes;
 use aionui_sidebar::sidebar_routes;
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
+use tokio::sync::broadcast;
 
 use crate::services::AppServices;
 
@@ -57,20 +58,21 @@ pub struct RouterRuntime {
 }
 
 async fn forward_event_bus_to_websocket(
-    mut event_rx: tokio::sync::broadcast::Receiver<WebSocketMessage<serde_json::Value>>,
+    mut event_rx: broadcast::Receiver<WebSocketMessage<serde_json::Value>>,
     ws_manager: Arc<WebSocketManager>,
 ) {
     loop {
         let event = match event_rx.recv().await {
             Ok(event) => event,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     skipped,
-                    "websocket event bus bridge lagged; skipped stale events and will continue"
+                    "websocket event bus bridge lagged; disconnecting clients for state resync"
                 );
+                ws_manager.disconnect_all("event stream lagged; reconnect to resync");
                 continue;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed) => break,
         };
 
         if let Some(user_id) = event
@@ -79,9 +81,9 @@ async fn forward_event_bus_to_websocket(
             .and_then(|value| value.as_str())
             .map(str::to_owned)
         {
-            ws_manager.broadcast_to_user(&user_id, event);
+            ws_manager.broadcast_to_user_or_disconnect(&user_id, event);
         } else if is_global_websocket_event(&event.name) {
-            ws_manager.broadcast_all(event);
+            ws_manager.broadcast_all_or_disconnect(event);
         } else {
             tracing::warn!(
                 event_name = %event.name,
@@ -647,43 +649,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_event_bridge_continues_after_receiver_lag() {
-        let event_bus = BroadcastEventBus::new(2);
+    async fn websocket_event_bridge_forwards_ordered_events() {
+        let event_bus = Arc::new(BroadcastEventBus::new(8));
         let event_rx = event_bus.subscribe();
         let ws_manager = Arc::new(WebSocketManager::new());
         let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(8);
         ws_manager.add_client_for_user("user-a".into(), "token".into(), outbound_tx);
 
+        let bridge = tokio::spawn(forward_event_bus_to_websocket(event_rx, ws_manager));
+        tokio::task::yield_now().await;
         for sequence in 1..=3 {
             event_bus.broadcast(WebSocketMessage::new(
                 "test.beforeLag",
                 json!({"user_id": "user-a", "sequence": sequence}),
             ));
         }
-
-        let bridge = tokio::spawn(forward_event_bus_to_websocket(event_rx, ws_manager));
         event_bus.broadcast(WebSocketMessage::new(
-            "test.afterLag",
+            "test.ordered",
             json!({"user_id": "user-a", "sequence": 4}),
         ));
 
         let delivered = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
+            let mut events = Vec::new();
+            for _ in 0..4 {
                 match outbound_rx.recv().await {
                     Some(WsOutbound::Text(text)) => {
-                        let event: serde_json::Value = serde_json::from_str(&text).unwrap();
-                        if event["name"] == "test.afterLag" {
-                            break event;
-                        }
+                        events.push(serde_json::from_str::<serde_json::Value>(&text).unwrap())
                     }
                     other => panic!("expected a text websocket event, got {other:?}"),
                 }
             }
+            events
         })
         .await
-        .expect("the bridge should deliver events after recovering from lag");
+        .expect("the bridge should deliver every ordered event");
 
-        assert_eq!(delivered["data"]["sequence"], 4);
+        assert_eq!(
+            delivered
+                .iter()
+                .map(|event| event["data"]["sequence"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        bridge.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_event_bridge_disconnects_clients_after_event_bus_lag() {
+        let event_bus = Arc::new(BroadcastEventBus::new(2));
+        let event_rx = event_bus.subscribe();
+        let ws_manager = Arc::new(WebSocketManager::new());
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(8);
+        ws_manager.add_client_for_user("user-a".into(), "token".into(), outbound_tx);
+
+        for sequence in 1..=3 {
+            event_bus.broadcast(WebSocketMessage::new(
+                "test.lag",
+                json!({"user_id": "user-a", "sequence": sequence}),
+            ));
+        }
+
+        let bridge = tokio::spawn(forward_event_bus_to_websocket(event_rx, Arc::clone(&ws_manager)));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while ws_manager.client_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lagged clients should be removed for resync");
         bridge.abort();
     }
 }

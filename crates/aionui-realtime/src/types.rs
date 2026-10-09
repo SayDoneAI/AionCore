@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 /// Unique identifier for a WebSocket connection.
 ///
@@ -146,6 +146,12 @@ pub struct ClientInfo {
     pub last_ping: Instant,
     /// Sender for outbound messages to this connection.
     pub tx: mpsc::Sender<WsOutbound>,
+    /// Signals the WebSocket receive loop when the manager removes this client.
+    ///
+    /// Dropping the outbound sender only stops the send loop; without a
+    /// separate signal the receive half can wait forever on an otherwise dead
+    /// socket, preventing the client from observing the close and reconnecting.
+    pub disconnect_tx: watch::Sender<bool>,
 }
 
 /// Server sends ping every 30 seconds.

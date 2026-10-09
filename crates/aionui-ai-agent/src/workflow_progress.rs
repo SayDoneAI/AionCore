@@ -359,6 +359,7 @@ impl WorkflowCard {
             // Cards ride a MAIN-STREAM launching call; absent (not null) so the
             // merge-patch never touches attribution persisted by the call itself.
             parent_call_id: None,
+            files: None,
         };
         let entries = rendered.entries.clone();
         self.last_render = Some(rendered);

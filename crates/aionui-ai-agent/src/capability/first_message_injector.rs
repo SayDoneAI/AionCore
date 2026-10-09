@@ -58,6 +58,9 @@ mod tests {
     use aionui_extension::{BUILTIN_SKILLS_ENV_VAR, resolve_skill_paths};
     use tempfile::TempDir;
 
+    static BUILTIN_ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     fn test_mgr(base: &std::path::Path) -> Arc<AcpSkillManager> {
         let paths = Arc::new(resolve_skill_paths(base, base));
         AcpSkillManager::new(paths)
@@ -126,6 +129,7 @@ mod tests {
     #[tokio::test]
     async fn heavy_mode_no_skills_no_context_passes_through() {
         let tmp = TempDir::new().unwrap();
+        let _env_lock = BUILTIN_ENV_LOCK.lock().await;
         let _guard = EmptyBuiltinGuard::new(tmp.path());
         let mgr = test_mgr(tmp.path());
 
@@ -146,6 +150,7 @@ mod tests {
     #[tokio::test]
     async fn heavy_mode_with_preset_context_no_skills() {
         let tmp = TempDir::new().unwrap();
+        let _env_lock = BUILTIN_ENV_LOCK.lock().await;
         let _guard = EmptyBuiltinGuard::new(tmp.path());
         let mgr = test_mgr(tmp.path());
 
@@ -183,6 +188,7 @@ mod tests {
             "---\nname: pdf\ndescription: Render PDFs\n---\nBody.",
         )
         .unwrap();
+        let _env_lock = BUILTIN_ENV_LOCK.lock().await;
         let _guard = EmptyBuiltinGuard::new(tmp.path());
         let mgr = test_mgr(tmp.path());
 
@@ -205,6 +211,7 @@ mod tests {
     #[tokio::test]
     async fn native_support_uses_light_mode_even_with_skills() {
         let tmp = TempDir::new().unwrap();
+        let _env_lock = BUILTIN_ENV_LOCK.lock().await;
         let _guard = EmptyBuiltinGuard::new(tmp.path());
         let mgr = test_mgr(tmp.path());
 

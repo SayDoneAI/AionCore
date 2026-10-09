@@ -8,7 +8,7 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info};
 
 use crate::manager::{TokenValidator, WebSocketManager};
@@ -86,18 +86,30 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
     };
 
     let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
-    let conn_id = state.manager.add_client_for_user(user_id.clone(), token, tx);
+    let (disconnect_tx, disconnect_rx) = watch::channel(false);
+    let conn_id = state
+        .manager
+        .add_client_for_user_with_disconnect(user_id.clone(), token, tx, disconnect_tx.clone());
 
     info!(%conn_id, user_id = %user_id, "websocket connection established");
 
     let (ws_sender, ws_receiver) = socket.split();
 
-    let send_handle = tokio::spawn(send_loop(conn_id, rx, ws_sender));
-    recv_loop(conn_id, &user_id, ws_receiver, &state).await;
+    let mut send_handle = tokio::spawn(send_loop(conn_id, rx, ws_sender, disconnect_tx));
+    recv_loop(conn_id, &user_id, ws_receiver, disconnect_rx, &state).await;
 
     // Recv loop exited — client disconnected or errored.
-    send_handle.abort();
     state.manager.remove_client(conn_id);
+    // Manager removal drops the mpsc sender after notifying the receive loop.
+    // Let the send loop flush a queued terminal event before falling back to
+    // an abort for a broken network sink.
+    if tokio::time::timeout(std::time::Duration::from_secs(1), &mut send_handle)
+        .await
+        .is_err()
+    {
+        debug!(%conn_id, "send loop did not drain after websocket close; aborting");
+        send_handle.abort();
+    }
     // Let stateful routers release per-connection state (e.g. fs subscriptions).
     state.router.on_disconnect(conn_id);
     info!(%conn_id, user_id = %user_id, "websocket connection closed");
@@ -125,8 +137,11 @@ async fn send_loop(
     conn_id: ConnectionId,
     mut rx: mpsc::Receiver<WsOutbound>,
     mut sender: futures_util::stream::SplitSink<WebSocket, Message>,
+    disconnect_tx: watch::Sender<bool>,
 ) {
+    let mut close_sent = false;
     while let Some(outbound) = rx.recv().await {
+        let terminal = matches!(&outbound, WsOutbound::Close(..) | WsOutbound::TextThenClose(..));
         let msg = match outbound {
             WsOutbound::Text(text) => Message::Text(text.into()),
             WsOutbound::Close(code, reason) => Message::Close(Some(CloseFrame {
@@ -136,6 +151,7 @@ async fn send_loop(
             WsOutbound::TextThenClose(text, code, reason) => {
                 if sender.send(Message::Text(text.into())).await.is_err() {
                     debug!(%conn_id, "send loop: socket write failed, exiting");
+                    let _ = disconnect_tx.send(true);
                     break;
                 }
                 Message::Close(Some(CloseFrame {
@@ -146,8 +162,21 @@ async fn send_loop(
         };
         if sender.send(msg).await.is_err() {
             debug!(%conn_id, "send loop: socket write failed, exiting");
+            let _ = disconnect_tx.send(true);
             break;
         }
+        if terminal {
+            close_sent = true;
+            break;
+        }
+    }
+    if !close_sent {
+        let _ = sender
+            .send(Message::Close(Some(CloseFrame {
+                code: WebSocketCloseCode::NormalClosure.as_u16(),
+                reason: "connection closed".into(),
+            })))
+            .await;
     }
 }
 
@@ -160,9 +189,22 @@ async fn recv_loop(
     conn_id: ConnectionId,
     user_id: &str,
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
+    mut disconnect_rx: watch::Receiver<bool>,
     state: &WsHandlerState,
 ) {
-    while let Some(result) = receiver.next().await {
+    loop {
+        let result = tokio::select! {
+            changed = disconnect_rx.changed() => {
+                if changed.is_ok() && *disconnect_rx.borrow() {
+                    debug!(%conn_id, "manager requested websocket close");
+                }
+                break;
+            }
+            result = receiver.next() => result,
+        };
+        let Some(result) = result else {
+            break;
+        };
         let msg = match result {
             Ok(m) => m,
             Err(e) => {

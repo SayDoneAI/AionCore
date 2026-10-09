@@ -68,7 +68,11 @@ use std::sync::Mutex;
 use std::sync::RwLock;
 
 pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
-const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum time allowed for a backend cancel to converge before the task is
+/// force-terminated. The fallback applies to every runtime type: a cancelled
+/// turn that keeps its claim is equally wedged whether it came from ACP,
+/// Aionrs, or the direct-CLI session adapter.
+const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
@@ -915,7 +919,7 @@ impl ConversationService {
     /// Spawn (or replace) the conversation's background-stream watcher.
     /// Idempotent per instance: keyed by the Arc pointer, so a rebuilt instance
     /// (crash/resume respawn) gets a fresh watcher on its fresh broadcast
-    /// channel while the old one exits on `Closed`.
+    /// subscription while the old one exits on `Closed`.
     ///
     /// Direct-CLI Session instances get the FULL watcher (orphan turns + card
     /// refreshes). ACP manager instances get a restricted watcher because their
@@ -4652,10 +4656,15 @@ impl ConversationService {
             })?;
 
         let active_turn_id = self.runtime_state.active_turn_id_for(conversation_id);
-        if active_turn_id.as_deref() != Some(turn_id) {
+        let requested_turn_id = if turn_id.trim().is_empty() {
+            active_turn_id.as_deref().unwrap_or_default()
+        } else {
+            turn_id
+        };
+        if active_turn_id.as_deref() != Some(requested_turn_id) {
             info!(
                 conversation_id,
-                requested_turn_id = %turn_id,
+                requested_turn_id = %requested_turn_id,
                 active_turn_id = active_turn_id.as_deref(),
                 "cancel ignored because turn id mismatched"
             );
@@ -4675,16 +4684,17 @@ impl ConversationService {
             // Record the intent instead. The orchestrator applies it as soon as
             // the task appears, so a cancel issued during the build behaves like
             // one issued a second later.
-            self.runtime_state.defer_cancel(conversation_id, turn_id);
+            self.runtime_state.defer_cancel(conversation_id, requested_turn_id);
             info!(
                 conversation_id,
-                turn_id, "Cancel arrived before the agent registered; deferring it to the build"
+                turn_id = requested_turn_id,
+                "Cancel arrived before the agent registered; deferring it to the build"
             );
             // A deferred cancel IS a real cancel intent — the orchestrator
             // applies it as soon as the task appears — so pending deliveries
             // aimed here must go now, not after the turn we are cancelling
             // finally starts.
-            self.notify_turn_cancelled(user_id, conversation_id, turn_id, cause)
+            self.notify_turn_cancelled(user_id, conversation_id, requested_turn_id, cause)
                 .await;
             return Ok(CancelConversationResponse {
                 runtime: self.runtime_summary_for(conversation_id).await,
@@ -4692,9 +4702,35 @@ impl ConversationService {
         };
 
         self.runtime_state.mark_cancelling(conversation_id);
-        if let Err(e) = agent.cancel().await {
+        let mut force_terminated = false;
+        let cancel_result =
+            match tokio::time::timeout(CANCEL_DRAIN_TIMEOUT, agent.cancel_for_turn(requested_turn_id)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    force_terminated = true;
+                    warn!(
+                        conversation_id,
+                        turn_id = requested_turn_id,
+                        timeout_ms = CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
+                        "Agent cancel did not return before timeout; forcing task termination"
+                    );
+                    task_manager
+                        .kill_and_wait(conversation_id, Some(AgentKillReason::UserCancelTimeout))
+                        .await;
+                    Ok(())
+                }
+            };
+        if let Err(e) = cancel_result {
+            warn!(
+                conversation_id,
+                turn_id = requested_turn_id,
+                error = %ErrorChain(&e),
+                "Agent cancel failed; force-terminating the active task"
+            );
+            task_manager
+                .kill_and_wait(conversation_id, Some(AgentKillReason::UserCancelTimeout))
+                .await;
             self.runtime_state.clear_cancelling(conversation_id);
-            warn!(conversation_id, turn_id, error = %ErrorChain(&e), "Failed to cancel agent");
             return Err(e.into());
         }
 
@@ -4702,22 +4738,22 @@ impl ConversationService {
         // still claimed and kills the task. agy cancels by killing its per-turn
         // child, but nothing guarantees the pump drains, and without this net a
         // stuck cancel leaves the conversation wedged with no way back.
-        if matches!(agent.agent_type(), AgentType::Acp | AgentType::Antigravity) {
+        if !force_terminated {
             let runtime_state = self.runtime_state();
             let task_manager = Arc::clone(task_manager);
             let conv_id = conversation_id.to_owned();
-            let active_turn = turn_id.to_owned();
+            let active_turn = requested_turn_id.to_owned();
 
             tokio::spawn(async move {
-                tokio::time::sleep(ACP_CANCEL_DRAIN_TIMEOUT).await;
+                tokio::time::sleep(CANCEL_DRAIN_TIMEOUT).await;
                 if runtime_state.active_turn_id_for(&conv_id).as_deref() == Some(active_turn.as_str())
                     && runtime_state.is_cancelling(&conv_id)
                 {
                     warn!(
                         conversation_id = %conv_id,
                         turn_id = %active_turn,
-                        timeout_ms = ACP_CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
-                        "CLI agent cancel did not drain before timeout; killing task"
+                        timeout_ms = CANCEL_DRAIN_TIMEOUT.as_millis() as u64,
+                        "Agent cancel did not drain before timeout; killing task"
                     );
                     task_manager
                         .kill_and_wait(&conv_id, Some(AgentKillReason::UserCancelTimeout))
@@ -4726,8 +4762,12 @@ impl ConversationService {
             });
         }
 
-        info!(conversation_id, turn_id, "Stream cancel acknowledged");
-        self.notify_turn_cancelled(user_id, conversation_id, turn_id, cause)
+        info!(
+            conversation_id,
+            turn_id = requested_turn_id,
+            "Stream cancel acknowledged"
+        );
+        self.notify_turn_cancelled(user_id, conversation_id, requested_turn_id, cause)
             .await;
         Ok(CancelConversationResponse {
             runtime: self.runtime_summary_for(conversation_id).await,

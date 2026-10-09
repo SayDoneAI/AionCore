@@ -772,6 +772,15 @@ fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
             "context too large",
             "maximum context",
             "prompt is too long",
+            "ran out of room",
+            "out of room in the model's context window",
+            "context window is full",
+            "payload too large",
+            "request payload is too large",
+            "request body is too large",
+            "request entity too large",
+            "status 413",
+            "http 413",
         ],
     ) {
         return Some(provider_error(
@@ -1912,6 +1921,56 @@ mod tests {
             AgentErrorCode::UserLlmProviderInvalidToolSchema,
             AgentErrorOwnership::UserLlmProvider,
             AgentErrorResolutionKind::Retry,
+        );
+    }
+
+    #[test]
+    fn classifies_http_payload_too_large_as_non_retryable_context_error() {
+        for detail in [
+            "unexpected status 413 Payload Too Large: Request payload is too large, url: https://proxy.example/v1/responses",
+            "HTTP 413 Request Entity Too Large",
+        ] {
+            let err = AgentSendError::from_agent_error(AgentError::bad_gateway(detail));
+            assert_eq!(
+                err.code(),
+                Some(AgentErrorCode::UserLlmProviderContextTooLarge),
+                "{detail}"
+            );
+            assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserLlmProvider), "{detail}");
+            assert_eq!(err.stream_error().retryable, Some(false), "{detail}");
+            assert_eq!(
+                err.stream_error().resolution.map(|value| value.kind),
+                Some(AgentErrorResolutionKind::ReduceContext),
+                "{detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_acp_payload_too_large_as_non_retryable_context_error() {
+        let err = AgentSendError::from(AcpError::AgentInternal {
+            message: "unexpected status 413 Payload Too Large: Request payload is too large".into(),
+            code: -32603,
+            data: None,
+        });
+
+        assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderContextTooLarge));
+        assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
+        assert_eq!(err.stream_error().retryable, Some(false));
+    }
+
+    #[test]
+    fn classifies_codex_context_window_exhaustion_as_non_retryable_context_error() {
+        let err = AgentSendError::from_agent_error(AgentError::bad_gateway(
+            "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+        ));
+
+        assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderContextTooLarge));
+        assert_eq!(err.ownership(), Some(AgentErrorOwnership::UserLlmProvider));
+        assert_eq!(err.stream_error().retryable, Some(false));
+        assert_eq!(
+            err.stream_error().resolution.map(|value| value.kind),
+            Some(AgentErrorResolutionKind::ReduceContext)
         );
     }
 

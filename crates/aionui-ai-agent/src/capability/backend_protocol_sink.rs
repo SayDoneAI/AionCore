@@ -4,9 +4,9 @@ use aion_protocol::events::{ProtocolEvent, ToolCategory};
 use aion_protocol::writer::ProtocolEmitter;
 use aionui_common::{Confirmation, ConfirmationOption, generate_id};
 use serde_json::json;
-use tokio::sync::broadcast;
 use tracing::debug;
 
+use crate::agent_runtime::AgentRuntime;
 use crate::protocol::events::{AcpPermissionEventData, AgentStreamEvent, ToolCallEventData, ToolCallStatus};
 
 /// Implements `ProtocolEmitter` for the aioncore context.
@@ -16,16 +16,13 @@ use crate::protocol::events::{AcpPermissionEventData, AgentStreamEvent, ToolCall
 /// other events (text, thinking, tool results) are already handled by
 /// `BackendOutputSink` via the `OutputSink` trait.
 pub struct BackendProtocolSink {
-    event_tx: broadcast::Sender<AgentStreamEvent>,
+    runtime: AgentRuntime,
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
 }
 
 impl BackendProtocolSink {
-    pub fn new(event_tx: broadcast::Sender<AgentStreamEvent>, confirmations: Arc<RwLock<Vec<Confirmation>>>) -> Self {
-        Self {
-            event_tx,
-            confirmations,
-        }
+    pub fn new(runtime: AgentRuntime, confirmations: Arc<RwLock<Vec<Confirmation>>>) -> Self {
+        Self { runtime, confirmations }
     }
 
     fn build_confirmation(call_id: &str, tool_name: &str, category: &ToolCategory, description: &str) -> Confirmation {
@@ -71,9 +68,8 @@ impl ProtocolEmitter for BackendProtocolSink {
                     confs.push(confirmation.clone());
                 }
 
-                let _ = self
-                    .event_tx
-                    .send(AgentStreamEvent::AcpPermission(AcpPermissionEventData::Confirmation(
+                self.runtime
+                    .emit(AgentStreamEvent::AcpPermission(AcpPermissionEventData::Confirmation(
                         confirmation.clone(),
                     )));
 
@@ -89,7 +85,7 @@ impl ProtocolEmitter for BackendProtocolSink {
                     confs.retain(|c| c.call_id != *call_id);
                 }
 
-                let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                self.runtime.emit(AgentStreamEvent::ToolCall(ToolCallEventData {
                     call_id: call_id.clone(),
                     name: format!("cancelled: {reason}"),
                     args: serde_json::Value::Null,
@@ -98,6 +94,7 @@ impl ProtocolEmitter for BackendProtocolSink {
                     output: None,
                     description: None,
                     parent_call_id: None,
+                    files: None,
                 }));
             }
 
@@ -114,12 +111,13 @@ mod tests {
 
     fn make_sink() -> (
         BackendProtocolSink,
-        broadcast::Receiver<AgentStreamEvent>,
+        tokio::sync::broadcast::Receiver<AgentStreamEvent>,
         Arc<RwLock<Vec<Confirmation>>>,
     ) {
-        let (tx, rx) = broadcast::channel(16);
+        let runtime = AgentRuntime::new("conv-test", "/tmp", 16);
+        let rx = runtime.subscribe();
         let confs = Arc::new(RwLock::new(Vec::new()));
-        let sink = BackendProtocolSink::new(tx, confs.clone());
+        let sink = BackendProtocolSink::new(runtime, confs.clone());
         (sink, rx, confs)
     }
 
@@ -216,9 +214,9 @@ mod tests {
 
     #[test]
     fn no_panic_when_no_receivers() {
-        let (tx, _) = broadcast::channel(16);
+        let runtime = AgentRuntime::new("conv-test", "/tmp", 16);
         let confs = Arc::new(RwLock::new(Vec::new()));
-        let sink = BackendProtocolSink::new(tx, confs);
+        let sink = BackendProtocolSink::new(runtime, confs);
         let event = ProtocolEvent::ToolRequest {
             msg_id: "m1".into(),
             call_id: "c1".into(),

@@ -14,6 +14,7 @@ use crate::ConversationError;
 pub struct ConversationRuntimeStateService {
     state: Mutex<ConversationRuntimeState>,
     release_notify: Notify,
+    cancel_notify: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -264,17 +265,50 @@ impl ConversationRuntimeStateService {
     /// it would make the orchestrator abort turns whose cancel is already being
     /// handled. This one is turn-scoped and consumed exactly once.
     pub fn defer_cancel(&self, conversation_id: &str, turn_id: &str) {
-        match self.state.lock() {
+        let deferred = match self.state.lock() {
             Ok(mut state) => {
                 state
                     .deferred_cancels
                     .insert(conversation_id.to_owned(), turn_id.to_owned());
                 info!(conversation_id, turn_id, "cancel deferred until the agent registers");
+                true
             }
-            Err(_) => warn!(
-                conversation_id,
-                "conversation runtime state lock poisoned while deferring cancel"
-            ),
+            Err(_) => {
+                warn!(
+                    conversation_id,
+                    "conversation runtime state lock poisoned while deferring cancel"
+                );
+                false
+            }
+        };
+        if deferred {
+            self.cancel_notify.notify_waiters();
+        }
+    }
+
+    /// Wait until a cancel recorded before agent registration targets this turn.
+    ///
+    /// The wait is paired with [`Self::defer_cancel`] so a cold agent build can
+    /// be dropped as soon as the user presses stop. The state check happens
+    /// after registering the notification future, which closes the race between
+    /// the check and the cancel request.
+    pub async fn wait_for_deferred_cancel(&self, conversation_id: &str, turn_id: &str) {
+        loop {
+            let notified = self.cancel_notify.notified();
+            let matches_turn = self
+                .state
+                .lock()
+                .map(|state| {
+                    state
+                        .deferred_cancels
+                        .get(conversation_id)
+                        .is_some_and(|id| id == turn_id)
+                })
+                .unwrap_or(false);
+            if matches_turn {
+                return;
+            }
+            notified.await;
         }
     }
 

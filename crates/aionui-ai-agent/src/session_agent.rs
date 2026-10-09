@@ -11,22 +11,22 @@
 //! `SessionBackend::dispatch`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, now_ms};
 use aionui_session::{
-    BackendError, Command, CommandMeta, ContentBlock, ModeInfo, ModelInfo, SessionBackend, SessionEnvelope,
+    Admission, BackendError, Command, CommandMeta, ContentBlock, ModeInfo, ModelInfo, SessionBackend, SessionEnvelope,
     SessionEvent, ToolResultContent,
 };
 use futures_util::stream::BoxStream;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 use tracing::warn;
 
 use crate::agent_task::IAgentTask;
 use crate::error::AgentError;
 use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::session_updates::ThinkingEventData;
-use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallFileChange, ToolCallStatus};
 use crate::protocol::events::{
     AgentStreamEvent, FinishEventData, StartEventData, TextEventData, TipType, TipsEventData,
 };
@@ -83,6 +83,21 @@ fn resolve_current_model_efforts(models: &[aionui_session::ModelInfo], current_m
 /// the translator writes and `subscribe()` reads, plus liveness bookkeeping.
 struct SessionRuntime {
     tx: broadcast::Sender<AgentStreamEvent>,
+    dispatch_gate: AsyncMutex<()>,
+    turn_control: std::sync::Mutex<TurnControl>,
+    /// Highest backend turn generation accepted by this task. The next user turn
+    /// uses it to reject frames from a previous turn before the pump observes the
+    /// new generation on its event stream.
+    last_dispatched_turn_gen: AtomicU64,
+    stale_before_turn_gen: AtomicU64,
+    /// Shared terminal ownership between the event pump and force-kill path.
+    /// The pump may receive a real terminal after `kill_and_wait` already
+    /// emitted the synthetic Finish; only the first claimant may close the
+    /// turn.
+    terminal_claimed: AtomicBool,
+    /// A force-kill claimed the terminal before the pump drained the backend.
+    /// The pump uses this to absorb all late frames from that killed turn.
+    force_terminal_claimed: AtomicBool,
     last_activity_ms: AtomicI64,
     /// Live (declared, not yet terminal) background containers — the pump's
     /// `workflow_cards` ledger size, mirrored here so the idle scanner can see
@@ -137,6 +152,25 @@ struct SessionRuntime {
     caps_fallback: std::sync::Mutex<CapsFallback>,
 }
 
+#[derive(Debug, Default)]
+struct TurnControl {
+    active_turn_id: Option<String>,
+    dispatch_started: bool,
+    cancel_requested: bool,
+    /// A cancel can arrive before the send task gets to `send_message`. Keep the
+    /// turn id until that task observes it, so the cancellation cannot be lost
+    /// just because the session runtime had no active turn yet.
+    pre_cancelled_turns: std::collections::HashSet<String>,
+    last_completed_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelDispatch {
+    Ignored,
+    BeforeDispatch,
+    AfterDispatch,
+}
+
 /// Backend-reported current values, mirrored out of `capabilities()` so the
 /// backend-Arc-free event pump can apply the same fallback REST applies.
 #[derive(Debug, Clone, Default)]
@@ -147,6 +181,133 @@ struct CapsFallback {
 }
 
 impl SessionRuntime {
+    fn emit(&self, event: AgentStreamEvent) {
+        let _ = self.tx.send(event);
+    }
+
+    fn begin_turn(&self, turn_id: Option<&str>) {
+        let mut control = self.turn_control.lock().ok();
+        let previous_active = control.as_ref().is_some_and(|control| control.active_turn_id.is_some());
+        if !previous_active {
+            let previous_generation = self.last_dispatched_turn_gen.load(Ordering::SeqCst);
+            self.stale_before_turn_gen
+                .store(previous_generation.saturating_add(1), Ordering::SeqCst);
+        }
+        self.terminal_claimed.store(false, Ordering::SeqCst);
+        self.force_terminal_claimed.store(false, Ordering::SeqCst);
+        let Some(turn_id) = turn_id.filter(|id| !id.trim().is_empty()) else {
+            return;
+        };
+        if let Some(control) = control.as_mut() {
+            control.active_turn_id = Some(turn_id.to_owned());
+            control.dispatch_started = false;
+            control.cancel_requested = false;
+        }
+    }
+
+    fn current_turn_id(&self) -> Option<String> {
+        self.turn_control
+            .lock()
+            .ok()
+            .and_then(|control| control.active_turn_id.clone())
+    }
+
+    fn record_turn_dispatch(&self, admission: Admission, turn_gen: u64) {
+        if !matches!(admission, Admission::Started) || turn_gen == 0 {
+            return;
+        }
+        self.last_dispatched_turn_gen.fetch_max(turn_gen, Ordering::SeqCst);
+        self.stale_before_turn_gen.fetch_max(turn_gen, Ordering::SeqCst);
+    }
+
+    fn is_stale_event(&self, turn_gen: u64, last_seen_turn_gen: u64) -> bool {
+        turn_gen > 0 && (turn_gen < last_seen_turn_gen || turn_gen < self.stale_before_turn_gen.load(Ordering::SeqCst))
+    }
+
+    fn take_pre_cancelled_turn(&self, turn_id: &str) -> bool {
+        self.turn_control
+            .lock()
+            .map(|mut control| control.pre_cancelled_turns.remove(turn_id))
+            .unwrap_or(false)
+    }
+
+    /// Atomically admit a turn to backend dispatch. A cancel may race this
+    /// boundary, so checking the pre-cancelled set and marking dispatch started
+    /// must happen under one lock; otherwise a cancel can emit Finish and the
+    /// sender can still put the prompt on the backend afterward.
+    fn admit_dispatch(&self, turn_id: Option<&str>) -> bool {
+        let Some(turn_id) = turn_id else {
+            return true;
+        };
+        let Ok(mut control) = self.turn_control.lock() else {
+            return false;
+        };
+        if control.pre_cancelled_turns.remove(turn_id) {
+            return false;
+        }
+        if control.active_turn_id.as_deref() != Some(turn_id) {
+            return false;
+        }
+        control.dispatch_started = true;
+        true
+    }
+
+    fn request_cancel(&self, turn_id: &str) -> CancelDispatch {
+        let Ok(mut control) = self.turn_control.lock() else {
+            return CancelDispatch::Ignored;
+        };
+
+        match control.active_turn_id.as_deref() {
+            Some(active) if active != turn_id => CancelDispatch::Ignored,
+            Some(_) => {
+                control.cancel_requested = true;
+                if control.dispatch_started {
+                    CancelDispatch::AfterDispatch
+                } else {
+                    control.pre_cancelled_turns.insert(turn_id.to_owned());
+                    CancelDispatch::BeforeDispatch
+                }
+            }
+            None if control.last_completed_turn_id.as_deref() == Some(turn_id) => CancelDispatch::Ignored,
+            None => {
+                control.pre_cancelled_turns.insert(turn_id.to_owned());
+                CancelDispatch::BeforeDispatch
+            }
+        }
+    }
+
+    fn cancel_is_currently_dispatching(&self, turn_id: &str) -> bool {
+        self.turn_control
+            .lock()
+            .map(|control| {
+                control.active_turn_id.as_deref() == Some(turn_id)
+                    && control.dispatch_started
+                    && control.cancel_requested
+            })
+            .unwrap_or(false)
+    }
+
+    fn finish_active_turn(&self) {
+        if let Ok(mut control) = self.turn_control.lock() {
+            control.last_completed_turn_id = control.active_turn_id.take();
+            control.dispatch_started = false;
+            control.cancel_requested = false;
+        }
+    }
+
+    fn finish_turn(&self, turn_id: Option<&str>) {
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+        if let Ok(mut control) = self.turn_control.lock()
+            && control.active_turn_id.as_deref() == Some(turn_id)
+        {
+            control.last_completed_turn_id = control.active_turn_id.take();
+            control.dispatch_started = false;
+            control.cancel_requested = false;
+        }
+    }
+
     fn touch(&self) {
         self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
     }
@@ -157,6 +318,33 @@ impl SessionRuntime {
         if let Ok(mut g) = self.status.lock() {
             *g = Some(s);
         }
+    }
+
+    /// Claim the one terminal boundary for the current turn.
+    ///
+    /// Both the backend event pump and the watchdog force-kill path can race
+    /// to close a turn. Keeping this claim in the shared runtime makes the
+    /// boundary idempotent across those two producers instead of relying on
+    /// the pump's local bookkeeping alone.
+    fn claim_terminal(&self, force_kill: bool) -> bool {
+        if self.terminal_claimed.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        if force_kill {
+            self.force_terminal_claimed.store(true, Ordering::SeqCst);
+        }
+        self.set_status(ConversationStatus::Finished);
+        self.finish_active_turn();
+        true
+    }
+
+    fn force_terminal_claimed(&self) -> bool {
+        self.force_terminal_claimed.load(Ordering::SeqCst)
+    }
+
+    fn reset_terminal_claim(&self) {
+        self.terminal_claimed.store(false, Ordering::SeqCst);
+        self.force_terminal_claimed.store(false, Ordering::SeqCst);
     }
     fn set_session_id(&self, id: String) {
         if let Ok(mut g) = self.session_id.lock() {
@@ -207,10 +395,10 @@ impl SessionRuntime {
         self.caps_fallback.lock().ok().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// Atomic clean-converge frame: if not already `Finished`, set status ←
-    /// `Finished` AND broadcast a clean `Finish` on `tx`. Idempotent in the
-    /// `Finished` absorbing state (a repeat cancel / a late real Finish is a
-    /// no-op — no second broadcast). This is the precise isomorph of the ACP
+    /// Atomic clean-converge frame: if this turn has no terminal owner, set
+    /// status ← `Finished` AND broadcast a clean `Finish` on `tx`. Idempotent
+    /// across a repeat cancel and a late real Finish — no second broadcast.
+    /// This is the precise isomorph of the ACP
     /// path's `AgentRuntime::emit_finish`: it drives the SAME convergence chain
     /// (relay break → orchestrator releases the turn claim → `cancelling`
     /// cleared → `Idle`) so the gate recovers in seconds on the `UserCancel`
@@ -218,18 +406,10 @@ impl SessionRuntime {
     /// It is emitted for a `UserCancelTimeout` kill BEFORE the process is torn
     /// down, so the relay returns clean (a "cancelled", not a red crash card).
     fn emit_finish_once(&self) {
-        let already = {
-            let mut g = self.status.lock().unwrap_or_else(|e| e.into_inner());
-            let was = matches!(*g, Some(ConversationStatus::Finished));
-            if !was {
-                *g = Some(ConversationStatus::Finished);
-            }
-            was
-        };
-        if already {
+        if !self.claim_terminal(true) {
             return;
         }
-        let _ = self.tx.send(AgentStreamEvent::Finish(FinishEventData {
+        self.emit(AgentStreamEvent::Finish(FinishEventData {
             session_id: self.session_id(),
         }));
     }
@@ -494,6 +674,12 @@ impl SessionAgentTask {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
             tx,
+            dispatch_gate: AsyncMutex::new(()),
+            turn_control: std::sync::Mutex::new(TurnControl::default()),
+            last_dispatched_turn_gen: AtomicU64::new(0),
+            stale_before_turn_gen: AtomicU64::new(0),
+            terminal_claimed: AtomicBool::new(false),
+            force_terminal_claimed: AtomicBool::new(false),
             last_activity_ms: AtomicI64::new(now_ms()),
             live_background_tasks: std::sync::atomic::AtomicUsize::new(0),
             status: std::sync::Mutex::new(None),
@@ -1339,7 +1525,19 @@ impl IAgentTask for SessionAgentTask {
     }
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        let turn_id = data.turn_id.clone();
+        self.runtime.begin_turn(turn_id.as_deref());
+        // A stop can arrive before the orchestrator gets this task's send
+        // future scheduled. The cancel path already emitted the terminal
+        // frames; consume the marker and leave the backend untouched.
+        if let Some(turn_id) = turn_id.as_deref()
+            && self.runtime.take_pre_cancelled_turn(turn_id)
+        {
+            self.runtime.finish_turn(Some(turn_id));
+            return Ok(());
+        }
         self.runtime.touch();
+        self.runtime.set_status(ConversationStatus::Running);
         let content = self.build_prompt_blocks(&data).await;
         // DEV (`--dump-prompts`): borrow the final blocks BEFORE they move into
         // Command::Send. No-op / best-effort — never affects the dispatch.
@@ -1354,18 +1552,30 @@ impl IAgentTask for SessionAgentTask {
                 client_msg_id: Some(data.msg_id),
             },
         };
+        // Serialize Send and Cancel on the backend command path. The admission
+        // check also closes the race where cancel arrives after content
+        // preparation but before the prompt is actually dispatched.
+        let _dispatch_guard = self.runtime.dispatch_gate.lock().await;
+        if !self.runtime.admit_dispatch(turn_id.as_deref()) {
+            if let Some(turn_id) = turn_id.as_deref() {
+                self.runtime.finish_turn(Some(turn_id));
+            }
+            return Ok(());
+        }
         // Emit the turn-start lifecycle frame BEFORE dispatch, exactly like the ACP
         // path (agent_session_flow.rs emits Start{session_id} right before prompt()).
         // The backend's own turn-start signal (claude/codex PromptAccepted) arrives
         // AFTER the first text delta, so it cannot drive an at-the-front Start — the
         // send call is the correct, ordering-stable anchor. session_id is None on the
         // very first turn (backend not yet bound) and filled on every subsequent turn.
-        let _ = self.runtime.tx.send(AgentStreamEvent::Start(StartEventData {
+        self.runtime.emit(AgentStreamEvent::Start(StartEventData {
             session_id: self.runtime.session_id(),
         }));
-        self.runtime.set_status(ConversationStatus::Running);
-        match self.backend.dispatch(cmd).await {
-            Ok(_receipt) => Ok(()),
+        let result = match self.backend.dispatch(cmd).await {
+            Ok(receipt) => {
+                self.runtime.record_turn_dispatch(receipt.admission, receipt.turn_gen);
+                Ok(())
+            }
             // Dead resume anchor surfaced at DISPATCH time (codex rejected the
             // thread/resume → bound-thread poison, ELECTRON-3Q0): the stored anchor
             // can never resume again — clear it NOW so the auto-replay (and any
@@ -1398,18 +1608,47 @@ impl IAgentTask for SessionAgentTask {
                 ))))
             }
             Err(e) => Err(AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string()))),
+        };
+        if result.is_err() {
+            self.runtime.finish_turn(turn_id.as_deref());
         }
+        result
     }
 
     async fn cancel(&self) -> Result<(), AgentError> {
         self.runtime.touch();
-        self.backend
-            .dispatch(Command::Cancel {
-                target: aionui_session::CancelTarget::Turn,
-            })
-            .await
-            .map(|_| ())
-            .map_err(|e| AgentError::internal(e.to_string()))
+        if let Some(turn_id) = self.runtime.current_turn_id() {
+            return self.cancel_for_turn(&turn_id).await;
+        }
+        self.dispatch_cancel_command().await
+    }
+
+    async fn cancel_for_turn(&self, turn_id: &str) -> Result<(), AgentError> {
+        self.runtime.touch();
+        match self.runtime.request_cancel(turn_id) {
+            CancelDispatch::Ignored => Ok(()),
+            CancelDispatch::BeforeDispatch => {
+                // There is no backend turn to interrupt. Still settle the
+                // subscribed relay immediately; send_message will observe the
+                // retained marker and skip its later Send command.
+                self.runtime.set_status(ConversationStatus::Running);
+                self.runtime.emit(AgentStreamEvent::Start(StartEventData {
+                    session_id: self.runtime.session_id(),
+                }));
+                self.runtime.emit_finish_once();
+                Ok(())
+            }
+            CancelDispatch::AfterDispatch => {
+                let _dispatch_guard = self.runtime.dispatch_gate.lock().await;
+                // A terminal event may have won the race while this cancel was
+                // waiting for the Send command. Never let this stale request
+                // reach the next turn.
+                if !self.runtime.cancel_is_currently_dispatching(turn_id) {
+                    return Ok(());
+                }
+                self.dispatch_cancel_command_locked().await
+            }
+        }
     }
 
     fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AgentError> {
@@ -1453,6 +1692,21 @@ impl IAgentTask for SessionAgentTask {
 }
 
 impl SessionAgentTask {
+    async fn dispatch_cancel_command(&self) -> Result<(), AgentError> {
+        let _dispatch_guard = self.runtime.dispatch_gate.lock().await;
+        self.dispatch_cancel_command_locked().await
+    }
+
+    async fn dispatch_cancel_command_locked(&self) -> Result<(), AgentError> {
+        self.backend
+            .dispatch(Command::Cancel {
+                target: aionui_session::CancelTarget::Turn,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| AgentError::internal(e.to_string()))
+    }
+
     /// Awaitable force-kill (aligns with `AcpAgentManager::kill_and_wait`): the
     /// awaitable teardown entry the `UserCancel` watchdog uses. For a
     /// `UserCancelTimeout` kill it emits the clean `Finish` synchronously FIRST
@@ -2674,7 +2928,7 @@ fn emit_config_options_snapshot(modes: &[ModeInfo], models: &[ModelInfo], runtim
     if !config_options.is_empty()
         && let Ok(v) = serde_json::to_value(serde_json::json!({ "config_options": config_options }))
     {
-        let _ = runtime.tx.send(AgentStreamEvent::AcpConfigOption(v));
+        runtime.emit(AgentStreamEvent::AcpConfigOption(v));
     }
 }
 
@@ -2705,6 +2959,10 @@ fn spawn_event_pump(
         // path, bypassing this buffer. The timer admits at most 16 queued previews
         // (1 MiB of output payload); other event types retain their existing policy.
         let mut tool_output = ToolOutputPreviews::default();
+        // Codex sends the full cumulative file diff through turn/diff/updated.
+        // Keep the latest snapshot so it can be replaced in one stable tool row
+        // and closed before the turn's terminal frame.
+        let mut live_turn_diff: Option<(u64, String)> = None;
         // In-flight workflow/subagent refs, mirroring `state::background_active`
         // (any non-terminal roster entry ⇒ in-flight). claude's non-blocking
         // Workflow turn emits MULTIPLE `result` frames: the LAUNCH result arrives
@@ -2818,7 +3076,7 @@ fn spawn_event_pump(
                         && let Some((call_id, output)) = tool_output.take_next()
                     {
                         let name = tool_name.get(&call_id).cloned().unwrap_or_default();
-                        let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                        runtime.emit(AgentStreamEvent::ToolCall(ToolCallEventData {
                             call_id,
                             name,
                             args: serde_json::Value::Null,
@@ -2827,6 +3085,7 @@ fn spawn_event_pump(
                             output: Some(output),
                             description: None,
                             parent_call_id: None,
+                            files: None,
                         }));
                     }
                     continue;
@@ -2846,25 +3105,49 @@ fn spawn_event_pump(
                         // this, between turns the conversation's background stream
                         // watcher does (forward + persist). The pump no longer
                         // broadcasts directly — that produced un-persisted frames.
-                        let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                        runtime.emit(AgentStreamEvent::WorkflowProgress(data));
                     }
                     continue;
                 }
             };
+            // A Codex detached exec deliberately outlives its prompt turn. Its
+            // output/result is stamped with the old generation even after a
+            // follow-up turn has started, so retain only those follow-up frames
+            // for a call that is still open and was explicitly identified as a
+            // detached exec. Ordinary stale content and terminals must remain
+            // suppressed: they could otherwise close or repaint the new turn.
+            let stale_detached_exec_follow_up = is_detached_exec_follow_up(&env.event, &open_tools, &tool_args);
+            if runtime.is_stale_event(env.turn_gen, last_seen_turn_gen) && !stale_detached_exec_follow_up {
+                tracing::debug!(
+                    conv_id = %conversation_id,
+                    turn_gen = env.turn_gen,
+                    last_seen_turn_gen,
+                    "session-pump: dropping stale event from an older turn generation"
+                );
+                continue;
+            }
             runtime.touch();
             tracing::debug!(conv_id = %conversation_id, event = session_event_name(&env.event), "session-pump: backend event");
 
             if env.turn_gen > last_seen_turn_gen {
-                if last_seen_turn_gen > 0 {
+                let previous_turn_gen = last_seen_turn_gen;
+                if previous_turn_gen > 0 {
                     tracing::debug!(
                         conv_id = %conversation_id,
-                        from = last_seen_turn_gen,
+                        from = previous_turn_gen,
                         to = env.turn_gen,
                         "session-pump: turn gen advanced; per-turn suppression state reset"
                     );
+                    if let Some((diff_turn_gen, diff)) = live_turn_diff.take()
+                        && let Some(event) =
+                            codex_live_diff_event(&conversation_id, diff_turn_gen, &diff, ToolCallStatus::Canceled)
+                    {
+                        runtime.emit(event);
+                    }
                 }
-                if last_seen_turn_gen > 0 {
+                if previous_turn_gen > 0 {
                     tool_output.retain(|id| open_tools.contains_key(id) && is_detached_exec_call(tool_args.get(id)));
+                    tool_args.retain(|id, _| open_tools.contains_key(id));
                 }
                 last_seen_turn_gen = env.turn_gen;
                 runtime.set_status(ConversationStatus::Running);
@@ -2875,6 +3158,30 @@ fn spawn_event_pump(
                 workflow_inflight.clear();
                 finish_suppressed_pending = false;
                 synthetic_finish_emitted = false;
+                // A force-kill may happen before the pump observes the first
+                // envelope for the turn. Preserve that claim across the first
+                // generation transition; send_message/begin_turn clears it
+                // when a genuinely new turn is admitted. Once an already
+                // observed generation advances, however, the new turn owns a
+                // fresh terminal boundary even if the old turn was force-killed.
+                if previous_turn_gen > 0 {
+                    runtime.reset_terminal_claim();
+                }
+            }
+
+            // A watchdog force-kill has already published the terminal for this
+            // turn. The backend can still flush content or a TurnResult while
+            // its process is being torn down; none of those frames may reopen
+            // or double-close the turn. A new turn resets this marker when its
+            // generation advances (or when send_message calls begin_turn).
+            if runtime.force_terminal_claimed() {
+                tracing::info!(
+                    conv_id = %conversation_id,
+                    turn_gen = env.turn_gen,
+                    event = session_event_name(&env.event),
+                    "session-pump: swallowing frame after force-kill terminal"
+                );
+                continue;
             }
 
             // The deferred DUPLICATE terminal: claude ends a turn twice — the
@@ -2910,13 +3217,17 @@ fn spawn_event_pump(
                     | SessionEvent::ToolCall { .. }
                     | SessionEvent::ToolResult { .. }
                     | SessionEvent::Permission { .. }
-                    | SessionEvent::Ask { .. } => {
+                    | SessionEvent::Ask { .. }
+                    | SessionEvent::TurnDiffUpdated { .. } => {
                         tracing::info!(
                             conv_id = %conversation_id,
                             event = session_event_name(&env.event),
                             "session-pump: content after settled terminal — CLI-initiated turn begins"
                         );
                         terminal_result_seen = false;
+                        synthetic_finish_emitted = false;
+                        runtime.reset_terminal_claim();
+                        runtime.set_status(ConversationStatus::Running);
                     }
                     _ => {}
                 }
@@ -2942,6 +3253,21 @@ fn spawn_event_pump(
                         preview_limit_bytes = tool_output::PREVIEW_BYTES,
                         "session-pump: live tool preview truncated; final result is unaffected"
                     );
+                }
+                continue;
+            }
+
+            // Codex's turn/diff/updated is a cumulative replacement snapshot,
+            // not a delta. Project it to one stable tool-call row so the client
+            // can render the live file changes while the turn is still running.
+            if let SessionEvent::TurnDiffUpdated { diff } = &env.event {
+                if !diff.is_empty()
+                    && let Some(event) =
+                        codex_live_diff_event(&conversation_id, env.turn_gen, diff, ToolCallStatus::Running)
+                {
+                    live_turn_diff = Some((env.turn_gen, diff.clone()));
+                    saw_visible_output = true;
+                    runtime.emit(event);
                 }
                 continue;
             }
@@ -2984,11 +3310,9 @@ fn spawn_event_pump(
                             )
                         })
                         .collect();
-                    let _ = runtime
-                        .tx
-                        .send(AgentStreamEvent::AvailableCommands(AvailableCommandsEventData {
-                            commands,
-                        }));
+                    runtime.emit(AgentStreamEvent::AvailableCommands(AvailableCommandsEventData {
+                        commands,
+                    }));
                 }
                 continue;
             }
@@ -3033,7 +3357,7 @@ fn spawn_event_pump(
                 // Uniform delivery: the per-turn relay consumes this in-turn; the
                 // conversation's background stream watcher consumes it between
                 // turns (forward + persist), so no pump-side broadcast bypass.
-                let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                runtime.emit(AgentStreamEvent::WorkflowProgress(data));
             }
             runtime.set_live_background_tasks(workflow_cards.len());
 
@@ -3135,7 +3459,7 @@ fn spawn_event_pump(
                                 aionui_common::now_ms(),
                                 &conversation_id,
                             ) {
-                                let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                                runtime.emit(AgentStreamEvent::WorkflowProgress(data));
                             }
                             runtime.set_live_background_tasks(workflow_cards.len());
                             // Same per-turn closure the real terminal arm performs:
@@ -3143,7 +3467,7 @@ fn spawn_event_pump(
                             // Finish (the relay stops forwarding the turn at Finish).
                             for (call_id, name) in open_tools.drain() {
                                 let output = tool_output.remove(&call_id);
-                                let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                                runtime.emit(AgentStreamEvent::ToolCall(ToolCallEventData {
                                     call_id,
                                     name,
                                     args: serde_json::Value::Null,
@@ -3152,7 +3476,20 @@ fn spawn_event_pump(
                                     output,
                                     description: None,
                                     parent_call_id: None,
+                                    files: None,
                                 }));
+                            }
+                            if let Some((diff_turn_gen, diff)) = live_turn_diff.take()
+                                && let Some(event) = codex_live_diff_event(
+                                    &conversation_id,
+                                    diff_turn_gen,
+                                    &diff,
+                                    ToolCallStatus::Canceled,
+                                )
+                            {
+                                // Synthetic cancellation is the terminal boundary for
+                                // this turn, so settle the live diff before Finish.
+                                runtime.emit(event);
                             }
                             tool_output.clear();
                             tool_name.clear();
@@ -3222,8 +3559,27 @@ fn spawn_event_pump(
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
                     // A real (unsuppressed) terminal settles any owed launch Finish —
                     // its own Finish/Error closes the turn.
+                    if !runtime.claim_terminal(false) {
+                        tracing::info!(
+                            conv_id = %conversation_id,
+                            event = session_event_name(&env.event),
+                            "session-pump: swallowing terminal after another producer already claimed it"
+                        );
+                        continue;
+                    }
                     finish_suppressed_pending = false;
-                    runtime.set_status(ConversationStatus::Finished);
+                    if let Some((diff_turn_gen, diff)) = live_turn_diff.take()
+                        && let Some(event) = codex_live_diff_event(
+                            &conversation_id,
+                            diff_turn_gen,
+                            &diff,
+                            codex_live_diff_terminal_status(&env.event),
+                        )
+                    {
+                        // The relay stops at Finish/Error, so the live diff's
+                        // terminal replacement must be emitted first.
+                        runtime.emit(event);
+                    }
                     // Close every tool call the turn left open (cancel/crash/dropped
                     // result): emit a terminal `Canceled` frame per call so the
                     // persisted row leaves "work" and the frontend spinner stops.
@@ -3248,7 +3604,7 @@ fn spawn_event_pump(
                         aionui_common::now_ms(),
                         &conversation_id,
                     ) {
-                        let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+                        runtime.emit(AgentStreamEvent::WorkflowProgress(data));
                     }
                     runtime.set_live_background_tasks(workflow_cards.len());
                     // Calls deliberately left running past this turn end (see below);
@@ -3281,7 +3637,7 @@ fn spawn_event_pump(
                             "session-pump: closing tool call left open at turn end as canceled"
                         );
                         let output = tool_output.remove(&call_id);
-                        let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                        runtime.emit(AgentStreamEvent::ToolCall(ToolCallEventData {
                             call_id,
                             name,
                             args: serde_json::Value::Null,
@@ -3290,6 +3646,7 @@ fn spawn_event_pump(
                             output,
                             description: None,
                             parent_call_id: None,
+                            files: None,
                         }));
                     }
                     for (call_id, name) in kept_open {
@@ -3326,6 +3683,7 @@ fn spawn_event_pump(
                     // name, or the card re-renders nameless.
                     tool_output.retain(|call_id| open_tools.contains_key(call_id));
                     tool_name.retain(|call_id, _| open_tools.contains_key(call_id));
+                    tool_args.retain(|call_id, _| open_tools.contains_key(call_id));
                     // Reset the per-turn visibility flag for the next turn.
                     saw_visible_output = false;
                 }
@@ -3350,13 +3708,18 @@ fn spawn_event_pump(
             if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&env.event)) {
                 broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
             }
-            for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
+            let completed_tool_id = match &env.event {
+                SessionEvent::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            };
+            for mut ev in translate_event_for_turn(env.event, &conversation_id, env.turn_gen, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
                 // `stamp_tool_name`): the terminal ToolResult frame leaves the name
                 // empty, and the upsert-by-call_id persistence would otherwise clobber
                 // the row's name to "". Runs before any routing decision below;
                 // no-op on non-ToolCall frames (e.g. the suppressed Finish).
                 stamp_tool_name(&mut tool_name, &mut ev);
+                stamp_tool_input(&tool_args, &mut ev);
                 // While a progress card is LIVE on a tool call, no translated
                 // frame may repaint that call terminal. The launching call's own
                 // tool_result lands one frame AFTER task_started (verified:
@@ -3394,7 +3757,7 @@ fn spawn_event_pump(
                 if matches!(ev, AgentStreamEvent::Finish(_))
                     && let Some(tip) = pending_empty_turn_tip.take()
                 {
-                    let _ = runtime.tx.send(AgentStreamEvent::Tips(tip));
+                    runtime.emit(AgentStreamEvent::Tips(tip));
                 }
                 // Suppress the intermediate workflow-launch Finish: the assistant's
                 // reply text already reached the frontend via MessageDelta→Text, so
@@ -3412,7 +3775,7 @@ fn spawn_event_pump(
                     // The turn now owes this Finish; the workflow drain (or a later
                     // real terminal) must settle it — see `finish_suppressed_pending`.
                     finish_suppressed_pending = true;
-                    let _ = runtime.tx.send(AgentStreamEvent::SegmentBreak);
+                    runtime.emit(AgentStreamEvent::SegmentBreak);
                     continue;
                 }
                 // Stamp the CLI session id onto the Finish frame, matching the ACP path
@@ -3433,8 +3796,27 @@ fn spawn_event_pump(
                     data.session_id = runtime.session_id();
                 }
                 // A send error only means no live subscribers — harmless.
-                let _ = runtime.tx.send(ev);
+                runtime.emit(ev);
             }
+            if let Some(call_id) = completed_tool_id {
+                // A workflow card owns its own cloned metadata once opened. Keep
+                // the maps only when a card still needs them for a later roster
+                // frame; ordinary and detached calls are fully terminal here.
+                let card_still_needs_metadata = workflow_cards.values().any(|card| card.call_id() == call_id);
+                if !card_still_needs_metadata {
+                    tool_name.remove(&call_id);
+                    tool_args.remove(&call_id);
+                }
+            }
+        }
+
+        // The stream is terminating without a turn result. Settle the latest live
+        // diff before any terminal tool output so the frontend cannot retain a
+        // `running` file-change row after the backend disappears.
+        if let Some((diff_turn_gen, diff)) = live_turn_diff.take()
+            && let Some(event) = codex_live_diff_event(&conversation_id, diff_turn_gen, &diff, ToolCallStatus::Canceled)
+        {
+            runtime.emit(event);
         }
 
         // Preserve the latest bounded output even if the stream ends before a
@@ -3444,7 +3826,7 @@ fn spawn_event_pump(
                 .remove(&call_id)
                 .or_else(|| tool_name.remove(&call_id))
                 .unwrap_or_default();
-            let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            runtime.emit(AgentStreamEvent::ToolCall(ToolCallEventData {
                 call_id,
                 name,
                 args: serde_json::Value::Null,
@@ -3453,6 +3835,7 @@ fn spawn_event_pump(
                 output: Some(output),
                 description: None,
                 parent_call_id: None,
+                files: None,
             }));
         }
 
@@ -3470,7 +3853,7 @@ fn spawn_event_pump(
             aionui_common::now_ms(),
             &conversation_id,
         ) {
-            let _ = runtime.tx.send(AgentStreamEvent::WorkflowProgress(data));
+            runtime.emit(AgentStreamEvent::WorkflowProgress(data));
         }
         runtime.set_live_background_tasks(workflow_cards.len());
     });
@@ -4003,6 +4386,7 @@ fn update_workflow_cards(
                                 output: None,
                                 description: None,
                                 parent_call_id: None,
+                                files: None,
                             },
                             agents: Vec::new(),
                             settle_only: true,
@@ -4117,6 +4501,22 @@ fn is_detached_exec_call(args: Option<&serde_json::Value>) -> bool {
         .is_some_and(|s| s.starts_with("unifiedExec"))
 }
 
+/// Whether a stale-generation frame belongs to a detached Codex exec that was
+/// intentionally kept open past its launching turn. These are the only old
+/// generation frames allowed through after a follow-up turn starts.
+fn is_detached_exec_follow_up(
+    event: &SessionEvent,
+    open_tools: &std::collections::HashMap<String, String>,
+    tool_args: &std::collections::HashMap<String, serde_json::Value>,
+) -> bool {
+    let call_id = match event {
+        SessionEvent::ToolOutputDelta { item_id, .. } => item_id,
+        SessionEvent::ToolResult { tool_use_id, .. } => tool_use_id,
+        _ => return false,
+    };
+    open_tools.contains_key(call_id) && is_detached_exec_call(tool_args.get(call_id))
+}
+
 fn settle_workflow_cards(
     cards: &mut std::collections::HashMap<String, crate::workflow_progress::WorkflowCard>,
     status: crate::workflow_progress::CardStatus,
@@ -4172,6 +4572,27 @@ fn stamp_tool_name(names: &mut std::collections::HashMap<String, String>, ev: &m
         }
     } else {
         names.insert(data.call_id.clone(), data.name.clone());
+    }
+}
+
+/// Keep the original tool arguments alive across terminal and preview frames.
+///
+/// The database upsert replaces the JSON content for a call id. Terminal frames
+/// do not carry arguments on the backend wire, so without this projection a
+/// reloaded conversation loses the `old_string`/`new_string` pair that the
+/// renderer needs for Claude-style edit previews.
+fn stamp_tool_input(args: &std::collections::HashMap<String, serde_json::Value>, ev: &mut AgentStreamEvent) {
+    let AgentStreamEvent::ToolCall(data) = ev else {
+        return;
+    };
+    let Some(known) = args.get(&data.call_id) else {
+        return;
+    };
+    if data.args.is_null() {
+        data.args = known.clone();
+    }
+    if data.input.is_none() && !known.is_null() {
+        data.input = Some(known.clone());
     }
 }
 
@@ -4238,6 +4659,214 @@ fn empty_turn_tip(outcome: &aionui_session::TurnOutcome) -> Option<TipsEventData
     })
 }
 
+const CODEX_LIVE_DIFF_TOOL_NAME: &str = "fileChange";
+
+fn decode_git_quoted_path(value: &str) -> String {
+    if !value.starts_with('"') || !value.ends_with('"') {
+        return value.to_owned();
+    }
+
+    let mut decoded = String::new();
+    let mut chars = value[1..value.len() - 1].chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            break;
+        };
+        decoded.push(match escaped {
+            'n' => '\n',
+            't' => '\t',
+            'r' => '\r',
+            'b' => '\u{0008}',
+            'f' => '\u{000c}',
+            'v' => '\u{000b}',
+            other => other,
+        });
+    }
+    decoded
+}
+
+fn strip_git_path_prefix(value: &str) -> String {
+    let path = decode_git_quoted_path(value.trim());
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(&path)
+        .to_owned()
+}
+
+fn parse_git_path_tokens(value: &str) -> Vec<String> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let mut tokens = Vec::new();
+    while index < bytes.len() && tokens.len() < 2 {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+
+        let start = index;
+        if bytes[index] == b'"' {
+            index += 1;
+            let mut escaped = false;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                index += 1;
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    break;
+                }
+            }
+        } else {
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+        }
+        tokens.push(value[start..index].to_owned());
+    }
+    tokens
+}
+
+fn parse_git_diff_paths(line: &str) -> (Option<String>, Option<String>) {
+    let raw = line.strip_prefix("diff --git ").unwrap_or_default().trim();
+    let tokens = parse_git_path_tokens(raw);
+    if tokens.len() >= 2 && tokens[0].starts_with('"') {
+        return (
+            Some(strip_git_path_prefix(&tokens[0])),
+            Some(strip_git_path_prefix(&tokens[1])),
+        );
+    }
+
+    if let Some(separator) = raw.rfind(" b/") {
+        return (
+            Some(strip_git_path_prefix(&raw[..separator])),
+            Some(strip_git_path_prefix(&raw[separator + 1..])),
+        );
+    }
+
+    if tokens.len() >= 2 {
+        return (
+            Some(strip_git_path_prefix(&tokens[0])),
+            Some(strip_git_path_prefix(&tokens[1])),
+        );
+    }
+    (None, None)
+}
+
+fn parse_rename_header_path(line: &str, marker: &str) -> Option<String> {
+    let raw = line.strip_prefix(marker)?.strip_prefix(' ')?;
+    let path = strip_git_path_prefix(raw);
+    (!path.is_empty()).then_some(path)
+}
+
+/// Split Codex's cumulative unified diff into one structured file entry per
+/// path. `turn/diff/updated` is a full snapshot, so each entry keeps its own
+/// complete block and the client can replace the same tool row on every update.
+fn codex_live_diff_files(diff: &str) -> Vec<ToolCallFileChange> {
+    let lines: Vec<&str> = diff.split('\n').collect();
+    let mut starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.starts_with("diff --git ").then_some(index))
+        .collect();
+    if starts.is_empty() {
+        starts.push(0);
+    }
+
+    starts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, start)| {
+            let end = starts.get(index + 1).copied().unwrap_or(lines.len());
+            let block = lines.get(*start..end)?.join("\n");
+            let block_lines = &lines[*start..end];
+            let header_end = block_lines
+                .iter()
+                .position(|line| line.starts_with("@@"))
+                .unwrap_or(block_lines.len());
+            let header_lines = &block_lines[..header_end];
+            let rename_from = header_lines
+                .iter()
+                .find_map(|line| parse_rename_header_path(line, "rename from"));
+            let rename_to = header_lines
+                .iter()
+                .find_map(|line| parse_rename_header_path(line, "rename to"));
+            let (git_from, git_to) = header_lines
+                .iter()
+                .find(|line| line.starts_with("diff --git "))
+                .map_or((None, None), |line| parse_git_diff_paths(line));
+            let source_path = rename_from.or(git_from).or(git_to.clone());
+            let target_path = rename_to.or(git_to);
+            let path = source_path?;
+            let move_path = target_path.filter(|target| target != &path);
+            Some(ToolCallFileChange {
+                path,
+                move_path,
+                diff: Some(block),
+                old_text: None,
+                new_text: None,
+            })
+        })
+        .collect()
+}
+
+fn codex_live_diff_event(
+    conversation_id: &str,
+    turn_gen: u64,
+    diff: &str,
+    status: ToolCallStatus,
+) -> Option<AgentStreamEvent> {
+    let files = codex_live_diff_files(diff);
+    (!files.is_empty()).then(|| {
+        AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: format!("codex-turn-diff:{conversation_id}:{turn_gen}"),
+            name: CODEX_LIVE_DIFF_TOOL_NAME.into(),
+            args: serde_json::Value::Null,
+            status,
+            input: None,
+            output: None,
+            description: None,
+            parent_call_id: None,
+            files: Some(files),
+        })
+    })
+}
+
+fn codex_live_diff_terminal_status(event: &SessionEvent) -> ToolCallStatus {
+    match event {
+        SessionEvent::TurnResult {
+            is_error: true,
+            outcome: aionui_session::TurnOutcome::Cancelled { .. },
+            ..
+        } => ToolCallStatus::Canceled,
+        SessionEvent::TurnResult { is_error: true, .. } => ToolCallStatus::Error,
+        SessionEvent::TurnResult { .. } => ToolCallStatus::Completed,
+        SessionEvent::Detached { .. } => ToolCallStatus::Canceled,
+        _ => ToolCallStatus::Canceled,
+    }
+}
+
+fn translate_event_for_turn(
+    event: SessionEvent,
+    conversation_id: &str,
+    turn_gen: u64,
+    terminal_result_seen: bool,
+) -> Vec<AgentStreamEvent> {
+    if let SessionEvent::TurnDiffUpdated { diff } = event {
+        return codex_live_diff_event(conversation_id, turn_gen, &diff, ToolCallStatus::Running)
+            .into_iter()
+            .collect();
+    }
+    translate_event(event, conversation_id, terminal_result_seen)
+}
+
 /// `terminal_result_seen`: did the current turn already reach a terminal
 /// `TurnResult`? Only consulted for `Detached` — it lets this stateless fn
 /// replicate the reducer's `crash_outcome` guard (a Detached AFTER the turn's
@@ -4286,6 +4915,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 // Subagent attribution (009 H5): persisted onto the row so the
                 // frontend can group a subagent's steps under its Task call.
                 parent_call_id: parent_tool_use_id,
+                files: None,
             })]
         }
         SessionEvent::ToolResult {
@@ -4296,6 +4926,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             ..
         } => {
             let output = tool_result_text(&content);
+            let files = tool_result_file_changes(&content);
             vec![AgentStreamEvent::ToolCall(ToolCallEventData {
                 call_id: tool_use_id,
                 name: String::new(),
@@ -4309,6 +4940,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 output,
                 description: None,
                 parent_call_id: parent_tool_use_id,
+                files,
             })]
         }
         SessionEvent::TurnResult {
@@ -4622,6 +5254,60 @@ fn tool_result_text(content: &[ToolResultContent]) -> Option<String> {
         }
     }
     if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// Project backend-neutral file results into the direct-CLI tool-call wire
+/// shape. Codex's `fileChange` stores its unified hunk in `FilePath.new_text`
+/// with no `old_text`; protocols that provide both sides keep them as content
+/// so the renderer can generate a unified diff.
+fn tool_result_file_changes(content: &[ToolResultContent]) -> Option<Vec<ToolCallFileChange>> {
+    let files: Vec<ToolCallFileChange> = content
+        .iter()
+        .filter_map(|part| {
+            let ToolResultContent::FilePath {
+                path,
+                move_path,
+                old_text,
+                new_text,
+                ..
+            } = part
+            else {
+                return None;
+            };
+            if path.trim().is_empty() {
+                return None;
+            }
+
+            if old_text.is_none() {
+                if let Some(diff) = new_text.as_ref().filter(|diff| !diff.is_empty()) {
+                    return Some(ToolCallFileChange {
+                        path: path.clone(),
+                        move_path: move_path.clone(),
+                        diff: Some(diff.clone()),
+                        old_text: None,
+                        new_text: None,
+                    });
+                }
+                return move_path.as_ref().map(|_| ToolCallFileChange {
+                    path: path.clone(),
+                    move_path: move_path.clone(),
+                    diff: None,
+                    old_text: None,
+                    new_text: None,
+                });
+            }
+
+            Some(ToolCallFileChange {
+                path: path.clone(),
+                move_path: move_path.clone(),
+                diff: None,
+                old_text: old_text.clone(),
+                new_text: Some(new_text.clone().unwrap_or_default()),
+            })
+        })
+        .collect();
+
+    (!files.is_empty()).then_some(files)
 }
 
 #[cfg(test)]
@@ -5501,6 +6187,7 @@ mod translate_tests {
             output: None,
             description: None,
             parent_call_id: None,
+            files: None,
         })
     }
 
@@ -5549,6 +6236,58 @@ mod translate_tests {
             unreachable!()
         };
         assert_eq!(o.name, "", "unknown call_id must not inherit another tool's name");
+    }
+
+    #[test]
+    fn tool_input_survives_terminal_frames_for_history_previews() {
+        let mut args = std::collections::HashMap::new();
+        args.insert(
+            "call-1".to_owned(),
+            serde_json::json!({
+                "file_path": "src/main.ts",
+                "old_string": "old",
+                "new_string": "new"
+            }),
+        );
+        let mut terminal = tool_call("call-1", "", ToolCallStatus::Completed);
+
+        stamp_tool_input(&args, &mut terminal);
+        let AgentStreamEvent::ToolCall(data) = terminal else {
+            unreachable!();
+        };
+
+        assert_eq!(data.args["file_path"], "src/main.ts");
+        assert_eq!(
+            data.input.as_ref().and_then(|input| input.get("new_string")),
+            Some(&serde_json::json!("new"))
+        );
+    }
+
+    #[test]
+    fn completed_file_result_exposes_a_renderable_file_change() {
+        let events = translate_event(
+            SessionEvent::ToolResult {
+                tool_use_id: "call-file".into(),
+                is_error: false,
+                content: vec![ToolResultContent::FilePath {
+                    path: "/workspace/src/main.rs".into(),
+                    move_path: None,
+                    mime: Some("text/x-rust".into()),
+                    old_text: None,
+                    new_text: Some("@@ -1 +1 @@\n-old\n+new\n".into()),
+                }],
+                parent_tool_use_id: None,
+            },
+            "conv-1",
+            false,
+        );
+        let AgentStreamEvent::ToolCall(data) = &events[0] else {
+            panic!("expected a tool-call terminal frame, got {events:?}");
+        };
+        let wire = serde_json::to_value(data).expect("tool-call frame should serialize");
+
+        assert_eq!(wire["files"][0]["path"], "/workspace/src/main.rs");
+        assert_eq!(wire["files"][0]["diff"], "@@ -1 +1 @@\n-old\n+new\n");
     }
 
     #[test]
@@ -6822,7 +7561,7 @@ mod pump_tests {
     use aionui_session::{
         Admission, BackendError, Capabilities, Command, CommandReceipt, SessionBackend, SessionEnvelope, SessionEvent,
     };
-    use futures_util::stream::BoxStream;
+    use futures_util::{StreamExt, stream::BoxStream};
 
     /// Emits a fixed script on `events()`; `dispatch(Send)` admits a turn.
     struct ScriptBackend(Vec<SessionEnvelope>);
@@ -6847,6 +7586,180 @@ mod pump_tests {
         fn capabilities(&self) -> Capabilities {
             Capabilities::default()
         }
+    }
+
+    fn test_runtime() -> SessionRuntime {
+        let (tx, _rx) = broadcast::channel(1);
+        SessionRuntime {
+            tx,
+            dispatch_gate: AsyncMutex::new(()),
+            turn_control: std::sync::Mutex::new(TurnControl::default()),
+            last_dispatched_turn_gen: AtomicU64::new(0),
+            stale_before_turn_gen: AtomicU64::new(0),
+            terminal_claimed: AtomicBool::new(false),
+            force_terminal_claimed: AtomicBool::new(false),
+            last_activity_ms: AtomicI64::new(0),
+            live_background_tasks: std::sync::atomic::AtomicUsize::new(0),
+            status: std::sync::Mutex::new(None),
+            session_id: std::sync::Mutex::new(None),
+            mode_override: std::sync::Mutex::new(None),
+            model_override: std::sync::Mutex::new(None),
+            effort_override: std::sync::Mutex::new(None),
+            last_catalog: std::sync::Mutex::new(None),
+            caps_fallback: std::sync::Mutex::new(CapsFallback::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn force_finish_owns_terminal_against_a_late_pump_terminal() {
+        let runtime = test_runtime();
+        runtime.begin_turn(Some("turn-1"));
+        runtime.set_status(ConversationStatus::Running);
+        let mut receiver = runtime.tx.subscribe();
+
+        runtime.emit_finish_once();
+        assert!(matches!(receiver.recv().await.unwrap(), AgentStreamEvent::Finish(_)));
+
+        assert!(
+            !runtime.claim_terminal(false),
+            "a late backend terminal must not claim a second finish"
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_finish_survives_the_first_generation_frame() {
+        let runtime = Arc::new(test_runtime());
+        runtime.begin_turn(Some("turn-1"));
+        runtime.set_status(ConversationStatus::Running);
+        let mut output = runtime.tx.subscribe();
+
+        runtime.emit_finish_once();
+        assert!(matches!(output.recv().await.unwrap(), AgentStreamEvent::Finish(_)));
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let events = futures_util::stream::unfold(event_rx, |mut receiver| async move {
+            receiver.recv().await.map(|event| (event, receiver))
+        })
+        .boxed();
+        spawn_event_pump(
+            events,
+            Arc::clone(&runtime),
+            "conv-1".into(),
+            "user-1".into(),
+            None,
+            None,
+        );
+
+        event_tx
+            .send(env_gen(
+                1,
+                SessionEvent::MessageDelta {
+                    item_id: "late".into(),
+                    text: "late content after force-kill".into(),
+                },
+            ))
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), output.recv())
+                .await
+                .is_err(),
+            "the first frame of a force-killed turn must not reopen the turn"
+        );
+        assert!(runtime.force_terminal_claimed());
+    }
+
+    #[tokio::test]
+    async fn stale_terminal_from_an_older_generation_does_not_finish_the_new_turn() {
+        let frames = drain_script(vec![
+            env_gen(
+                1,
+                SessionEvent::MessageDelta {
+                    item_id: "old".into(),
+                    text: "old turn".into(),
+                },
+            ),
+            env_gen(
+                2,
+                SessionEvent::MessageDelta {
+                    item_id: "new".into(),
+                    text: "new turn".into(),
+                },
+            ),
+            // This terminal belongs to generation 1 and arrives after generation 2
+            // has already opened. It must not close generation 2's relay.
+            env_gen(
+                1,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 1,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ),
+        ])
+        .await;
+
+        assert!(
+            !frames.iter().any(|event| matches!(event, AgentStreamEvent::Finish(_))),
+            "a stale generation must not emit a terminal frame: {frames:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generation_floor_drops_a_late_event_before_the_pump_sees_the_new_turn() {
+        let runtime = Arc::new(test_runtime());
+        runtime.begin_turn(Some("turn-old"));
+        runtime.record_turn_dispatch(Admission::Started, 1);
+        runtime.finish_active_turn();
+        runtime.begin_turn(Some("turn-new"));
+        runtime.record_turn_dispatch(Admission::Started, 2);
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let events = futures_util::stream::unfold(event_rx, |mut receiver| async move {
+            receiver.recv().await.map(|event| (event, receiver))
+        })
+        .boxed();
+        let mut output = runtime.tx.subscribe();
+        spawn_event_pump(events, runtime, "conv-1".into(), "user-1".into(), None, None);
+
+        event_tx
+            .send(env_gen(
+                1,
+                SessionEvent::TurnResult {
+                    is_error: false,
+                    api_error_status: None,
+                    result_text: String::new(),
+                    epoch: 1,
+                    outcome: aionui_session::TurnOutcome::EndTurn,
+                },
+            ))
+            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), output.recv())
+                .await
+                .is_err(),
+            "generation 1 terminal must be dropped before generation 2 is observed"
+        );
+
+        event_tx
+            .send(env_gen(
+                2,
+                SessionEvent::MessageDelta {
+                    item_id: "new".into(),
+                    text: "new turn".into(),
+                },
+            ))
+            .unwrap();
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            AgentStreamEvent::Text(TextEventData { content }) if content == "new turn"
+        ));
     }
 
     /// Backend that records every dispatched Command and advertises
@@ -6881,6 +7794,103 @@ mod pump_tests {
                 ..Capabilities::default()
             }
         }
+    }
+
+    fn recording_task(backend: Arc<RecordingBackend>) -> Arc<SessionAgentTask> {
+        SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend as Arc<dyn SessionBackend>,
+            None,
+        )
+    }
+
+    fn send_data(turn_id: &str) -> SendMessageData {
+        SendMessageData {
+            content: "hello".into(),
+            msg_id: format!("msg-{turn_id}"),
+            turn_id: Some(turn_id.into()),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_before_send_settles_without_dispatching_prompt() {
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet::default(),
+        });
+        let task = recording_task(backend.clone());
+        let mut events = task.subscribe();
+
+        IAgentTask::cancel_for_turn(task.as_ref(), "turn-early").await.unwrap();
+        assert!(matches!(events.recv().await.unwrap(), AgentStreamEvent::Start(_)));
+        assert!(matches!(events.recv().await.unwrap(), AgentStreamEvent::Finish(_)));
+
+        IAgentTask::send_message(task.as_ref(), send_data("turn-early"))
+            .await
+            .unwrap();
+        assert!(
+            backend.commands.lock().unwrap().is_empty(),
+            "a pre-dispatch cancel must not send either a prompt or a backend cancel"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_for_current_turn_dispatches_backend_cancel() {
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet::default(),
+        });
+        let task = recording_task(backend.clone());
+
+        IAgentTask::send_message(task.as_ref(), send_data("turn-current"))
+            .await
+            .unwrap();
+        IAgentTask::cancel_for_turn(task.as_ref(), "turn-current")
+            .await
+            .unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        assert!(matches!(commands.first(), Some(Command::Send { .. })));
+        assert!(matches!(commands.get(1), Some(Command::Cancel { .. })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_cancel_does_not_affect_the_next_turn() {
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet::default(),
+        });
+        let task = recording_task(backend.clone());
+
+        IAgentTask::send_message(task.as_ref(), send_data("turn-old"))
+            .await
+            .unwrap();
+        task.runtime.finish_active_turn();
+        IAgentTask::send_message(task.as_ref(), send_data("turn-new"))
+            .await
+            .unwrap();
+        IAgentTask::cancel_for_turn(task.as_ref(), "turn-old").await.unwrap();
+
+        let commands = backend.commands.lock().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::Send { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::Cancel { .. }))
+                .count(),
+            0
+        );
     }
 
     // Image-capable backend: an image attachment leaves the [[AION_FILES]]
@@ -7154,11 +8164,16 @@ mod pump_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn late_terminal_of_a_kept_open_exec_still_carries_the_tool_name() {
         use aionui_session::TurnOutcome;
+        let expected_input = serde_json::json!({
+            "type": "commandExecution",
+            "source": "unifiedExecStartup",
+            "command": "sleep 60",
+        });
         let detached = SessionEvent::ToolCall {
             tool_use_id: "call-detached".into(),
             name: "commandExecution".into(),
             subagent: aionui_session::SubagentKind::Inline,
-            input: serde_json::json!({ "type": "commandExecution", "source": "unifiedExecStartup" }),
+            input: expected_input.clone(),
             parent_tool_use_id: None,
         };
         let clean_end = SessionEvent::TurnResult {
@@ -7189,6 +8204,8 @@ mod pump_tests {
         let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
         let _ = task;
 
+        let mut terminal_args: Vec<serde_json::Value> = Vec::new();
+        let mut terminal_inputs: Vec<serde_json::Value> = Vec::new();
         let mut terminal_names: Vec<String> = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
         while tokio::time::Instant::now() < deadline {
@@ -7197,6 +8214,10 @@ mod pump_tests {
                     if data.call_id == "call-detached" && data.status == ToolCallStatus::Completed =>
                 {
                     terminal_names.push(data.name.clone());
+                    terminal_args.push(data.args.clone());
+                    if let Some(input) = data.input.clone() {
+                        terminal_inputs.push(input);
+                    }
                 }
                 Ok(Ok(_)) => {}
                 _ => break,
@@ -7206,6 +8227,8 @@ mod pump_tests {
             terminal_names.iter().any(|n| n == "commandExecution"),
             "late terminal must keep the tool name, got: {terminal_names:?}"
         );
+        assert!(terminal_args.iter().any(|args| args == &expected_input));
+        assert!(terminal_inputs.iter().any(|input| input == &expected_input));
     }
 
     fn env(event: SessionEvent) -> SessionEnvelope {
@@ -7454,6 +8477,89 @@ mod pump_tests {
             canceled_pos < finish_pos,
             "Canceled must precede Finish (relay breaks the turn on Finish)"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_live_diff_replaces_one_stable_tool_call_until_finish() {
+        use aionui_session::TurnOutcome;
+
+        let first_diff = [
+            "diff --git a/src/first.ts b/src/first.ts",
+            "--- a/src/first.ts",
+            "+++ b/src/first.ts",
+            "@@ -1 +1 @@",
+            "-old first",
+            "+new first",
+        ]
+        .join("\n");
+        let second_diff = [
+            first_diff.as_str(),
+            "diff --git a/src/second.ts b/src/second.ts",
+            "--- a/src/second.ts",
+            "+++ b/src/second.ts",
+            "@@ -1 +1 @@",
+            "-old second",
+            "+new second",
+        ]
+        .join("\n");
+        let script = vec![
+            env(SessionEvent::TurnDiffUpdated { diff: first_diff }),
+            env(SessionEvent::TurnDiffUpdated { diff: second_diff }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: "done".into(),
+                epoch: 1,
+                outcome: TurnOutcome::EndTurn,
+            }),
+        ];
+
+        let frames = drain_script(script).await;
+        let diffs: Vec<&ToolCallEventData> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::ToolCall(data) if data.name == CODEX_LIVE_DIFF_TOOL_NAME => Some(data),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(diffs.len(), 3, "live snapshots must be followed by one terminal update");
+        assert!(diffs[..2].iter().all(|data| data.status == ToolCallStatus::Running));
+        assert_eq!(diffs[0].call_id, diffs[1].call_id);
+        assert_eq!(diffs[1].call_id, diffs[2].call_id);
+        assert_eq!(diffs[0].call_id, "codex-turn-diff:conv-1:1");
+        assert_eq!(diffs[0].files.as_ref().map(Vec::len), Some(1));
+        assert_eq!(diffs[1].files.as_ref().map(Vec::len), Some(2));
+        assert_eq!(diffs[2].status, ToolCallStatus::Completed);
+
+        let terminal_pos = frames
+            .iter()
+            .position(|frame| {
+                matches!(frame, AgentStreamEvent::ToolCall(data) if data.name == CODEX_LIVE_DIFF_TOOL_NAME && data.status == ToolCallStatus::Completed)
+            })
+            .expect("live diff must have a terminal update");
+        let finish_pos = frames
+            .iter()
+            .position(|frame| matches!(frame, AgentStreamEvent::Finish(_)))
+            .expect("turn must finish");
+        assert!(terminal_pos < finish_pos, "the terminal diff must precede Finish");
+    }
+
+    #[test]
+    fn codex_live_diff_preserves_quoted_rename_paths_without_a_hunk() {
+        let diff = [
+            "diff --git \"a/src/old name.ts\" \"b/src/new name.ts\"",
+            "similarity index 100%",
+            "rename from src/old name.ts",
+            "rename to src/new name.ts",
+        ]
+        .join("\n");
+
+        let files = codex_live_diff_files(&diff);
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/old name.ts");
+        assert_eq!(files[0].move_path.as_deref(), Some("src/new name.ts"));
     }
 
     // A tool call that DID receive its ToolResult must NOT get a trailing Canceled
@@ -8495,6 +9601,10 @@ mod pump_tests {
                 parent_ref: Some("toolu_bg".into()),
                 kind: Some(SubagentTaskKind::Other),
             }),
+            env(SessionEvent::TurnDiffUpdated {
+                diff: "diff --git a/src/teardown.ts b/src/teardown.ts\n--- a/src/teardown.ts\n+++ b/src/teardown.ts\n@@ -1 +1 @@\n-old\n+new"
+                    .into(),
+            }),
             // No terminal, no TurnResult — the stream just ends (teardown).
         ];
         let frames = drain_script(script).await;
@@ -8509,6 +9619,17 @@ mod pump_tests {
                 )
             });
         assert_eq!(settled.card.call_id, "toolu_bg");
+        assert!(
+            frames.iter().any(|frame| {
+                matches!(
+                    frame,
+                    AgentStreamEvent::ToolCall(data)
+                        if data.name == CODEX_LIVE_DIFF_TOOL_NAME
+                            && data.status == ToolCallStatus::Canceled
+                )
+            }),
+            "stream teardown must settle the live diff"
+        );
     }
 
     /// A terminal for a task this pump never opened (post-resume: the old pump —
@@ -8834,6 +9955,10 @@ mod pump_tests {
                 item_id: "m".into(),
                 text: "launching workflow".into(),
             }),
+            env(SessionEvent::TurnDiffUpdated {
+                diff: "diff --git a/src/live.ts b/src/live.ts\n--- a/src/live.ts\n+++ b/src/live.ts\n@@ -1 +1 @@\n-old\n+new"
+                    .into(),
+            }),
             // LAUNCH result — suppressed (workflow in flight): the turn now OWES
             // this Finish.
             env(SessionEvent::TurnResult {
@@ -8875,6 +10000,25 @@ mod pump_tests {
         assert!(
             matches!(last_turn_frame, Some(AgentStreamEvent::Finish(_))),
             "the settled Finish is the turn's terminal frame, got {seq:?}"
+        );
+        let diff_cancel_idx = frames
+            .iter()
+            .position(|frame| {
+                matches!(
+                    frame,
+                    AgentStreamEvent::ToolCall(data)
+                        if data.name == CODEX_LIVE_DIFF_TOOL_NAME
+                            && data.status == ToolCallStatus::Canceled
+                )
+            })
+            .expect("synthetic cancellation must settle the live diff");
+        let live_diff_finish_idx = frames
+            .iter()
+            .position(|frame| matches!(frame, AgentStreamEvent::Finish(_)))
+            .expect("synthetic cancellation must finish the turn");
+        assert!(
+            diff_cancel_idx < live_diff_finish_idx,
+            "live diff cancellation must precede Finish"
         );
         // The Task tool call left open by the kill is closed as Canceled BEFORE the
         // Finish, so the persisted row leaves "work" and the frontend spinner stops.

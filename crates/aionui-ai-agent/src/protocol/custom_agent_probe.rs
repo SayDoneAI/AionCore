@@ -20,7 +20,7 @@ use aionui_common::{CommandSpec, EnvVar};
 
 use crate::protocol::acp_init_budget::{INIT_TIMEOUT_SECS, InitBudget};
 use aionui_runtime::{NodeRuntimeProgressReporter, ResolvedCommand, ensure_runtime_command_with_reporter};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::capability::cli_process::CliAgentProcess;
@@ -189,7 +189,8 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
 
     // Throwaway channels — a probe session never sends a prompt, so no events,
     // permission requests, or notifications are consumed.
-    let (event_tx, _event_rx) = broadcast::channel(16);
+    let runtime =
+        crate::agent_runtime::AgentRuntime::new("custom-agent-probe", std::env::temp_dir().display().to_string(), 16);
     let (permission_tx, _permission_rx) = mpsc::channel(4);
     let (notification_tx, _notification_rx) = mpsc::channel(4);
 
@@ -207,7 +208,7 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
     let connect = AcpProtocol::connect(
         stdin,
         stdout,
-        event_tx,
+        runtime,
         permission_tx,
         notification_tx,
         "custom-agent-probe",

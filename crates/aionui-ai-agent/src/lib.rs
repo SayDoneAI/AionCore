@@ -39,7 +39,7 @@ pub use active_lease::{ACTIVE_LEASE_TTL_MS, ActiveLeaseRegistry};
 pub use agent_runtime::AgentRuntime;
 #[cfg(any(test, feature = "test-support"))]
 pub use agent_task::IMockAgent;
-pub use agent_task::{AgentInstance, IAgentTask};
+pub use agent_task::{AgentInstance, AgentStreamReceiver, IAgentTask};
 pub use aionui_api_types::{AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, SlashCommandItem};
 // Backend-static capability table (session layer's single source of truth) —
 // re-exported so the conversation layer can read the mid-turn bit for a

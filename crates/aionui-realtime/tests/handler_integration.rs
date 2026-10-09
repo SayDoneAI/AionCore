@@ -362,6 +362,33 @@ async fn client_disconnect_removes_from_manager() {
 }
 
 #[tokio::test]
+async fn manager_disconnect_closes_client_socket() {
+    let (state, manager) = default_state();
+    let addr = start_server(state).await;
+
+    let (_tx, mut rx) = connect_with_token(addr, "valid-token").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(manager.client_count(), 1);
+
+    manager.disconnect_all("ordered stream resync");
+
+    let close = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match rx.next().await {
+                Some(Ok(tungstenite::Message::Close(frame))) => break frame.map(|f| f.code.into()),
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => break None,
+            }
+        }
+    })
+    .await
+    .expect("manager disconnect must close the client socket");
+
+    assert_eq!(close, Some(1000));
+    assert_eq!(manager.client_count(), 0);
+}
+
+#[tokio::test]
 async fn pong_message_does_not_generate_response() {
     let (state, _) = default_state();
     let addr = start_server(state).await;

@@ -3322,8 +3322,20 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                         // so the FileDiff card has a body; `old_text` stays None
                         // (codex sends a single combined hunk, not before/after pair).
                         let diff = ch.get("diff").and_then(Value::as_str).map(str::to_string);
+                        let move_path = ch
+                            .get("kind")
+                            .and_then(|kind| kind.get("move_path"))
+                            .and_then(Value::as_str)
+                            .or_else(|| {
+                                ch.get("kind")
+                                    .and_then(|kind| kind.get("update"))
+                                    .and_then(|update| update.get("move_path"))
+                                    .and_then(Value::as_str)
+                            })
+                            .map(str::to_string);
                         content.push(crate::event::ToolResultContent::FilePath {
                             path: path.to_string(),
+                            move_path,
                             mime: None,
                             old_text: None,
                             new_text: diff,
@@ -3342,6 +3354,7 @@ fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
                 {
                     content.push(crate::event::ToolResultContent::FilePath {
                         path: path.to_string(),
+                        move_path: None,
                         mime: None,
                         old_text: None,
                         new_text: None,
@@ -3526,13 +3539,14 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
         total_tokens: g("totalTokens"),
         cost_usd: None,
         // DELIBERATELY NOT REPORTED, despite `tokenUsage.modelContextWindow` being
-        // the only context-window field in the whole codex protocol.
+        // the only context-window field in the whole codex protocol. Managed
+        // sessions receive the backend-authoritative window through process
+        // config; this wire value is still not trusted for the UI.
         //
         // Live-probed on 0.145.0 through a custom `model_provider`: `gpt-5.6-sol`,
         // `gpt-5.5` and `gpt-5.6-luna` ALL report 258_400, and an explicit
-        // `model_context_window` (in `config.toml` AND via `-c`) is ignored. A
-        // figure that never varies by model and cannot be configured says nothing
-        // about the model in use, and a wrong denominator is worse than none: the
+        // figure that never varies by model says nothing about the model in use,
+        // and a wrong denominator is worse than none: the
         // renderer has a designed "context window size unknown" state that shows a
         // plain token count instead of inventing a percentage.
         //
@@ -3564,9 +3578,10 @@ mod usage_window_tests {
     /// (11030 = the request carrying the whole history + its reply), NOT on the
     /// cumulative `total` (22043) which would blow past any window on a long
     /// session. The reported `modelContextWindow` is NOT forwarded — see
-    /// `map_usage` for why codex's only window figure is unusable.
+    /// `map_usage` for why Codex's wire-reported window is not authoritative
+    /// for the UI.
     #[test]
-    fn live_token_usage_maps_last_as_occupancy_and_drops_the_window() {
+    fn live_token_usage_maps_last_as_occupancy_without_using_wire_window() {
         let params: Value = serde_json::from_str(
             r#"{"threadId":"th1","turnId":"t1","tokenUsage":{
                  "modelContextWindow":258400,
@@ -7299,6 +7314,10 @@ mod tests {
                     value: r#"{"efforts":["low","high"],"default_effort":"high"}"#.into(),
                 },
                 aionui_common::EnvVar {
+                    name: "SAYDONE_MANAGED_CONTEXT_WINDOW".into(),
+                    value: "1048576".into(),
+                },
+                aionui_common::EnvVar {
                     name: OPENAI_API_KEY_ENV.into(),
                     value: "lease-token".into(),
                 },
@@ -7349,6 +7368,10 @@ mod tests {
                     value: r#"{"efforts":["low","high"],"default_effort":"high"}"#.into(),
                 },
                 aionui_common::EnvVar {
+                    name: "SAYDONE_MANAGED_CONTEXT_WINDOW".into(),
+                    value: "1048576".into(),
+                },
+                aionui_common::EnvVar {
                     name: OPENAI_API_KEY_ENV.into(),
                     value: "lease-token".into(),
                 },
@@ -7366,6 +7389,10 @@ mod tests {
         assert!(args.contains(&"model_providers.custom.env_key=\"OPENAI_API_KEY\"".into()));
         assert!(args.contains(&"model_providers.custom.requires_openai_auth=false".into()));
         assert!(args.contains(&"model_providers.custom.base_url=\"https://admin.saydone.ai/openai/v1\"".into()));
+        assert!(
+            !args.iter().any(|arg| arg == "model_context_window=1048576"),
+            "managed Codex must keep context-window accounting and compaction in Codex"
+        );
         assert!(args.iter().any(|arg| arg.starts_with("model_catalog_json=")));
     }
 
@@ -9721,6 +9748,40 @@ mod tests {
             filepath.1.as_deref().is_some_and(|d| d.contains("def subtract")),
             "the unified diff rides FilePath.new_text, got {:?}",
             filepath.1
+        );
+    }
+
+    #[test]
+    fn codex_filechange_preserves_move_path_for_rename_without_hunk() {
+        let params = serde_json::json!({
+            "item": {
+                "type": "fileChange",
+                "id": "call_rename",
+                "status": "completed",
+                "changes": [{
+                    "path": "/w/old name.py",
+                    "kind": { "type": "update", "move_path": "/w/new name.py" }
+                }]
+            }
+        });
+
+        let events = map_item(&params, true);
+        let filepath = events.iter().find_map(|event| match event {
+            SessionEvent::ToolResult { content, .. } => content.iter().find_map(|part| match part {
+                crate::event::ToolResultContent::FilePath {
+                    path,
+                    move_path,
+                    new_text,
+                    ..
+                } => Some((path.clone(), move_path.clone(), new_text.clone())),
+                _ => None,
+            }),
+            _ => None,
+        });
+
+        assert_eq!(
+            filepath,
+            Some(("/w/old name.py".to_owned(), Some("/w/new name.py".to_owned()), None,))
         );
     }
 
