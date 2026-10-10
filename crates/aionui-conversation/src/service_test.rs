@@ -4862,7 +4862,7 @@ async fn managed_runtime_switch_replaces_and_clears_model_capabilities() {
 }
 
 #[tokio::test]
-async fn managed_codex_runtime_leaves_context_window_to_codex() {
+async fn managed_codex_runtime_passes_context_window_to_session_adapter() {
     let workspace = tempfile::tempdir().unwrap();
     let task_manager = Arc::new(RebuildingScriptedTaskManager::new(
         (0..1)
@@ -4907,7 +4907,10 @@ async fn managed_codex_runtime_leaves_context_window_to_codex() {
 
     let options = task_manager.captured_options();
     let env = &options.last().unwrap().context.runtime_env;
-    assert!(!env.iter().any(|(key, _)| key == "SAYDONE_MANAGED_CONTEXT_WINDOW"));
+    assert!(
+        env.iter()
+            .any(|(key, value)| { key == "SAYDONE_MANAGED_CONTEXT_WINDOW" && value == "1048576" })
+    );
     assert!(
         env.iter()
             .any(|(key, value)| { key == "SAYDONE_MANAGED_MAX_OUTPUT_TOKENS" && value == "131072" })

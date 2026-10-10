@@ -5801,10 +5801,11 @@ impl ConversationService {
                 runtime.default_output_tokens.to_string(),
             ),
         ];
-        // Pi needs the backend-declared window for its custom provider. Direct
-        // CLI backends own context accounting and must not receive an external
-        // override.
-        if runtime.backend == "pi" {
+        // Pi needs the backend-declared window for its custom provider. Codex
+        // also receives this value as host metadata so the session adapter can
+        // attach the backend-authoritative denominator to usage events; it is
+        // not passed as a Codex config override.
+        if matches!(runtime.backend.as_str(), "codex" | "pi") {
             env.push((
                 "SAYDONE_MANAGED_CONTEXT_WINDOW".to_owned(),
                 runtime.context_window.to_string(),

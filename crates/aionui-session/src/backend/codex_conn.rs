@@ -50,6 +50,7 @@ const SAYDONE_MANAGED_BACKEND_ENV: &str = "SAYDONE_MANAGED_BACKEND";
 const SAYDONE_MANAGED_PROTOCOL_ENV: &str = "SAYDONE_MANAGED_PROTOCOL";
 const SAYDONE_MANAGED_MODEL_ENV: &str = "SAYDONE_MANAGED_MODEL";
 const SAYDONE_MANAGED_BASE_URL_ENV: &str = "SAYDONE_MANAGED_BASE_URL";
+const SAYDONE_MANAGED_CONTEXT_WINDOW_ENV: &str = "SAYDONE_MANAGED_CONTEXT_WINDOW";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// 仅在完整的 SayDone 托管 Codex 上保留服务端已授权的模型。
@@ -61,6 +62,7 @@ const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 struct SaydoneManagedCodexRuntime {
     model: String,
     base_url: String,
+    context_window: Option<u64>,
 }
 
 fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManagedCodexRuntime> {
@@ -76,6 +78,9 @@ fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManage
     let model = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_MODEL_ENV)?;
     let base_url = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BASE_URL_ENV)?;
     let api_key = unique_env_value(&config.spawn_env, OPENAI_API_KEY_ENV)?;
+    let context_window = unique_env_value(&config.spawn_env, SAYDONE_MANAGED_CONTEXT_WINDOW_ENV)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0);
     (unique_env_value(&config.spawn_env, SAYDONE_MANAGED_AGENT_ENV) == Some("1")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BACKEND_ENV) == Some("codex")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_PROTOCOL_ENV) == Some("openai")
@@ -84,6 +89,7 @@ fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManage
     .then(|| SaydoneManagedCodexRuntime {
         model: model.to_owned(),
         base_url: base_url.to_owned(),
+        context_window,
     })
 }
 
@@ -1049,6 +1055,9 @@ struct CodexReaderState {
     title_gen: Arc<TitleGen>,
     /// SayDone 托管 Codex 的服务端授权模型。CLI 的默认模型通知不能覆盖它。
     managed_model: Option<String>,
+    /// SayDone 托管模型目录中的上下文窗口。Codex wire 的同名字段不稳定，
+    /// 因此只把已校验的后端值带进 usage 事件。
+    managed_context_window: Option<u64>,
 }
 
 /// Spawn a codex JSON-RPC reader over `stdout`/`io` using the shared state. Used
@@ -1081,6 +1090,7 @@ fn start_codex_reader(
             state.stdin,
             state.turn_in_flight,
             state.managed_model,
+            state.managed_context_window,
             state.title_gen,
         )
         .await;
@@ -1290,7 +1300,9 @@ impl CodexSessionBackend {
         let resume_poison = Arc::new(Mutex::new(None));
         let pending_fork = Arc::new(Mutex::new(None));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
-        let managed_model = saydone_managed_codex_runtime(&wake.config).map(|runtime| runtime.model);
+        let managed_runtime = saydone_managed_codex_runtime(&wake.config);
+        let managed_model = managed_runtime.as_ref().map(|runtime| runtime.model.clone());
+        let managed_context_window = managed_runtime.and_then(|runtime| runtime.context_window);
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (event_tx, _) = broadcast::channel(1024);
 
@@ -1320,6 +1332,7 @@ impl CodexSessionBackend {
             turn_in_flight: turn_in_flight.clone(),
             title_gen: title_gen.clone(),
             managed_model,
+            managed_context_window,
         };
         let reader = start_codex_reader(&reader_state, stdout, io.clone());
 
@@ -1615,6 +1628,7 @@ async fn reader_task(
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
     managed_model: Option<String>,
+    managed_context_window: Option<u64>,
     title_gen: Arc<TitleGen>,
 ) {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -1892,7 +1906,7 @@ async fn reader_task(
                             }
                             continue;
                         }
-                        for ev in map_notification(m, params, managed_model.as_deref()) {
+                        for ev in map_notification(m, params, managed_model.as_deref(), managed_context_window) {
                             emit(&event_tx, &session_id, cur, scope_notice_to_turn(ev, cur));
                         }
                     }
@@ -2800,7 +2814,12 @@ async fn write_reverse_error(
 /// here: `item` payloads are matched on the `type` STRING (never deserialized
 /// into the closed 16-variant ThreadItem enum), so an unknown future variant is
 /// data (→ AdapterSpecific), not a panic.
-fn map_notification(method: &str, params: &Value, managed_model: Option<&str>) -> Vec<SessionEvent> {
+fn map_notification(
+    method: &str,
+    params: &Value,
+    managed_model: Option<&str>,
+    managed_context_window: Option<u64>,
+) -> Vec<SessionEvent> {
     match method {
         "turn/started" => vec![], // optimistic; the orchestrator already lowered TurnStarted
         "item/agentMessage/delta" => {
@@ -2833,7 +2852,7 @@ fn map_notification(method: &str, params: &Value, managed_model: Option<&str>) -
             let diff = params.get("diff").and_then(Value::as_str).unwrap_or("").to_string();
             vec![SessionEvent::TurnDiffUpdated { diff }]
         }
-        "thread/tokenUsage/updated" => map_usage(params),
+        "thread/tokenUsage/updated" => map_usage(params, managed_context_window),
         // LC-8a: codex to-do plan snapshot. `TurnPlanUpdatedNotification{plan:[{step,
         // status}], explanation?}` (schema-verified, codex 0.137.0) → SessionEvent::Plan.
         // step→content; camelCase `inProgress`→InProgress; codex has no per-step priority.
@@ -3450,9 +3469,11 @@ fn item_kind_for(item_type: &str) -> crate::event::ItemKind {
 /// the occupancy. `total.*` accumulates across turns and would exceed the window
 /// on a long session; it must never feed `used`.
 ///
-/// `modelContextWindow` is the indicator's denominator and is nullable in the
-/// schema (verified: `codex app-server generate-json-schema` → ThreadTokenUsage).
-fn map_usage(params: &Value) -> Vec<SessionEvent> {
+/// `modelContextWindow` is nullable and has been observed as a fixed stand-in
+/// across different custom-provider models. For SayDone-managed sessions the
+/// backend catalog is authoritative, so its validated window is supplied by the
+/// host. External Codex sessions keep the denominator unknown.
+fn map_usage(params: &Value, managed_context_window: Option<u64>) -> Vec<SessionEvent> {
     let usage = params.get("tokenUsage").unwrap_or(&Value::Null);
     let last = usage.get("last").unwrap_or(&Value::Null);
     let g = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
@@ -3461,10 +3482,9 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
         output_tokens: g("outputTokens"),
         total_tokens: g("totalTokens"),
         cost_usd: None,
-        // DELIBERATELY NOT REPORTED, despite `tokenUsage.modelContextWindow` being
-        // the only context-window field in the whole codex protocol. Managed
-        // sessions receive the backend-authoritative window through process
-        // config; this wire value is still not trusted for the UI.
+        // The wire value is deliberately ignored. Managed sessions receive the
+        // backend-authoritative window through host config; external sessions
+        // remain without a denominator when no trusted value exists.
         //
         // Live-probed on 0.145.0 through a custom `model_provider`: `gpt-5.6-sol`,
         // `gpt-5.5` and `gpt-5.6-luna` ALL report 258_400, and an explicit
@@ -3476,11 +3496,11 @@ fn map_usage(params: &Value) -> Vec<SessionEvent> {
         // The likely explanation is that codex falls back to a stand-in for models
         // it does not recognise, i.e. any custom provider — an official/Bedrock
         // setup may well report a real window. That is UNVERIFIED: this machine has
-        // no official codex auth (no `~/.codex/auth.json`) to test against. Suppress
-        // unconditionally rather than encode a guess; revisit with a capture from a
-        // first-party provider, and gate on that evidence rather than on a
+        // no official codex auth (no `~/.codex/auth.json`) to test against. Keep
+        // ignoring this field for external sessions, and use only the validated
+        // host value for managed sessions rather than encoding a guess or a
         // hardcoded constant.
-        context_window: None,
+        context_window: managed_context_window,
         // Per-turn detail line. codex reports every field natively on `last`
         // (verified: TokenUsageBreakdown in the generated schema), including the
         // reasoning tokens claude only exposes per-call.
@@ -3502,7 +3522,7 @@ mod usage_window_tests {
     /// cumulative `total` (22043) which would blow past any window on a long
     /// session. The reported `modelContextWindow` is NOT forwarded — see
     /// `map_usage` for why Codex's wire-reported window is not authoritative
-    /// for the UI.
+    /// for the UI. External sessions therefore have no denominator.
     #[test]
     fn live_token_usage_maps_last_as_occupancy_without_using_wire_window() {
         let params: Value = serde_json::from_str(
@@ -3514,7 +3534,7 @@ mod usage_window_tests {
                           "cacheWriteInputTokens":11022,"outputTokens":11,"reasoningOutputTokens":0}}}"#,
         )
         .unwrap();
-        let events = map_usage(&params);
+        let events = map_usage(&params, None);
         assert!(
             matches!(
                 events.as_slice(),
@@ -3533,6 +3553,26 @@ mod usage_window_tests {
         );
     }
 
+    #[test]
+    fn managed_context_window_overrides_untrusted_wire_window() {
+        let params: Value = serde_json::from_str(
+            r#"{"tokenUsage":{"modelContextWindow":258400,
+                 "last":{"totalTokens":11030,"inputTokens":11024,"outputTokens":6}}}"#,
+        )
+        .unwrap();
+        let events = map_usage(&params, Some(1_048_576));
+        assert!(matches!(
+            events.as_slice(),
+            [SessionEvent::UsageDelta {
+                input_tokens: 11024,
+                output_tokens: 6,
+                total_tokens: 11030,
+                context_window: Some(1_048_576),
+                ..
+            }]
+        ));
+    }
+
     /// codex reports the whole detail line natively on `last`, including the
     /// reasoning tokens claude only exposes per-call. Values from the live two-turn
     /// probe (turn 2).
@@ -3544,7 +3584,7 @@ mod usage_window_tests {
                          "cacheWriteInputTokens":16,"outputTokens":6,"reasoningOutputTokens":242}}}"#,
         )
         .unwrap();
-        let b = match map_usage(&params).into_iter().next() {
+        let b = match map_usage(&params, None).into_iter().next() {
             Some(SessionEvent::UsageDelta { breakdown, .. }) => breakdown,
             other => panic!("expected UsageDelta, got {other:?}"),
         };
@@ -3564,7 +3604,7 @@ mod usage_window_tests {
             let params: Value = serde_json::from_str(raw).unwrap();
             assert!(
                 matches!(
-                    map_usage(&params).as_slice(),
+                    map_usage(&params, None).as_slice(),
                     [SessionEvent::UsageDelta {
                         context_window: None,
                         total_tokens: 5,
@@ -7248,6 +7288,7 @@ mod tests {
             Some(SaydoneManagedCodexRuntime {
                 model: "deepseek-v4-flash".into(),
                 base_url: "https://admin.saydone.ai/openai/v1".into(),
+                context_window: Some(1_048_576),
             })
         );
 
@@ -7313,7 +7354,7 @@ mod tests {
                 "activePermissionProfile": { "id": ":workspace" }
             }
         });
-        let events = map_notification("thread/settings/updated", &params, Some("deepseek-v4-flash"));
+        let events = map_notification("thread/settings/updated", &params, Some("deepseek-v4-flash"), None);
         assert!(matches!(
             events.as_slice(),
             [SessionEvent::ConfigChanged { model: Some(model), mode: Some(mode) }]
@@ -9694,7 +9735,7 @@ mod tests {
                 { "step": "run tests", "status": "pending" },
             ],
         });
-        let events = map_notification("turn/plan/updated", &params, None);
+        let events = map_notification("turn/plan/updated", &params, None, None);
         match &events[..] {
             [SessionEvent::Plan { entries, explanation }] => {
                 assert_eq!(entries.len(), 3);
