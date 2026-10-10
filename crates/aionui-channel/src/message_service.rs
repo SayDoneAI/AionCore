@@ -144,7 +144,8 @@ impl ChannelMessageService {
                 ))
             })?;
 
-        self.conversation_svc
+        let send_response = self
+            .conversation_svc
             .send_message(user_id, &conversation_id, req, &self.task_manager)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
@@ -158,6 +159,7 @@ impl ChannelMessageService {
 
         Ok(SendResult {
             conversation_id,
+            delivered_midturn: send_response.delivered_midturn,
             stream_rx: Some(AgentStreamReceiver::Broadcast(stream_rx)),
         })
     }
@@ -335,12 +337,12 @@ impl ChannelMessageService {
         }
     }
 
-    /// Builds the "thinking" placeholder message sent immediately after
-    /// receiving a user message, before the AI starts streaming.
+    /// Builds the working marker sent immediately after receiving a user
+    /// message, before the AI starts streaming.
     pub fn build_thinking_message() -> UnifiedOutgoingMessage {
         UnifiedOutgoingMessage {
             message_type: OutgoingMessageType::Text,
-            text: Some("\u{23f3} 正在思考…".into()),
+            text: Some("\u{23f3} working".into()),
             parse_mode: None,
             buttons: None,
             keyboard: None,
@@ -353,12 +355,17 @@ impl ChannelMessageService {
         }
     }
 
-    /// Builds the final message after streaming completes, including
-    /// action buttons for the user.
+    /// Builds the final message after the agent has fully stopped, including
+    /// the worked marker and action buttons for the user.
     pub fn build_final_message(text: &str) -> UnifiedOutgoingMessage {
+        let text = if text.trim().is_empty() {
+            "\u{2705} worked".to_owned()
+        } else {
+            format!("{text}\n\n\u{2705} worked")
+        };
         UnifiedOutgoingMessage {
             message_type: OutgoingMessageType::Buttons,
-            text: Some(text.to_owned()),
+            text: Some(text),
             parse_mode: None,
             buttons: Some(vec![vec![
                 ActionButton {
@@ -404,10 +411,10 @@ impl ChannelMessageService {
         }
     }
 
-    /// Builds an intermediate streaming message (for editMessage calls).
+    /// Builds an intermediate text message sent while the agent is working.
     pub fn build_streaming_message(text: &str) -> UnifiedOutgoingMessage {
         let mut message = Self::build_text_message(text);
-        message.text = Some(format!("{text}\n\n⏳ 正在生成…"));
+        message.text = Some(format!("{text}\n\n\u{23f3} working"));
         message
     }
 
@@ -449,6 +456,9 @@ fn normalize_confirmation_value(value: &str) -> String {
 #[derive(Debug)]
 pub struct SendResult {
     pub conversation_id: String,
+    /// The message was injected into the already-running turn. The existing
+    /// relay owns that stream, so the caller must not start another relay.
+    pub delivered_midturn: bool,
     /// Agent event stream for the ChannelStreamRelay.
     /// `None` when the agent task could not be found after sending
     /// (should not happen in normal flow).
@@ -845,7 +855,7 @@ mod tests {
         let msg = ChannelMessageService::build_thinking_message();
         assert_eq!(msg.message_type, OutgoingMessageType::Text);
         let text = msg.text.unwrap();
-        assert!(text.contains("正在思考"));
+        assert_eq!(text, "⏳ working");
     }
 
     // ── build_final_message ────────────────────────────────────────────
@@ -854,7 +864,7 @@ mod tests {
     fn final_message_has_buttons() {
         let msg = ChannelMessageService::build_final_message("Response text");
         assert_eq!(msg.message_type, OutgoingMessageType::Buttons);
-        assert_eq!(msg.text.as_deref(), Some("Response text"));
+        assert_eq!(msg.text.as_deref(), Some("Response text\n\n✅ worked"));
         let buttons = msg.buttons.unwrap();
         assert!(!buttons.is_empty());
         assert!(buttons[0].len() >= 2);
@@ -866,7 +876,7 @@ mod tests {
     fn streaming_message_is_plain_text() {
         let msg = ChannelMessageService::build_streaming_message("partial...");
         assert_eq!(msg.message_type, OutgoingMessageType::Text);
-        assert_eq!(msg.text.as_deref(), Some("partial...\n\n⏳ 正在生成…"));
+        assert_eq!(msg.text.as_deref(), Some("partial...\n\n⏳ working"));
         assert!(msg.buttons.is_none());
     }
 

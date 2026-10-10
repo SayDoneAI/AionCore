@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use aionui_ai_agent::{AgentStreamEvent, AgentStreamReceiver};
 use aionui_conversation::runtime_state::ConversationRuntimeStateService;
@@ -7,7 +6,6 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
-use crate::constants::{LARK_MESSAGE_LIMIT, WEIXIN_MESSAGE_LIMIT};
 use crate::error::ChannelError;
 use crate::formatter::format_text_for_platform;
 use crate::message_service::{ChannelMessageService, StreamAction};
@@ -24,31 +22,18 @@ pub struct RelayConfig {
     pub plugin_id: String,
     pub chat_id: String,
     pub prompt_text: String,
-    pub throttle_ms: u64,
 }
 
 enum ContinuationOutcome {
     Event(Box<AgentStreamEvent>),
-    Complete,
+    AgentStopped,
     Interrupted,
-}
-
-/// Per-platform minimum interval between streaming `edit_message` calls.
-///
-/// Slack's `chat.update` is rate-limited more aggressively than the other
-/// editable platforms, so it uses a larger interval; Telegram/Lark/DingTalk
-/// keep the original 500 ms cadence.
-pub fn throttle_ms_for_platform(platform: PluginType) -> u64 {
-    match platform {
-        PluginType::Slack => 1200,
-        PluginType::Discord => 1000,
-        _ => 500,
-    }
 }
 
 /// Abstraction for sending/editing messages through a channel plugin.
 ///
-/// Decouples ChannelStreamRelay from ChannelManager for testability.
+/// The relay only sends new messages. Editing remains part of this trait because
+/// channel action responses can still target an existing message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelDeliveryReceipt {
     pub message_id: String,
@@ -76,12 +61,15 @@ pub trait ChannelSender: Send + Sync {
     ) -> Result<(), ChannelError>;
 }
 
-/// Relays agent stream events to an IM platform.
+/// Relays the meaningful text produced during an agent turn to a channel.
 ///
-/// Responsibilities:
-/// - Send a "Thinking..." placeholder and update it for editable platforms
-/// - Send final message with action buttons on Finish
-/// - Send error message on Error
+/// Every channel follows the same relay contract:
+/// - send a working marker immediately;
+/// - send each non-empty text event as it arrives with `working`;
+/// - send one completion marker with `worked` after the turn finishes.
+///
+/// Thinking and tool-call events remain internal agent progress and are not
+/// exposed as channel messages.
 pub struct ChannelStreamRelay {
     config: RelayConfig,
     sender: Arc<dyn ChannelSender>,
@@ -119,7 +107,9 @@ impl ChannelStreamRelay {
 
     async fn next_continuation_event(&self, rx: &mut AgentStreamReceiver) -> ContinuationOutcome {
         let Some(runtime_state) = self.runtime_state.as_ref() else {
-            return ContinuationOutcome::Complete;
+            // Standalone tests do not have a runtime claim. Production always
+            // supplies runtime state, where this means the active turn ended.
+            return ContinuationOutcome::AgentStopped;
         };
         match rx.try_recv() {
             Ok(event) => ContinuationOutcome::Event(Box::new(event)),
@@ -130,7 +120,7 @@ impl ChannelStreamRelay {
             Err(broadcast::error::TryRecvError::Closed) => ContinuationOutcome::Interrupted,
             Err(broadcast::error::TryRecvError::Empty) => {
                 tokio::select! {
-                    _ = runtime_state.wait_until_unclaimed(&self.config.conversation_id) => ContinuationOutcome::Complete,
+                    _ = runtime_state.wait_until_unclaimed(&self.config.conversation_id) => ContinuationOutcome::AgentStopped,
                     event = rx.recv() => match event {
                         Ok(event) => ContinuationOutcome::Event(Box::new(event)),
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -149,136 +139,18 @@ impl ChannelStreamRelay {
     where
         R: Into<AgentStreamReceiver>,
     {
-        let rx = rx.into();
-        if is_buffered_platform(self.config.platform) {
-            self.run_buffered(rx).await;
-        } else {
-            self.run_editable(rx).await;
-        }
-    }
+        let mut rx = rx.into();
 
-    /// Buffered relay for channels where intermediate messages should not be
-    /// exposed as separate user-facing messages.
-    async fn run_buffered(self, mut rx: AgentStreamReceiver) {
-        let mut text_buffer = String::new();
-        let mut has_content = false;
-        let mut pending_event = None;
-
-        loop {
-            let received = match pending_event.take() {
-                Some(event) => Ok(event),
-                None => rx.recv().await,
-            };
-            match received {
-                Ok(event) => match ChannelMessageService::process_stream_event(&event) {
-                    Some(StreamAction::AppendText(chunk)) => {
-                        text_buffer.push_str(&chunk);
-                        has_content = true;
-                    }
-                    Some(StreamAction::Thinking(_)) => {}
-                    Some(StreamAction::ToolCall { .. }) => {}
-                    Some(StreamAction::Finish) => {
-                        match self.next_continuation_event(&mut rx).await {
-                            ContinuationOutcome::Event(event) => {
-                                pending_event = Some(*event);
-                                continue;
-                            }
-                            ContinuationOutcome::Interrupted => {
-                                let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                                let reply =
-                                    format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
-                                let formatted = format_text_for_platform(&reply, self.config.platform);
-                                let preview = self.route_preview(&error_text);
-                                self.send_buffered_message(&formatted, false, Some(&preview)).await;
-                                break;
-                            }
-                            ContinuationOutcome::Complete => {}
-                        }
-                        if has_content && !text_buffer.trim().is_empty() {
-                            let reply =
-                                format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
-                            let formatted = format_text_for_platform(&reply, self.config.platform);
-                            let preview = self.route_preview(&text_buffer);
-                            self.send_buffered_message(&formatted, true, Some(&preview)).await;
-                        }
-                        info!(
-                            plugin_id = %self.config.plugin_id,
-                            chat_id = %self.config.chat_id,
-                            text_len = text_buffer.len(),
-                            platform = %self.config.platform,
-                            "channel stream relay finished (buffered)"
-                        );
-                        break;
-                    }
-                    Some(StreamAction::Error(msg)) => {
-                        let error_text = stream_error_text(&text_buffer, &msg);
-                        let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
-                        let formatted = format_text_for_platform(&reply, self.config.platform);
-                        let preview = self.route_preview(&error_text);
-                        self.send_buffered_message(&formatted, false, Some(&preview)).await;
-                        break;
-                    }
-                    None => {}
-                },
-                Err(broadcast::error::RecvError::Closed) => {
-                    let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                    let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
-                    let formatted = format_text_for_platform(&reply, self.config.platform);
-                    let preview = self.route_preview(&error_text);
-                    self.send_buffered_message(&formatted, false, Some(&preview)).await;
-                    break;
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(
-                        lagged = n,
-                        platform = %self.config.platform,
-                        "channel stream relay lagged (buffered)"
-                    );
-                    let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                    let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
-                    let formatted = format_text_for_platform(&reply, self.config.platform);
-                    let preview = self.route_preview(&error_text);
-                    self.send_buffered_message(&formatted, false, Some(&preview)).await;
-                    break;
-                }
-            }
-        }
-
-        debug!(
-            plugin_id = %self.config.plugin_id,
-            chat_id = %self.config.chat_id,
-            platform = %self.config.platform,
-            "channel stream relay exited (buffered)"
-        );
-    }
-
-    /// Standard relay for platforms that support edit (Telegram, DingTalk).
-    async fn run_editable(self, mut rx: AgentStreamReceiver) {
-        let throttle = Duration::from_millis(self.config.throttle_ms);
-
-        let thinking_msg = ChannelMessageService::build_thinking_message();
-        let thinking_receipt = match self
-            .sender
-            .send_message(
-                &self.config.owner_user_id,
-                &self.config.plugin_id,
-                &self.config.chat_id,
-                thinking_msg,
-            )
+        if self
+            .send_outgoing(ChannelMessageService::build_thinking_message(), None)
             .await
+            .is_none()
         {
-            Ok(receipt) => receipt,
-            Err(e) => {
-                error!(error = %e, "failed to send thinking message");
-                return;
-            }
-        };
-        self.register_message_route(&thinking_receipt, None).await;
-        let thinking_msg_id = thinking_receipt.message_id.clone();
+            error!("failed to send channel working marker");
+            return;
+        }
 
         let mut text_buffer = String::new();
-        let mut last_edit = Instant::now() - throttle;
-        let mut has_content = false;
         let mut pending_event = None;
 
         loop {
@@ -289,91 +161,50 @@ impl ChannelStreamRelay {
             match received {
                 Ok(event) => match ChannelMessageService::process_stream_event(&event) {
                     Some(StreamAction::AppendText(chunk)) => {
+                        if chunk.trim().is_empty() {
+                            continue;
+                        }
                         text_buffer.push_str(&chunk);
-                        has_content = true;
-                        if last_edit.elapsed() >= throttle {
-                            let reply =
-                                format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
-                            let formatted = format_text_for_platform(&reply, self.config.platform);
-                            let msg = ChannelMessageService::build_streaming_message(&formatted);
-                            let _ = self
-                                .sender
-                                .edit_message(
-                                    &self.config.owner_user_id,
-                                    &self.config.plugin_id,
-                                    &self.config.chat_id,
-                                    &thinking_msg_id,
-                                    msg,
-                                )
-                                .await;
-                            last_edit = Instant::now();
-                        }
+                        let formatted = format_text_for_platform(&chunk, self.config.platform);
+                        let message = ChannelMessageService::build_streaming_message(&formatted);
+                        self.send_outgoing(message, None).await;
                     }
-                    Some(StreamAction::Thinking(_)) => {}
-                    Some(StreamAction::ToolCall { name, .. }) => {
-                        let msg = ChannelMessageService::build_streaming_message(&format!("\u{23f3} {name}..."));
-                        let _ = self
-                            .sender
-                            .edit_message(
-                                &self.config.owner_user_id,
-                                &self.config.plugin_id,
-                                &self.config.chat_id,
-                                &thinking_msg_id,
-                                msg,
-                            )
-                            .await;
-                    }
-                    Some(StreamAction::Finish) => {
-                        match self.next_continuation_event(&mut rx).await {
-                            ContinuationOutcome::Event(event) => {
-                                pending_event = Some(*event);
-                                continue;
-                            }
-                            ContinuationOutcome::Interrupted => {
-                                let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                                self.send_error_edit(&error_text, &thinking_msg_id).await;
-                                let preview = self.route_preview(&error_text);
-                                self.register_message_route(&thinking_receipt, Some(&preview)).await;
-                                break;
-                            }
-                            ContinuationOutcome::Complete => {}
+                    Some(StreamAction::Thinking(_)) | Some(StreamAction::ToolCall { .. }) => {}
+                    Some(StreamAction::Finish) => match self.next_continuation_event(&mut rx).await {
+                        ContinuationOutcome::Event(event) => {
+                            pending_event = Some(*event);
                         }
-                        self.send_final_edit(&text_buffer, has_content, &thinking_msg_id).await;
-                        if has_content {
+                        ContinuationOutcome::AgentStopped => {
                             let preview = self.route_preview(&text_buffer);
-                            self.register_message_route(&thinking_receipt, Some(&preview)).await;
+                            self.send_outgoing(ChannelMessageService::build_final_message(""), Some(&preview))
+                                .await;
+                            info!(
+                                plugin_id = %self.config.plugin_id,
+                                chat_id = %self.config.chat_id,
+                                text_len = text_buffer.len(),
+                                "channel stream relay finished"
+                            );
+                            break;
                         }
-                        info!(
-                            plugin_id = %self.config.plugin_id,
-                            chat_id = %self.config.chat_id,
-                            text_len = text_buffer.len(),
-                            "channel stream relay finished"
-                        );
-                        break;
-                    }
-                    Some(StreamAction::Error(msg)) => {
-                        let error_text = stream_error_text(&text_buffer, &msg);
-                        self.send_error_edit(&error_text, &thinking_msg_id).await;
-                        let preview = self.route_preview(&error_text);
-                        self.register_message_route(&thinking_receipt, Some(&preview)).await;
+                        ContinuationOutcome::Interrupted => {
+                            self.send_error_message("回复流中断，请重试").await;
+                            break;
+                        }
+                    },
+                    Some(StreamAction::Error(message)) => {
+                        self.send_error_message(&message).await;
                         break;
                     }
                     None => {}
                 },
                 Err(broadcast::error::RecvError::Closed) => {
                     warn!("channel stream relay: broadcast closed without terminal event");
-                    let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                    self.send_error_edit(&error_text, &thinking_msg_id).await;
-                    let preview = self.route_preview(&error_text);
-                    self.register_message_route(&thinking_receipt, Some(&preview)).await;
+                    self.send_error_message("回复流中断，请重试").await;
                     break;
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(lagged = n, "channel stream relay lagged");
-                    let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                    self.send_error_edit(&error_text, &thinking_msg_id).await;
-                    let preview = self.route_preview(&error_text);
-                    self.register_message_route(&thinking_receipt, Some(&preview)).await;
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "channel stream relay lagged");
+                    self.send_error_message("回复流中断，请重试").await;
                     break;
                 }
             }
@@ -386,79 +217,37 @@ impl ChannelStreamRelay {
         );
     }
 
-    async fn send_final_edit(&self, text_buffer: &str, has_content: bool, msg_id: &str) {
-        if has_content {
-            let reply = format_remote_reply(&self.config.prompt_text, text_buffer, self.config.platform);
-            let formatted = format_text_for_platform(&reply, self.config.platform);
-            let final_msg = ChannelMessageService::build_final_message(&formatted);
-            let _ = self
-                .sender
-                .edit_message(
-                    &self.config.owner_user_id,
-                    &self.config.plugin_id,
-                    &self.config.chat_id,
-                    msg_id,
-                    final_msg,
-                )
-                .await;
-        }
+    async fn send_error_message(&self, reason: &str) {
+        let text = format_text_for_platform(&format!("❌ {reason}"), self.config.platform);
+        let preview = self.route_preview(&text);
+        self.send_outgoing(ChannelMessageService::build_text_message(&text), Some(&preview))
+            .await;
     }
 
-    async fn send_buffered_message(&self, formatted: &str, with_buttons: bool, preview: Option<&str>) {
-        let limit = match self.config.platform {
-            PluginType::Lark => LARK_MESSAGE_LIMIT,
-            _ => WEIXIN_MESSAGE_LIMIT,
-        };
-        let chunks = split_text_for_limit(formatted, limit);
-        for (index, chunk) in chunks.iter().enumerate() {
-            let is_last = index + 1 == chunks.len();
-            let message = if with_buttons && is_last {
-                ChannelMessageService::build_final_message(chunk)
-            } else {
-                ChannelMessageService::build_text_message(chunk)
-            };
-            match self
-                .sender
-                .send_message(
-                    &self.config.owner_user_id,
-                    &self.config.plugin_id,
-                    &self.config.chat_id,
-                    message,
-                )
-                .await
-            {
-                Ok(receipt) => {
-                    self.register_message_route(&receipt, if is_last { preview } else { None })
-                        .await;
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        chunk_index = index,
-                        chunk_count = chunks.len(),
-                        platform = %self.config.platform,
-                        "failed to send buffered channel reply chunk"
-                    );
-                    break;
-                }
-            }
-        }
-    }
-
-    async fn send_error_edit(&self, assistant_text: &str, msg_id: &str) {
-        let reply = format_remote_reply(&self.config.prompt_text, assistant_text, self.config.platform);
-        let formatted = format_text_for_platform(&reply, self.config.platform);
-        let error_msg = ChannelMessageService::build_text_message(&formatted);
-        let _ = self
+    async fn send_outgoing(
+        &self,
+        message: UnifiedOutgoingMessage,
+        preview_text: Option<&str>,
+    ) -> Option<ChannelDeliveryReceipt> {
+        match self
             .sender
-            .edit_message(
+            .send_message(
                 &self.config.owner_user_id,
                 &self.config.plugin_id,
                 &self.config.chat_id,
-                msg_id,
-                error_msg,
+                message,
             )
-            .await;
+            .await
+        {
+            Ok(receipt) => {
+                self.register_message_route(&receipt, preview_text).await;
+                Some(receipt)
+            }
+            Err(error) => {
+                warn!(error = %error, "failed to send channel stream message");
+                None
+            }
+        }
     }
 
     async fn register_message_route(&self, receipt: &ChannelDeliveryReceipt, preview_text: Option<&str>) {
@@ -466,7 +255,7 @@ impl ChannelStreamRelay {
             return;
         };
         let platform_type = self.config.platform.to_string();
-        if let Err(e) = session_manager
+        if let Err(error) = session_manager
             .register_conversation_route(
                 &self.config.owner_user_id,
                 &aionui_db::UpsertChannelConversationRouteParams {
@@ -482,7 +271,7 @@ impl ChannelStreamRelay {
             )
             .await
         {
-            warn!(error = %e, "failed to register channel reply route");
+            warn!(error = %error, "failed to register channel reply route");
         }
     }
 
@@ -511,48 +300,6 @@ pub(crate) fn format_remote_reply(prompt_text: &str, assistant_text: &str, platf
     }
 }
 
-fn split_text_for_limit(text: &str, limit: usize) -> Vec<String> {
-    if text.is_empty() || limit == 0 {
-        return Vec::new();
-    }
-
-    let mut chunks = Vec::new();
-    let mut remaining = text;
-    while remaining.chars().count() > limit {
-        let boundary = remaining
-            .char_indices()
-            .nth(limit)
-            .map(|(index, _)| index)
-            .unwrap_or(remaining.len());
-        let split_at = remaining[..boundary]
-            .rfind('\n')
-            .map(|index| index + 1)
-            .filter(|index| *index > 0)
-            .unwrap_or(boundary);
-        chunks.push(remaining[..split_at].to_owned());
-        remaining = &remaining[split_at..];
-    }
-    if !remaining.is_empty() {
-        chunks.push(remaining.to_owned());
-    }
-    chunks
-}
-
-fn stream_error_text(text_buffer: &str, reason: &str) -> String {
-    let error = format!("\u{274c} {reason}");
-    if text_buffer.trim().is_empty() {
-        error
-    } else {
-        format!("{}\n\n{error}", text_buffer.trim_end())
-    }
-}
-
-/// WeChat, WeCom, and Lark relays buffer the whole turn and send one final
-/// answer instead of exposing intermediate status messages.
-fn is_buffered_platform(platform: PluginType) -> bool {
-    matches!(platform, PluginType::Weixin | PluginType::Wecom | PluginType::Lark)
-}
-
 // ── Test helpers (pub so integration tests can use them) ─────────
 
 /// Records send/edit calls for test assertions.
@@ -571,6 +318,10 @@ impl MessageRecorder {
 
     pub fn take_sends(&self) -> Vec<UnifiedOutgoingMessage> {
         std::mem::take(&mut self.sends.lock().unwrap())
+    }
+
+    pub fn snapshot_sends(&self) -> Vec<UnifiedOutgoingMessage> {
+        self.sends.lock().unwrap().clone()
     }
 
     pub fn take_edits(&self) -> Vec<UnifiedOutgoingMessage> {

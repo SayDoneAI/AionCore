@@ -12,9 +12,7 @@ use crate::action::{ActionExecutor, MessageResult};
 use crate::formatter::format_text_for_platform;
 use crate::message_service::ChannelMessageService;
 use crate::session::SessionManager;
-use crate::stream_relay::{
-    ChannelSender, ChannelStreamRelay, RelayConfig, format_remote_reply, throttle_ms_for_platform,
-};
+use crate::stream_relay::{ChannelSender, ChannelStreamRelay, RelayConfig, format_remote_reply};
 use crate::types::{ActionBehavior, OutgoingMessageType, UnifiedIncomingMessage, UnifiedOutgoingMessage};
 
 /// Orchestrates the full channel message lifecycle.
@@ -588,8 +586,6 @@ async fn handle_dispatched(
         .entry(lock_key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
-    let _conversation_guard = conversation_lock.lock().await;
-
     if let Some(conversation_id) = conversation_id {
         mirror_service.mark_channel_turn(
             owner_user_id,
@@ -603,7 +599,13 @@ async fn handle_dispatched(
         );
     }
 
-    let send_result = match msg_svc.send_to_agent(owner_user_id, &session, text, platform).await {
+    // Serialize only the input handoff. Release the guard before relaying so a
+    // follow-up message can be delivered into the active turn immediately.
+    let send_result = {
+        let _conversation_guard = conversation_lock.lock().await;
+        msg_svc.send_to_agent(owner_user_id, &session, text, platform).await
+    };
+    let send_result = match send_result {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "failed to send to agent");
@@ -660,6 +662,16 @@ async fn handle_dispatched(
         }
     };
 
+    // The active turn already has a relay. Starting another one would duplicate
+    // every subsequent text event on the channel.
+    if send_result.delivered_midturn {
+        info!(
+            conversation_id = %send_result.conversation_id,
+            "channel message delivered into the active agent turn"
+        );
+        return Ok(());
+    }
+
     // Bind conversation to session if newly created
     if conversation_id.is_none()
         && let Err(e) = session_mgr
@@ -679,7 +691,6 @@ async fn handle_dispatched(
             plugin_id: plugin_id.to_owned(),
             chat_id: chat_id.to_owned(),
             prompt_text: text.to_owned(),
-            throttle_ms: throttle_ms_for_platform(platform),
         };
         let relay = ChannelStreamRelay::with_session_manager(relay_config, Arc::clone(sender), Arc::clone(session_mgr))
             .with_runtime_state(msg_svc.runtime_state());
