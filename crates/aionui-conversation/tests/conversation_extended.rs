@@ -134,6 +134,19 @@ fn make_create_req() -> CreateConversationRequest {
     .unwrap()
 }
 
+fn make_codex_create_req(agent_source: &str) -> CreateConversationRequest {
+    let workspace = ensure_test_workspace_path();
+    serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": workspace,
+            "backend": "codex",
+            "agent_source": agent_source
+        }
+    }))
+    .unwrap()
+}
+
 fn make_message(conv_id: &str, content: &str, offset_ms: i64) -> MessageRow {
     MessageRow {
         id: generate_prefixed_id("msg"),
@@ -253,6 +266,104 @@ async fn t8_1_empty_messages() {
     assert!(result.newest_cursor.is_none());
     assert!(!result.has_more_before);
     assert!(!result.has_more_after);
+}
+
+#[tokio::test]
+async fn managed_codex_catalog_warning_is_hidden_in_history_without_changing_storage() {
+    let (svc, repo, _b) = setup().await;
+    let conv = svc.create(USER_ID, make_codex_create_req("builtin")).await.unwrap();
+    let warning_text = "Model metadata for `gpt-6.1-sol` not found. Defaulting to fallback metadata; this may degrade performance and cause issues.";
+    for (id, message_type, message, status) in [
+        ("metadata-warning", "tips", warning_text, "finish"),
+        ("actionable-warning", "tips", "Selected model was rejected", "finish"),
+    ] {
+        repo.insert_message(
+            USER_ID,
+            &MessageRow {
+                id: id.into(),
+                conversation_id: conv.id.clone(),
+                msg_id: Some(id.into()),
+                r#type: message_type.into(),
+                content: json!({ "content": message, "type": "warning" }).to_string(),
+                position: Some("center".into()),
+                status: Some(status.into()),
+                hidden: false,
+                created_at: now_ms(),
+                backend_turn_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let history = svc
+        .list_messages(USER_ID, &conv.id, ListMessagesQuery::default())
+        .await
+        .unwrap();
+    let diagnostic = history
+        .items
+        .iter()
+        .find(|message| message.id == "metadata-warning")
+        .unwrap();
+    assert!(diagnostic.hidden);
+    assert_eq!(diagnostic.content["content"], warning_text);
+    assert!(
+        !history
+            .items
+            .iter()
+            .find(|message| message.id == "actionable-warning")
+            .unwrap()
+            .hidden
+    );
+
+    let detail = svc.get_message(USER_ID, &conv.id, "metadata-warning").await.unwrap();
+    assert!(detail.hidden);
+    let raw = repo
+        .list_messages_page(
+            USER_ID,
+            &conv.id,
+            &aionui_db::MessagePageParams {
+                limit: 20,
+                direction: aionui_db::MessagePageDirection::InitialLatest,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        raw.items
+            .iter()
+            .any(|message| message.id == "metadata-warning" && !message.hidden)
+    );
+}
+
+#[tokio::test]
+async fn custom_codex_catalog_warning_remains_visible() {
+    let (svc, repo, _b) = setup().await;
+    let conv = svc.create(USER_ID, make_codex_create_req("custom")).await.unwrap();
+    let diagnostic = "Model metadata for `custom-model` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.";
+    repo.insert_message(
+        USER_ID,
+        &MessageRow {
+            id: "external-metadata-warning".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("external-metadata-warning".into()),
+            r#type: "tips".into(),
+            content: json!({ "content": diagnostic, "type": "warning" }).to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: now_ms(),
+            backend_turn_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let history = svc
+        .list_messages(USER_ID, &conv.id, ListMessagesQuery::default())
+        .await
+        .unwrap();
+    assert!(!history.items[0].hidden);
 }
 
 #[tokio::test]

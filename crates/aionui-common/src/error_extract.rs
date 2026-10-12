@@ -46,6 +46,25 @@ pub const ERROR_KEYWORDS: &[&str] = &[
 
 const MAX_MESSAGE_CHARS: usize = 240;
 
+/// Recognize a standalone Codex catalog diagnostic without matching model names.
+///
+/// Managed model metadata comes from the hosted backend. This CLI diagnostic is
+/// retained in logs, while actionable errors and messages quoting it stay visible.
+pub fn is_codex_model_metadata_warning(message: &str) -> bool {
+    let Some(rest) = message.trim().strip_prefix("Model metadata for `") else {
+        return false;
+    };
+    let Some((model, consequence)) = rest.split_once("` not found. Defaulting to fallback metadata; ") else {
+        return false;
+    };
+    !model.is_empty()
+        && !model.contains(['`', '\n', '\r'])
+        && matches!(
+            consequence,
+            "this can degrade performance and cause issues." | "this may degrade performance and cause issues."
+        )
+}
+
 /// Strip ANSI CSI escape sequences (`\u{1b}[...m` and similar) from `s`.
 ///
 /// Minimal implementation — handles the SGR (`m`) terminator that `tracing`'s
@@ -136,7 +155,28 @@ pub fn extract_error_message(stderr_tail: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_error_message;
+    use super::{extract_error_message, is_codex_model_metadata_warning};
+
+    #[test]
+    fn recognizes_only_standalone_model_metadata_diagnostics() {
+        for model in ["gpt-6.1-sol", "custom-hosted-model"] {
+            for modal in ["can", "may"] {
+                assert!(is_codex_model_metadata_warning(&format!(
+                    "Model metadata for `{model}` not found. Defaulting to fallback metadata; this {modal} degrade performance and cause issues."
+                )));
+            }
+        }
+        for message in [
+            "",
+            "The selected model could not be used.",
+            "Model metadata for `custom-model` is invalid.",
+            "Model metadata for `` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.",
+            "I saw: Model metadata for `custom-model` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.",
+            "Model metadata for `custom-model` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.\nConnection refused.",
+        ] {
+            assert!(!is_codex_model_metadata_warning(message), "must preserve: {message}");
+        }
+    }
 
     const STDERR_USAGE_LIMIT: &str = "\u{1b}[2m2026-05-13T20:01:21.330370Z\u{1b}[0m \u{1b}[31mERROR\u{1b}[0m \u{1b}[2mcodex_acp::thread\u{1b}[0m\u{1b}[2m:\u{1b}[0m Unhandled error during turn: You've hit your usage limit. To get more access now, send a request to your admin or try again at May 14th, 2026 8:16 PM. Some(UsageLimitExceeded)";
 

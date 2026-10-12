@@ -2256,6 +2256,14 @@ async fn reader_task(
                             continue;
                         }
                         for ev in map_notification(m, params, managed_model.as_deref(), managed_context_window) {
+                            if is_managed_codex_internal_notice(&ev, managed_model.as_deref()) {
+                                tracing::warn!(
+                                    backend = "codex",
+                                    diagnostic_code = "managed_model_metadata_fallback",
+                                    "Managed Codex emitted an internal model metadata diagnostic"
+                                );
+                                continue;
+                            }
                             if let SessionEvent::ConfigChanged { model: Some(model), .. } = &ev {
                                 // Model changes become authoritative only after Codex
                                 // confirms them on the wire. This avoids poisoning the
@@ -3395,6 +3403,12 @@ fn map_notification(
             payload: params.clone(),
         }],
     }
+}
+
+fn is_managed_codex_internal_notice(event: &SessionEvent, managed_model: Option<&str>) -> bool {
+    managed_model.is_some()
+        && matches!(event, SessionEvent::Notice { message, .. }
+            if aionui_common::error_extract::is_codex_model_metadata_warning(message))
 }
 
 /// Build a [`SessionEvent::Notice`] message from a codex `deprecationNotice` /
@@ -5783,6 +5797,33 @@ mod tests {
             cfg.iter()
                 .any(|e| matches!(e, SessionEvent::Notice { level: NoticeLevel::Warning, message, .. } if message == "unknown key X")),
             "configWarning → Notice(Warning), got {cfg:?}"
+        );
+        let metadata_warning = json!({
+            "message": "Model metadata for `gpt-6.1-sol` not found. Defaulting to fallback metadata; this may degrade performance and cause issues."
+        });
+        assert!(
+            map_notification("warning", &metadata_warning, Some("gpt-6.1-sol"), None)
+                .iter()
+                .all(|event| is_managed_codex_internal_notice(event, Some("gpt-6.1-sol"))),
+            "managed Codex model catalog diagnostics are identified before forwarding"
+        );
+        assert!(
+            matches!(
+                map_notification("warning", &metadata_warning, None, None).as_slice(),
+                [SessionEvent::Notice {
+                    level: NoticeLevel::Warning,
+                    ..
+                }]
+            ),
+            "external Codex warnings remain visible"
+        );
+        assert!(
+            matches!(
+                map_notification("warning", &json!({ "message": "Selected model was rejected" }), Some("gpt-6.1-sol"), None).as_slice(),
+                [SessionEvent::Notice { level: NoticeLevel::Warning, message, .. }]
+                    if message == "Selected model was rejected"
+            ),
+            "actionable managed Codex warnings remain visible"
         );
         // error{willRetry:true} → Heartbeat (transient retry, not a duplicate terminal)
         let retry = drive_codex(&[

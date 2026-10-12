@@ -29,9 +29,9 @@ use aionui_api_types::{
 };
 use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
-    AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
-    now_ms, validate_workspace_path_availability,
+    AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageStatus, MessageType,
+    OnConversationDelete, OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError,
+    generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
@@ -3492,6 +3492,25 @@ fn message_locator_count(query: &ListMessagesQuery) -> usize {
         + usize::from(query.anchor_message_id.is_some())
 }
 
+/// Hide historical CLI diagnostics at the read boundary without rewriting rows
+/// or removing pagination anchors. Only unlocalized warnings are diagnostics;
+/// configuration failures, user text, and external CLI notices stay visible.
+fn project_managed_codex_notice(response: &mut MessageResponse, managed_codex: bool) {
+    if managed_codex
+        && response.r#type == MessageType::Tips
+        && response.status != Some(MessageStatus::Error)
+        && response.content.get("type").and_then(serde_json::Value::as_str) == Some("warning")
+        && response.content.get("code").is_none_or(serde_json::Value::is_null)
+        && response
+            .content
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(aionui_common::error_extract::is_codex_model_metadata_warning)
+    {
+        response.hidden = true;
+    }
+}
+
 impl ConversationService {
     /// List messages for a conversation with cursor-based pagination.
     pub async fn list_messages(
@@ -3501,12 +3520,15 @@ impl ConversationService {
         query: ListMessagesQuery,
     ) -> Result<MessageListResponse, ConversationError> {
         // Verify conversation exists and belongs to user
-        self.conversation_repo
+        let conversation = self
+            .conversation_repo
             .get(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+
+        let managed_codex = validate_managed_runtime_target(&conversation, "codex").is_ok();
 
         let limit = effective_message_limit(query.limit);
         if message_locator_count(&query) > 1 {
@@ -3552,11 +3574,12 @@ impl ConversationService {
         for row in page.items {
             let original_content_bytes = row.content.len();
             total_original_content_bytes += original_content_bytes;
-            let response = if compact_content {
+            let mut response = if compact_content {
                 row_to_message_response_compact(row)?
             } else {
                 row_to_message_response(row)?
             };
+            project_managed_codex_notice(&mut response, managed_codex);
 
             if compact_content {
                 if response
@@ -3606,7 +3629,8 @@ impl ConversationService {
         conversation_id: &str,
         message_type: &str,
     ) -> Result<Option<MessageResponse>, ConversationError> {
-        self.conversation_repo
+        let conversation = self
+            .conversation_repo
             .get(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
@@ -3618,7 +3642,15 @@ impl ConversationService {
             .latest_message_of_type(user_id, conversation_id, message_type)
             .await?;
 
-        row.map(row_to_message_response).transpose()
+        row.map(|row| {
+            let mut response = row_to_message_response(row)?;
+            project_managed_codex_notice(
+                &mut response,
+                validate_managed_runtime_target(&conversation, "codex").is_ok(),
+            );
+            Ok(response)
+        })
+        .transpose()
     }
 
     pub async fn get_message(
@@ -3627,7 +3659,8 @@ impl ConversationService {
         conversation_id: &str,
         message_id: &str,
     ) -> Result<MessageResponse, ConversationError> {
-        self.conversation_repo
+        let conversation = self
+            .conversation_repo
             .get(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
@@ -3643,7 +3676,11 @@ impl ConversationService {
             })?;
 
         let content_bytes = row.content.len();
-        let response = row_to_message_response(row)?;
+        let mut response = row_to_message_response(row)?;
+        project_managed_codex_notice(
+            &mut response,
+            validate_managed_runtime_target(&conversation, "codex").is_ok(),
+        );
         if is_tool_message_type(response.r#type) || content_bytes > TOOL_CONTENT_COMPACT_THRESHOLD_BYTES {
             info!(
                 conversation_id,
