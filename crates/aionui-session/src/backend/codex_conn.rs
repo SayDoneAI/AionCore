@@ -51,13 +51,13 @@ const SAYDONE_MANAGED_PROTOCOL_ENV: &str = "SAYDONE_MANAGED_PROTOCOL";
 const SAYDONE_MANAGED_MODEL_ENV: &str = "SAYDONE_MANAGED_MODEL";
 const SAYDONE_MANAGED_BASE_URL_ENV: &str = "SAYDONE_MANAGED_BASE_URL";
 const SAYDONE_MANAGED_CONTEXT_WINDOW_ENV: &str = "SAYDONE_MANAGED_CONTEXT_WINDOW";
+const SAYDONE_MANAGED_REASONING_POLICY: &str = "SAYDONE_MANAGED_REASONING_POLICY";
 const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 
 /// 仅在完整的 SayDone 托管 Codex 上保留服务端已授权的模型。
 ///
-/// Codex CLI 的 `model/list` 只包含其原生目录；SayDone 通过 OpenAI
-/// 兼容运行时提供的模型不会出现在其中。四项标记和会话模型必须完全
-/// 一致，避免把普通用户的 Codex 配置误判为托管会话。
+/// Managed identity requires consistent runtime markers and an authorized
+/// session model. External Codex sessions retain their own catalog and policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SaydoneManagedCodexRuntime {
     model: String,
@@ -84,13 +84,322 @@ fn saydone_managed_codex_runtime(config: &SessionConfig) -> Option<SaydoneManage
     (unique_env_value(&config.spawn_env, SAYDONE_MANAGED_AGENT_ENV) == Some("1")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_BACKEND_ENV) == Some("codex")
         && unique_env_value(&config.spawn_env, SAYDONE_MANAGED_PROTOCOL_ENV) == Some("openai")
-        && !api_key.is_empty()
+        && !api_key.trim().is_empty()
+        && !model.trim().is_empty()
+        && !base_url.trim().is_empty()
         && config.model.as_deref() == Some(model))
     .then(|| SaydoneManagedCodexRuntime {
         model: model.to_owned(),
         base_url: base_url.to_owned(),
         context_window,
     })
+}
+
+struct ManagedCodexModelMetadata {
+    runtime: SaydoneManagedCodexRuntime,
+    supports_vision: bool,
+    efforts: Vec<String>,
+    default_effort: Option<String>,
+    off_value: Option<String>,
+}
+
+impl ManagedCodexModelMetadata {
+    fn wire_effort<'a>(&'a self, effort: &'a str) -> Result<&'a str, BackendError> {
+        if effort == "off" {
+            return self.off_value.as_deref().ok_or_else(|| {
+                BackendError::SetupRejected("Managed CLI reasoning policy is missing or invalid".into())
+            });
+        }
+        // The generated private Codex catalog exposes the backend's wire value
+        // (for example `none`) for the canonical `off` level. Accepting that
+        // value here keeps the catalog and a later SetConfigOption round-trip
+        // consistent. `off_value` is validated against canonical efforts below,
+        // so it cannot accidentally alias another level.
+        if self.off_value.as_deref() == Some(effort) || self.efforts.iter().any(|allowed| allowed == effort) {
+            return Ok(effort);
+        }
+        Err(BackendError::SetupRejected(
+            "Managed CLI reasoning effort is not allowed".into(),
+        ))
+    }
+}
+
+fn validate_managed_codex_metadata(config: &SessionConfig) -> Result<ManagedCodexModelMetadata, BackendError> {
+    let invalid = || BackendError::SetupRejected("Managed CLI model configuration is missing or invalid".into());
+    let runtime = saydone_managed_codex_runtime(config).ok_or_else(invalid)?;
+    let env = |name: &str| {
+        let mut values = config
+            .spawn_env
+            .iter()
+            .filter(|entry| entry.name == name)
+            .map(|entry| entry.value.as_str());
+        let value = values.next()?;
+        values.all(|candidate| candidate == value).then_some(value)
+    };
+    let number = |name: &str| {
+        env(name)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    };
+    let context = number(SAYDONE_MANAGED_CONTEXT_WINDOW_ENV).ok_or_else(invalid)?;
+    let max_output = number("SAYDONE_MANAGED_MAX_OUTPUT_TOKENS").ok_or_else(invalid)?;
+    let default_output = number("SAYDONE_MANAGED_DEFAULT_OUTPUT_TOKENS").ok_or_else(invalid)?;
+    if default_output > max_output || max_output > context || i64::try_from(context).is_err() {
+        return Err(invalid());
+    }
+    let vision = env("SAYDONE_MANAGED_SUPPORTS_VISION")
+        .and_then(|value| match value {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        })
+        .ok_or_else(invalid)?;
+    let policy: Value = env(SAYDONE_MANAGED_REASONING_POLICY)
+        .and_then(|value| serde_json::from_str(value).ok())
+        .ok_or_else(invalid)?;
+    let policy = policy.as_object().ok_or_else(invalid)?;
+    let efforts = policy.get("efforts").and_then(Value::as_array).ok_or_else(invalid)?;
+    if efforts.len() > 16
+        || policy.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "efforts" | "default_effort" | "wire_protocol" | "off_value"
+            )
+        })
+        || efforts.iter().enumerate().any(|(index, effort)| {
+            effort.as_str().is_none_or(|value| {
+                value.is_empty()
+                    || value.len() > 32
+                    || !value.as_bytes()[0].is_ascii_lowercase()
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'))
+            }) || efforts[..index].contains(effort)
+        })
+        || policy
+            .get("default_effort")
+            .is_some_and(|value| !efforts.contains(value))
+        || policy
+            .get("wire_protocol")
+            .is_some_and(|value| value.as_str() != Some("openai_reasoning_effort"))
+    {
+        return Err(invalid());
+    }
+    let off_value = policy
+        .get("off_value")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty() && value.len() <= 32)
+                .map(str::to_owned)
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    let supports_off = efforts.iter().any(|value| value.as_str() == Some("off"));
+    if supports_off != off_value.is_some() {
+        return Err(invalid());
+    }
+    if let Some(off_value) = off_value.as_deref()
+        && efforts.iter().any(|effort| {
+            effort
+                .as_str()
+                .is_some_and(|effort| effort != "off" && effort == off_value)
+        })
+    {
+        return Err(invalid());
+    }
+    // Codex accepts model-advertised effort strings on its app-server protocol.
+    // Its ModelInfo has no response-output-budget field. Validate backend
+    // budgets without misrepresenting them as tool-result truncation limits.
+    Ok(ManagedCodexModelMetadata {
+        runtime,
+        supports_vision: vision,
+        efforts: efforts.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+        default_effort: policy.get("default_effort").and_then(Value::as_str).map(str::to_owned),
+        off_value,
+    })
+}
+
+fn managed_codex_metadata(config: &SessionConfig, native_catalog: &Value) -> Result<Value, BackendError> {
+    let invalid = || BackendError::SetupRejected("Managed CLI model configuration is missing or invalid".into());
+    let metadata = validate_managed_codex_metadata(config)?;
+    let runtime = &metadata.runtime;
+    let context = runtime.context_window.ok_or_else(invalid)?;
+    // The CLI supplies its own prompt and tool protocol, never model limits or
+    // capabilities. Read those protocol fields from the installed binary's
+    // `debug models --bundled` output instead of maintaining a local model table.
+    let models = native_catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid)?;
+    // Backend-authorized models need not exist in this CLI's bundled catalog.
+    // Use its highest-priority ordinary direct-tool profile only as a protocol
+    // template; code-mode and specialized profiles carry different prompts.
+    let native = models
+        .iter()
+        .filter(|model| {
+            model.get("supported_in_api").and_then(Value::as_bool) == Some(true)
+                && model.get("visibility").and_then(Value::as_str) == Some("list")
+                && model
+                    .get("tool_mode")
+                    .is_none_or(|mode| mode.is_null() || mode.as_str() == Some("direct"))
+                && model.get("model_specialty").is_none_or(Value::is_null)
+                && matches!(
+                    model.get("shell_type").and_then(Value::as_str),
+                    Some("shell_command" | "unified_exec")
+                )
+                && model.get("priority").and_then(Value::as_i64).is_some()
+        })
+        .min_by_key(|model| model["priority"].as_i64())
+        .ok_or_else(invalid)?;
+    let instructions = native
+        .pointer("/model_messages/instructions_template")
+        .and_then(Value::as_str)
+        .filter(|instructions| !instructions.trim().is_empty())
+        .or_else(|| {
+            native
+                .get("base_instructions")
+                .and_then(Value::as_str)
+                .filter(|instructions| !instructions.trim().is_empty())
+        })
+        .ok_or_else(invalid)?;
+    if native
+        .get("apply_patch_tool_type")
+        .is_some_and(|value| !value.is_null() && value.as_str() != Some("freeform"))
+    {
+        return Err(invalid());
+    }
+    let truncation = native.get("truncation_policy").ok_or_else(invalid)?;
+    if !matches!(truncation.get("mode").and_then(Value::as_str), Some("bytes" | "tokens"))
+        || truncation
+            .get("limit")
+            .and_then(Value::as_i64)
+            .is_none_or(|limit| limit <= 0)
+    {
+        return Err(invalid());
+    }
+    let default_effort = metadata
+        .default_effort
+        .as_deref()
+        .map(|effort| metadata.wire_effort(effort))
+        .transpose()?;
+    let supported_efforts = metadata
+        .efforts
+        .iter()
+        .map(|effort| {
+            metadata
+                .wire_effort(effort)
+                .map(|effort| json!({"effort":effort,"description":""}))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let model = json!({
+        "slug": runtime.model,
+        "display_name": runtime.model,
+        "description": "",
+        "shell_type": native.get("shell_type").ok_or_else(invalid)?,
+        "base_instructions": instructions,
+        // Copy the instruction text, not model-owned budgets, multi-agent
+        // prompts or confirmation policies from ModelMessages.
+        "model_messages": {"instructions_template": instructions},
+        "apply_patch_tool_type": native.get("apply_patch_tool_type"),
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": 0,
+        "context_window": context,
+        "max_context_window": context,
+        "input_modalities": if metadata.supports_vision { vec!["text", "image"] } else { vec!["text"] },
+        "default_reasoning_level": default_effort,
+        "supported_reasoning_levels": supported_efforts,
+        // The backend exposes no verbosity or experimental-tool policy. Do not
+        // copy those model capabilities from the CLI's native catalog.
+        "support_verbosity": false,
+        "experimental_supported_tools": [],
+        "default_reasoning_summary": "none",
+        "supports_reasoning_summary_parameter": false,
+        // This is Codex's tool-output protocol, not the model output budget.
+        "truncation_policy": truncation,
+        "include_skills_usage_instructions": false,
+        "include_plugin_usage_instructions": false,
+        "include_apps_usage_instructions": false,
+    });
+    Ok(json!({"models":[model]}))
+}
+
+async fn prepare_managed_codex_catalog(
+    config: &SessionConfig,
+    spawner: &dyn Spawner,
+) -> Result<Option<Arc<tempfile::NamedTempFile>>, BackendError> {
+    if !config
+        .spawn_env
+        .iter()
+        .any(|entry| entry.name == SAYDONE_MANAGED_AGENT_ENV && entry.value == "1")
+    {
+        return Ok(None);
+    }
+    // Validate backend input before starting even the metadata probe.
+    validate_managed_codex_metadata(config)?;
+    let proc = spawner
+        .spawn(
+            aionui_common::CommandSpec {
+                command: config.cli_program.clone().unwrap_or_else(|| "codex".into()),
+                args: vec!["debug".into(), "models".into(), "--bundled".into()],
+                env: config.spawn_env.clone(),
+                cwd: config.cwd.clone(),
+            },
+            &[],
+            "saydone-codex-catalog",
+        )
+        .await
+        .map_err(|error| BackendError::from_spawn("Codex catalog probe failed", error))?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        use tokio::io::AsyncReadExt;
+        let (stdin, stdout) = proc
+            .take_stdio()
+            .await
+            .ok_or_else(|| BackendError::Transport("Codex catalog probe has no stdio".into()))?;
+        drop(stdin);
+        let mut bytes = Vec::new();
+        stdout
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| BackendError::Transport(format!("Codex catalog probe read failed: {error}")))?;
+        if bytes.len() > 16 * 1024 * 1024 || proc.wait_for_exit().await.is_none_or(|status| !status.success()) {
+            return Err(BackendError::SetupRejected("Codex catalog probe failed".into()));
+        }
+        let native = serde_json::from_slice(&bytes)
+            .map_err(|_| BackendError::SetupRejected("Codex catalog probe returned invalid metadata".into()))?;
+        managed_codex_metadata(config, &native)
+    })
+    .await;
+    let result = match result {
+        Ok(Ok(result)) => result,
+        failed => {
+            if let Err(error) = proc.kill(std::time::Duration::from_millis(200)).await {
+                tracing::warn!(error = %error, "Codex catalog probe cleanup failed");
+            }
+            return match failed {
+                Ok(Err(error)) => Err(error),
+                Err(_) => Err(BackendError::HandshakeTimeout("Codex catalog probe timed out".into())),
+                Ok(Ok(_)) => unreachable!(),
+            };
+        }
+    };
+    let mut file = tempfile::Builder::new()
+        .prefix("saydone-codex-models-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|error| BackendError::Transport(format!("Codex catalog file creation failed: {error}")))?;
+    use std::io::Write;
+    serde_json::to_writer(file.as_file_mut(), &result)
+        .map_err(|error| BackendError::Transport(format!("Codex catalog serialization failed: {error}")))?;
+    file.flush()
+        .map_err(|error| BackendError::Transport(format!("Codex catalog file write failed: {error}")))?;
+    tracing::info!(
+        backend = "codex",
+        "prepared backend-authoritative managed model metadata"
+    );
+    Ok(Some(Arc::new(file)))
 }
 
 /// Config overrides that make Codex command-execution children inherit the
@@ -107,7 +416,7 @@ pub fn codex_shell_environment_policy_args() -> [&'static str; 4] {
 /// Build the process-level app-server argv shared by initial open and idle
 /// wake. `codex app-server --help` documents the config override and uses
 /// `shell_environment_policy.inherit=all` as its example.
-fn codex_app_server_args(config: &SessionConfig) -> Vec<String> {
+fn codex_app_server_args(config: &SessionConfig, catalog: Option<&std::path::Path>) -> Vec<String> {
     let mut args = vec!["app-server".to_owned()];
     args.extend(config.extra_args.iter().cloned());
     if let Some(runtime) = saydone_managed_codex_runtime(config) {
@@ -130,6 +439,22 @@ fn codex_app_server_args(config: &SessionConfig) -> Vec<String> {
         }
         args.push(CODEX_CONFIG_FLAG.to_owned());
         args.push("model_providers.custom.requires_openai_auth=false".to_owned());
+        // Verified: Codex rust-v0.157.1 features/src/lib.rs and
+        // ext/guardian-v2/src/async_scorer/{extension,startup}.rs. Guardian
+        // resolves a fixed auxiliary model even before a turn starts. Managed
+        // leases authorize only backend-configured models; keep approvals on
+        // the host's user-review path rather than invoking that auxiliary model.
+        args.push(CODEX_CONFIG_FLAG.to_owned());
+        args.push("features.guardian_approval=false".to_owned());
+        args.push(CODEX_CONFIG_FLAG.to_owned());
+        args.push("approvals_reviewer=\"user\"".to_owned());
+        if let Some(path) = catalog {
+            args.push(CODEX_CONFIG_FLAG.to_owned());
+            args.push(format!(
+                "model_catalog_json={}",
+                serde_json::to_string(&path.to_string_lossy()).expect("path serializes")
+            ));
+        }
     }
     // Append the compatibility policy after user/configured extras, matching
     // the former ACP launch policy and making these final overrides authoritative.
@@ -185,7 +510,8 @@ impl BackendConnection for CodexConnection {
             SessionSpec::Fork { session_id, .. } => session_id.clone(),
         };
         let managed_runtime = saydone_managed_codex_runtime(&config);
-        let args = codex_app_server_args(&config);
+        let managed_catalog = prepare_managed_codex_catalog(&config, self.spawner.as_ref()).await?;
+        let args = codex_app_server_args(&config, managed_catalog.as_ref().map(|file| file.path()));
         log_codex_runtime_policy(&config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Orchestration-resolved bundled CLI (packaged app) or bare "codex"
@@ -211,6 +537,7 @@ impl BackendConnection for CodexConnection {
         let wake = CodexWakeRecipe {
             spawner: Some(self.spawner.clone()),
             config: config.clone(),
+            managed_catalog,
         };
         // Conversation titles are generated by the SayDone client now. Keep the
         // legacy latch disarmed and give it a source that can never spawn a
@@ -238,10 +565,10 @@ impl BackendConnection for CodexConnection {
         // GAP-D: also seed the immutable capabilities SNAPSHOT's current_model /
         // current_mode from config (parity with claude_conn, which does this at
         // spawn). Without this `capabilities().current_model` stays None even with a
-        // known config.model. (The live `current_model` Mutex above is for building
-        // collaborationMode; the snapshot is what the conversation reads to render
-        // the model/mode selector. SetModel/SetMode updates flow via ConfigChanged,
-        // not by mutating this open-time snapshot — §5.5.)
+        // known config.model. The live `current_model` mutex is updated only by the
+        // authoritative settings notification; the snapshot is what the conversation
+        // reads to render the model/mode selector. SetModel/SetMode updates flow via
+        // ConfigChanged, not by mutating this open-time snapshot — §5.5.)
         backend.capabilities.current_model = config.model.clone();
         // Present the current mode in the SAME value space as the catalog (frontend-facing
         // legacy bare token). `config.mode` can arrive in ANY accepted vocabulary — the
@@ -322,10 +649,9 @@ impl BackendConnection for CodexConnection {
         let is_managed_runtime = managed_runtime.is_some();
         let backend = Arc::new(backend);
         if let Some(runtime) = managed_runtime {
-            // A resumed Codex thread retains its previous model. Unlike the
-            // native catalog, SayDone's authorized models are not returned by
-            // model/list, so apply the server-authorized model directly before
-            // the first turn instead of dropping it during catalog validation.
+            // A resumed thread can retain its previous model. Apply the
+            // backend-authorized selection before the first turn as well as
+            // supplying its metadata through the private runtime catalog.
             backend.dispatch(Command::SetModel { model: runtime.model }).await?;
         }
         if matches!(spec, SessionSpec::Fresh { .. }) && (config.model.is_some() || config.mode.is_some()) {
@@ -368,9 +694,8 @@ const CODEX_RECONCILE_POLLS: u32 = 100;
 /// model+mode (it deliberately did not embed `config.model`, and codex has no
 /// `thread/start` mode param at all). This detached task applies the requested model
 /// then mode, each validated against its discovered catalog. The two are SEQUENCED —
-/// model MUST settle first because `SetMode` builds a `collaborationMode` around the
-/// tracked `current_model`; running them concurrently could fire `SetMode` while
-/// `current_model` is still the (possibly-invalid) optimistic seed or already cleared.
+/// model MUST settle first so the two settings writes stay deterministic. SetMode uses
+/// the permissions channel and does not depend on the current model.
 fn spawn_codex_reconcile(backend: Arc<CodexSessionBackend>, model: Option<String>, mode: Option<String>) {
     tokio::spawn(async move {
         if let Some(model) = model {
@@ -427,8 +752,8 @@ async fn reconcile_codex_model(backend: &CodexSessionBackend, requested: String)
 
     if !catalog.contains(&requested) {
         // DROP the invalid desire (ACP `clear_invalid_desired_model`). Clear the
-        // optimistic open-time seed so SetMode can't later build a collaborationMode
-        // around a model codex rejected, and the UI intent doesn't outlive reality.
+        // optimistic open-time seed so the model shown by the backend does not outlive
+        // the model Codex actually accepted; the permission-mode path is independent.
         tracing::warn!(
             requested_model = %requested,
             catalog = ?catalog,
@@ -888,10 +1213,11 @@ pub struct CodexSessionBackend {
     /// supplied tokens. UNLIKE infra reverse-RPCs this is NOT auto-answered — a
     /// human/credential source must satisfy it (mid-session re-auth, §6b b3).
     pending_auth_id: Arc<Mutex<Option<Value>>>,
-    /// The current model id (M1): codex's `collaborationMode` for SetMode REQUIRES
-    /// `settings.model`, so the backend must know it. Seeded from config at open,
-    /// updated by `dispatch(SetModel)` + the `thread/settings/updated` notif. None
-    /// until known → SetMode rejects (can't build a valid collaborationMode).
+    /// The last model id confirmed by Codex. The open path may seed this value from
+    /// the requested configuration so the session has an initial display value;
+    /// after that, the reader updates it only from the authoritative
+    /// `thread/settings/updated` notification. Settings writes never update this
+    /// optimistically, so a rejected or failed SetModel cannot poison later state.
     current_model: Arc<Mutex<Option<String>>>,
     /// REST-recovery (`GET /confirmations`) source: the currently-open (unanswered)
     /// tool/file/elicitation approval requests, keyed by the SAME request_id the
@@ -1010,6 +1336,9 @@ struct Discovered {
 struct CodexWakeRecipe {
     spawner: Option<Arc<dyn Spawner>>,
     config: SessionConfig,
+    // Retain the private catalog for the entire backend lifetime, including
+    // idle suspend/wake. A policy refresh creates a new backend and catalog.
+    managed_catalog: Option<Arc<tempfile::NamedTempFile>>,
 }
 
 impl CodexWakeRecipe {
@@ -1020,6 +1349,7 @@ impl CodexWakeRecipe {
         Self {
             spawner: None,
             config: SessionConfig::default(),
+            managed_catalog: None,
         }
     }
 }
@@ -1033,6 +1363,7 @@ struct CodexReaderState {
     turn_gen: Arc<AtomicU64>,
     event_tx: broadcast::Sender<SessionEnvelope>,
     thread_binding: Arc<Mutex<Option<String>>>,
+    current_model: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
@@ -1076,6 +1407,7 @@ fn start_codex_reader(
             state.turn_gen,
             state.event_tx,
             state.thread_binding,
+            state.current_model,
             state.active_turn_id,
             state.pending_auth_id,
             state.pending_tool_approvals,
@@ -1186,6 +1518,7 @@ impl CodexSessionBackend {
         let wake = CodexWakeRecipe {
             spawner: Some(spawner),
             config: SessionConfig::default(),
+            managed_catalog: None,
         };
         Self::spawn_with_wake(
             session_id.into(),
@@ -1317,6 +1650,7 @@ impl CodexSessionBackend {
             turn_gen: turn_gen.clone(),
             event_tx: event_tx.clone(),
             thread_binding: thread_binding.clone(),
+            current_model: current_model.clone(),
             active_turn_id: active_turn_id.clone(),
             pending_auth_id: pending_auth_id.clone(),
             pending_tool_approvals: pending_tool_approvals.clone(),
@@ -1411,6 +1745,17 @@ impl CodexSessionBackend {
             .await
             .map_err(|e| BackendError::Transport(e.to_string()))?;
         Ok(())
+    }
+
+    /// Write a tracked settings update and remove its correlation entry when the
+    /// transport fails before Codex can answer it. Leaving the entry behind would
+    /// make a later response with the reused id look like the failed update.
+    async fn write_pending_set_frame(&self, rpc_id: u64, frame: Value) -> Result<(), BackendError> {
+        let result = self.write_frame(frame).await;
+        if result.is_err() {
+            self.pending_set.lock().await.remove(&rpc_id);
+        }
+        result
     }
 
     fn next_rpc_id(&self) -> u64 {
@@ -1556,7 +1901,10 @@ impl CodexSessionBackend {
             .spawner
             .as_ref()
             .ok_or_else(|| BackendError::Transport("codex wake: no spawner (suspension not enabled)".into()))?;
-        let args = codex_app_server_args(&self.wake.config);
+        let args = codex_app_server_args(
+            &self.wake.config,
+            self.wake.managed_catalog.as_ref().map(|file| file.path()),
+        );
         log_codex_runtime_policy(&self.wake.config.spawn_env);
         let cmd = aionui_common::CommandSpec {
             // Same bundled-CLI resolution + spawn env as the initial spawn
@@ -1614,6 +1962,7 @@ async fn reader_task(
     turn_gen: Arc<AtomicU64>,
     event_tx: broadcast::Sender<SessionEnvelope>,
     thread_binding: Arc<Mutex<Option<String>>>,
+    current_model: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
     pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
@@ -1907,6 +2256,14 @@ async fn reader_task(
                             continue;
                         }
                         for ev in map_notification(m, params, managed_model.as_deref(), managed_context_window) {
+                            if let SessionEvent::ConfigChanged { model: Some(model), .. } = &ev {
+                                // Model changes become authoritative only after Codex
+                                // confirms them on the wire. This avoids poisoning the
+                                // session state when a settings write fails or Codex
+                                // rejects the requested model.
+                                *current_model.lock().await = Some(model.clone());
+                                title_gen.set_model(Some(model.clone()));
+                            }
                             emit(&event_tx, &session_id, cur, scope_notice_to_turn(ev, cur));
                         }
                     }
@@ -4330,7 +4687,7 @@ impl SessionBackend for CodexSessionBackend {
                         "permissions": profile_id
                     }
                 });
-                self.write_frame(frame).await?;
+                self.write_pending_set_frame(id, frame).await?;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4338,19 +4695,20 @@ impl SessionBackend for CodexSessionBackend {
                 })
             }
             Command::SetModel { model } => {
+                if let Some(runtime) = saydone_managed_codex_runtime(&self.wake.config)
+                    && model != runtime.model
+                {
+                    return Err(BackendError::SetupRejected(
+                        "Managed Codex model is not authorized for this session".into(),
+                    ));
+                }
                 // F-4: between-turn config write → wake a suspended session first.
                 self.suspend
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
                     .await?;
                 // codex `thread/settings/update{threadId, model}` (verified frame:
                 // {"threadId":..,"model":"gpt-5.5"}). Applies to subsequent turns.
-                // Track it so a subsequent SetMode can build collaborationMode (M1).
                 let tid = self.bound_thread().await?;
-                *self.current_model.lock().await = Some(model.clone());
-                // Keep the title latch on the model the user is actually talking
-                // to — a title run started after a switch must not use the stale
-                // open-time model.
-                self.reader_state.title_gen.set_model(Some(model.clone()));
                 let id = self.next_rpc_id();
                 // Register the rpc id so the reader claims the response: a JSON-RPC
                 // error (codex rejected the model) surfaces as a Notice instead of
@@ -4363,7 +4721,7 @@ impl SessionBackend for CodexSessionBackend {
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": { "threadId": tid, "model": model }
                 });
-                self.write_frame(frame).await?;
+                self.write_pending_set_frame(id, frame).await?;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4564,6 +4922,19 @@ impl SessionBackend for CodexSessionBackend {
             Command::SetConfigOption { option_id, value }
                 if matches!(option_id.as_str(), "effort" | "reasoning_effort" | "thought_level") =>
             {
+                let value = if self
+                    .wake
+                    .config
+                    .spawn_env
+                    .iter()
+                    .any(|entry| entry.name == SAYDONE_MANAGED_AGENT_ENV && entry.value == "1")
+                {
+                    validate_managed_codex_metadata(&self.wake.config)?
+                        .wire_effort(&value)?
+                        .to_owned()
+                } else {
+                    value
+                };
                 // F-4: between-turn config write → wake a suspended session first.
                 self.suspend
                     .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
@@ -4581,7 +4952,7 @@ impl SessionBackend for CodexSessionBackend {
                     "jsonrpc": "2.0", "id": id, "method": "thread/settings/update",
                     "params": { "threadId": tid, "effort": value }
                 });
-                self.write_frame(frame).await?;
+                self.write_pending_set_frame(id, frame).await?;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -6456,6 +6827,26 @@ mod tests {
         fake
     }
 
+    async fn managed_backend_with_binding() -> (Arc<CodexSessionBackend>, Arc<tokio::sync::Mutex<Vec<u8>>>) {
+        let fake = fake_with_binding("managed-thread", None);
+        let captured = fake.captured_stdin();
+        let wake = CodexWakeRecipe {
+            spawner: None,
+            config: managed_codex_catalog_config(),
+            managed_catalog: None,
+        };
+        let backend = CodexSessionBackend::spawn_with_wake(
+            "managed-codex".into(),
+            Box::new(fake),
+            wake,
+            None,
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await;
+        backend.bound_thread().await.expect("managed thread bound");
+        (Arc::new(backend), captured)
+    }
+
     /// Drain the captured-stdin buffer to a String after dispatch settles. Polls
     /// briefly because the duplex→capture copy is on a background task.
     async fn captured_str(captured: &Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {
@@ -7333,7 +7724,7 @@ mod tests {
             ..SessionConfig::default()
         };
 
-        let args = codex_app_server_args(&config);
+        let args = codex_app_server_args(&config, Some(std::path::Path::new("/tmp/backend-models.json")));
 
         assert!(args.contains(&"model=\"deepseek-v4-flash\"".into()));
         assert!(args.contains(&"model_providers.custom.env_key=\"OPENAI_API_KEY\"".into()));
@@ -7343,7 +7734,456 @@ mod tests {
             !args.iter().any(|arg| arg == "model_context_window=1048576"),
             "managed Codex must keep context-window accounting and compaction in Codex"
         );
-        assert!(!args.iter().any(|arg| arg.starts_with("model_catalog_json=")));
+        assert!(args.contains(&"model_catalog_json=\"/tmp/backend-models.json\"".into()));
+        assert!(args.contains(&"features.guardian_approval=false".into()));
+        assert!(args.contains(&"approvals_reviewer=\"user\"".into()));
+    }
+
+    #[test]
+    fn managed_codex_metadata_uses_backend_capabilities_and_native_tool_protocol() {
+        let mut config = managed_codex_catalog_config();
+        let native = native_codex_catalog_fixture();
+        let first = managed_codex_metadata(&config, &native).unwrap();
+        assert_eq!(first["models"][0]["context_window"], 131_072);
+        assert_eq!(first["models"][0]["input_modalities"], json!(["text"]));
+        assert_eq!(first["models"][0]["default_reasoning_level"], "low");
+
+        set_catalog_env(&mut config, SAYDONE_MANAGED_CONTEXT_WINDOW_ENV, "262144");
+        set_catalog_env(&mut config, "SAYDONE_MANAGED_MAX_OUTPUT_TOKENS", "32768");
+        set_catalog_env(&mut config, "SAYDONE_MANAGED_DEFAULT_OUTPUT_TOKENS", "16384");
+        set_catalog_env(&mut config, "SAYDONE_MANAGED_SUPPORTS_VISION", "true");
+        set_catalog_env(
+            &mut config,
+            "SAYDONE_MANAGED_REASONING_POLICY",
+            r#"{"efforts":["low","high","custom_effort"],"default_effort":"custom_effort","wire_protocol":"openai_reasoning_effort"}"#,
+        );
+        let second = managed_codex_metadata(&config, &native).unwrap();
+        let model = &second["models"][0];
+        assert_eq!(model["slug"], "gpt-6.1-sol");
+        assert_eq!(model["context_window"], 262_144);
+        assert_eq!(model["max_context_window"], 262_144);
+        assert_eq!(model["input_modalities"], json!(["text", "image"]));
+        assert_eq!(model["default_reasoning_level"], "custom_effort");
+        assert_eq!(
+            model["supported_reasoning_levels"],
+            json!([
+                {"effort":"low","description":""},
+                {"effort":"high","description":""},
+                {"effort":"custom_effort","description":""}
+            ])
+        );
+        for key in [
+            "shell_type",
+            "base_instructions",
+            "apply_patch_tool_type",
+            "truncation_policy",
+        ] {
+            assert_eq!(model[key], native["models"][0][key], "native protocol field {key}");
+        }
+        for key in [
+            "supports_image_detail_original",
+            "supports_search_tool",
+            "tool_mode",
+            "max_output_tokens",
+        ] {
+            assert!(
+                model.get(key).is_none(),
+                "must not invent or copy model capability {key}"
+            );
+        }
+        assert_eq!(model["support_verbosity"], false);
+        assert_eq!(model["experimental_supported_tools"], json!([]));
+    }
+
+    #[test]
+    fn managed_codex_metadata_keeps_reasoning_absent_or_uses_backend_off_mapping() {
+        let mut config = managed_codex_catalog_config();
+        set_catalog_env(&mut config, "SAYDONE_MANAGED_REASONING_POLICY", r#"{"efforts":[]}"#);
+        let catalog = managed_codex_metadata(&config, &native_codex_catalog_fixture()).unwrap();
+        assert!(catalog["models"][0]["default_reasoning_level"].is_null());
+        assert_eq!(catalog["models"][0]["supported_reasoning_levels"], json!([]));
+
+        set_catalog_env(
+            &mut config,
+            "SAYDONE_MANAGED_REASONING_POLICY",
+            r#"{"efforts":["off","high"],"default_effort":"off","wire_protocol":"openai_reasoning_effort","off_value":"none"}"#,
+        );
+        let catalog = managed_codex_metadata(&config, &native_codex_catalog_fixture()).unwrap();
+        assert_eq!(catalog["models"][0]["default_reasoning_level"], "none");
+        assert_eq!(catalog["models"][0]["supported_reasoning_levels"][0]["effort"], "none");
+
+        let metadata = validate_managed_codex_metadata(&config).unwrap();
+        assert_eq!(metadata.wire_effort("off").unwrap(), "none");
+        assert_eq!(metadata.wire_effort("none").unwrap(), "none");
+        assert!(metadata.wire_effort("unknown").is_err());
+
+        set_catalog_env(
+            &mut config,
+            SAYDONE_MANAGED_REASONING_POLICY,
+            r#"{"efforts":["off","none"],"default_effort":"off","wire_protocol":"openai_reasoning_effort","off_value":"none"}"#,
+        );
+        assert!(matches!(
+            validate_managed_codex_metadata(&config),
+            Err(BackendError::SetupRejected(_))
+        ));
+    }
+
+    fn managed_codex_catalog_config() -> SessionConfig {
+        SessionConfig {
+            model: Some("gpt-6.1-sol".into()),
+            spawn_env: [
+                (SAYDONE_MANAGED_AGENT_ENV, "1"),
+                (SAYDONE_MANAGED_BACKEND_ENV, "codex"),
+                (SAYDONE_MANAGED_PROTOCOL_ENV, "openai"),
+                (SAYDONE_MANAGED_MODEL_ENV, "gpt-6.1-sol"),
+                (SAYDONE_MANAGED_BASE_URL_ENV, "http://127.0.0.1:1/v1"),
+                (OPENAI_API_KEY_ENV, "local-test-lease"),
+                (SAYDONE_MANAGED_CONTEXT_WINDOW_ENV, "131072"),
+                ("SAYDONE_MANAGED_MAX_OUTPUT_TOKENS", "16384"),
+                ("SAYDONE_MANAGED_DEFAULT_OUTPUT_TOKENS", "8192"),
+                ("SAYDONE_MANAGED_SUPPORTS_VISION", "false"),
+                (
+                    "SAYDONE_MANAGED_REASONING_POLICY",
+                    r#"{"efforts":["low","high"],"default_effort":"low","wire_protocol":"openai_reasoning_effort"}"#,
+                ),
+            ]
+            .into_iter()
+            .map(|(name, value)| aionui_common::EnvVar {
+                name: name.into(),
+                value: value.into(),
+            })
+            .collect(),
+            ..SessionConfig::default()
+        }
+    }
+
+    fn set_catalog_env(config: &mut SessionConfig, name: &str, value: &str) {
+        config.spawn_env.retain(|entry| entry.name != name);
+        config.spawn_env.push(aionui_common::EnvVar {
+            name: name.into(),
+            value: value.into(),
+        });
+    }
+
+    fn native_codex_catalog_fixture() -> Value {
+        json!({"models":[{
+            "slug":"native-direct-model", "priority":0, "supported_in_api":true, "visibility":"list",
+            "shell_type":"unified_exec", "base_instructions":"Native tool instructions",
+            "apply_patch_tool_type":"freeform", "web_search_tool_type":"text_and_image",
+            "truncation_policy":{"mode":"bytes","limit":12000},
+            "context_window":272000, "max_context_window":872000,
+            "input_modalities":["text","image"], "default_reasoning_level":"medium",
+            "supported_reasoning_levels":[{"effort":"medium","description":"Native"}],
+            "support_verbosity":true, "supports_image_detail_original":true,
+            "supports_search_tool":true,
+            "model_messages": {"instructions_template":"Native tool instructions", "token_budget":{"limit":123}, "multi_agent":{"instructions":"model-specific"}},
+            "experimental_supported_tools":["experimental"]
+        }]})
+    }
+
+    #[tokio::test]
+    async fn managed_codex_invalid_configuration_is_rejected_before_any_spawn() {
+        let config = managed_codex_catalog_config();
+        let mut invalid_configs = Vec::new();
+        for name in [
+            SAYDONE_MANAGED_MODEL_ENV,
+            SAYDONE_MANAGED_BASE_URL_ENV,
+            OPENAI_API_KEY_ENV,
+            SAYDONE_MANAGED_CONTEXT_WINDOW_ENV,
+            "SAYDONE_MANAGED_MAX_OUTPUT_TOKENS",
+            "SAYDONE_MANAGED_DEFAULT_OUTPUT_TOKENS",
+            "SAYDONE_MANAGED_SUPPORTS_VISION",
+            "SAYDONE_MANAGED_REASONING_POLICY",
+        ] {
+            let mut missing = config.clone();
+            missing.spawn_env.retain(|entry| entry.name != name);
+            invalid_configs.push(missing);
+        }
+        for (name, value) in [
+            (SAYDONE_MANAGED_BASE_URL_ENV, " "),
+            (SAYDONE_MANAGED_CONTEXT_WINDOW_ENV, "0"),
+            (SAYDONE_MANAGED_CONTEXT_WINDOW_ENV, "18446744073709551615"),
+            ("SAYDONE_MANAGED_MAX_OUTPUT_TOKENS", "262144"),
+            ("SAYDONE_MANAGED_DEFAULT_OUTPUT_TOKENS", "32768"),
+            ("SAYDONE_MANAGED_SUPPORTS_VISION", "1"),
+            ("SAYDONE_MANAGED_REASONING_POLICY", r#"{"efforts":["high","high"]}"#),
+            ("SAYDONE_MANAGED_REASONING_POLICY", r#"{"efforts":["LOW"]}"#),
+            (
+                "SAYDONE_MANAGED_REASONING_POLICY",
+                r#"{"efforts":["low"],"default_effort":"high"}"#,
+            ),
+            (
+                "SAYDONE_MANAGED_REASONING_POLICY",
+                r#"{"efforts":["low"],"wire_protocol":"pi_thinking_level_map"}"#,
+            ),
+            ("SAYDONE_MANAGED_REASONING_POLICY", r#"{"efforts":["off"]}"#),
+            (
+                "SAYDONE_MANAGED_REASONING_POLICY",
+                r#"{"efforts":[],"off_value":"none"}"#,
+            ),
+            ("SAYDONE_MANAGED_REASONING_POLICY", r#"{"efforts":[],"unknown":true}"#),
+        ] {
+            let mut malformed = config.clone();
+            set_catalog_env(&mut malformed, name, value);
+            invalid_configs.push(malformed);
+        }
+        let mut mismatched_model = config.clone();
+        mismatched_model.model = Some("unapproved-model".into());
+        invalid_configs.push(mismatched_model);
+        let mut conflicting = config;
+        conflicting.spawn_env.push(aionui_common::EnvVar {
+            name: SAYDONE_MANAGED_CONTEXT_WINDOW_ENV.into(),
+            value: "262144".into(),
+        });
+        invalid_configs.push(conflicting);
+
+        for config in invalid_configs {
+            let spawner = crate::testing::FakeSpawner::new();
+            let error = prepare_managed_codex_catalog(&config, &spawner).await.unwrap_err();
+            assert!(matches!(error, BackendError::SetupRejected(ref reason)
+                if reason == "Managed CLI model configuration is missing or invalid"));
+            assert_eq!(spawner.call_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_codex_keeps_its_own_catalog_and_does_not_probe() {
+        let config = SessionConfig {
+            model: Some("external-model".into()),
+            ..SessionConfig::default()
+        };
+        let spawner = crate::testing::FakeSpawner::new();
+        assert!(
+            prepare_managed_codex_catalog(&config, &spawner)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(spawner.call_count(), 0);
+        let args = codex_app_server_args(&config, Some(std::path::Path::new("/tmp/managed-catalog.json")));
+        assert!(!args.iter().any(|arg| arg.starts_with("model_catalog_json=")
+            || arg.starts_with("model_providers.")
+            || arg.starts_with("features.guardian_approval=")
+            || arg.starts_with("approvals_reviewer=")));
+    }
+
+    #[test]
+    fn managed_codex_rejects_missing_native_instructions_and_tool_policy() {
+        let config = managed_codex_catalog_config();
+        for catalog in [
+            json!({"models":[]}),
+            json!({"models":[{"supported_in_api":true,"shell_type":"unified_exec"}]}),
+            json!({"models":[{"supported_in_api":true,"shell_type":"unified_exec","base_instructions":"prompt"}]}),
+        ] {
+            assert!(matches!(
+                managed_codex_metadata(&config, &catalog),
+                Err(BackendError::SetupRejected(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_codex_accepts_backend_models_missing_from_the_bundled_catalog() {
+        let mut config = managed_codex_catalog_config();
+        let catalog = native_codex_catalog_fixture();
+        for name in ["gpt-6.1-sol", "new-backend-model"] {
+            config.model = Some(name.into());
+            set_catalog_env(&mut config, SAYDONE_MANAGED_MODEL_ENV, name);
+            let metadata = managed_codex_metadata(&config, &catalog).unwrap();
+            assert_eq!(metadata["models"][0]["slug"], name);
+            assert_eq!(metadata["models"][0]["context_window"], 131_072);
+            assert_eq!(
+                metadata["models"][0]["model_messages"],
+                json!({"instructions_template":"Native tool instructions"})
+            );
+        }
+    }
+
+    #[test]
+    fn managed_codex_uses_an_ordinary_protocol_template_without_copying_code_mode() {
+        let config = managed_codex_catalog_config();
+        let mut catalog = native_codex_catalog_fixture();
+        let mut code_mode = catalog["models"][0].clone();
+        code_mode["slug"] = json!("gpt-6.1-sol");
+        code_mode["priority"] = json!(-1);
+        code_mode["tool_mode"] = json!("code_mode_only");
+        code_mode["model_messages"]["instructions_template"] = json!("Use code mode only");
+        catalog["models"].as_array_mut().unwrap().insert(0, code_mode.clone());
+        let metadata = managed_codex_metadata(&config, &catalog).unwrap();
+        assert_eq!(metadata["models"][0]["base_instructions"], "Native tool instructions");
+        assert!(metadata["models"][0].get("tool_mode").is_none());
+
+        assert!(matches!(
+            managed_codex_metadata(&config, &json!({"models":[code_mode]})),
+            Err(BackendError::SetupRejected(_))
+        ));
+    }
+
+    #[test]
+    fn managed_codex_accepts_current_shell_command_protocol_templates() {
+        let config = managed_codex_catalog_config();
+        let mut catalog = native_codex_catalog_fixture();
+        let ordinary = catalog["models"][0].as_object_mut().unwrap();
+        ordinary.insert("shell_type".into(), json!("shell_command"));
+        ordinary.insert("priority".into(), json!(7));
+
+        let mut code_mode = catalog["models"][0].clone();
+        code_mode["priority"] = json!(-1);
+        code_mode["tool_mode"] = json!("code_mode_only");
+        code_mode["model_messages"]["instructions_template"] = json!("Use code mode only");
+        catalog["models"].as_array_mut().unwrap().insert(0, code_mode);
+
+        let metadata = managed_codex_metadata(&config, &catalog).unwrap();
+        assert_eq!(metadata["models"][0]["shell_type"], "shell_command");
+        assert_eq!(metadata["models"][0]["base_instructions"], "Native tool instructions");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_codex_probe_uses_resolved_cli_and_keeps_catalog_for_wake() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("catalog-cli");
+        let arguments = temp.path().join("arguments.txt");
+        std::fs::write(&program, format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SAYDONE_TEST_ARGS_FILE\"\ncat <<'SAYDONE_CATALOG'\n{}\nSAYDONE_CATALOG\n",
+            native_codex_catalog_fixture()
+        )).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let spawner: Arc<dyn Spawner> = Arc::new(aionui_process::RealSpawner::new(
+            Arc::new(aionui_process::FileRegistryStore::new(temp.path())),
+            uuid::Uuid::now_v7(),
+            "catalog-test",
+        ));
+        let mut config = managed_codex_catalog_config();
+        config.cli_program = Some(program);
+        config.cwd = Some(temp.path().to_string_lossy().into_owned());
+        set_catalog_env(&mut config, "SAYDONE_TEST_ARGS_FILE", &arguments.to_string_lossy());
+        let catalog = prepare_managed_codex_catalog(&config, spawner.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(arguments).unwrap(),
+            "debug\nmodels\n--bundled\n"
+        );
+        let path = catalog.path().to_path_buf();
+        let metadata: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(metadata["models"][0]["slug"], "gpt-6.1-sol");
+        let initial_args = codex_app_server_args(&config, Some(&path));
+        let wake = CodexWakeRecipe {
+            spawner: Some(spawner),
+            config,
+            managed_catalog: Some(catalog.clone()),
+        };
+        drop(catalog);
+        assert!(path.is_file());
+        assert_eq!(
+            initial_args,
+            codex_app_server_args(&wake.config, wake.managed_catalog.as_ref().map(|file| file.path()))
+        );
+        drop(wake);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires SAYDONE_TEST_CODEX_PROGRAM pointing to a real Codex binary; no model requests"]
+    async fn managed_codex_real_cli_accepts_catalog_without_fallback_metadata() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let program = std::env::var_os("SAYDONE_TEST_CODEX_PROGRAM")
+            .map(std::path::PathBuf::from)
+            .expect("set SAYDONE_TEST_CODEX_PROGRAM to the bundled Codex binary");
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_home = temp.path().join("runtime");
+        std::fs::create_dir(&runtime_home).unwrap();
+        // User configuration and launch extras must not re-enable an auxiliary
+        // model outside the managed lease's backend-authorized catalog.
+        std::fs::write(
+            runtime_home.join("config.toml"),
+            "approvals_reviewer = \"auto_review\"\n[features]\nguardian_approval = true\n",
+        )
+        .unwrap();
+        let spawner = aionui_process::RealSpawner::new(
+            Arc::new(aionui_process::FileRegistryStore::new(temp.path())),
+            uuid::Uuid::now_v7(),
+            "real-catalog-test",
+        );
+        let mut config = managed_codex_catalog_config();
+        config.cli_program = Some(program);
+        config.cwd = Some(temp.path().to_string_lossy().into_owned());
+        config.extra_args = vec![
+            CODEX_CONFIG_FLAG.into(),
+            "features.guardian_approval=true".into(),
+            CODEX_CONFIG_FLAG.into(),
+            "approvals_reviewer=\"auto_review\"".into(),
+        ];
+        // Isolate the real CLI from user configuration and credentials. The
+        // test provider points at a closed local port and no turn is sent.
+        set_catalog_env(&mut config, "CODEX_HOME", &runtime_home.to_string_lossy());
+        set_catalog_env(&mut config, "RUST_LOG", "warn");
+        let catalog = prepare_managed_codex_catalog(&config, &spawner).await.unwrap().unwrap();
+        let process = spawner
+            .spawn(
+                aionui_common::CommandSpec {
+                    command: config.cli_program.clone().unwrap(),
+                    args: codex_app_server_args(&config, Some(catalog.path())),
+                    env: config.spawn_env.clone(),
+                    cwd: config.cwd.clone(),
+                },
+                &[],
+                "real-catalog-test",
+            )
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let (mut stdin, stdout) = process.take_stdio().await.unwrap();
+            let mut lines = BufReader::new(stdout).lines();
+            let requests = [
+                json!({"id":1,"method":"initialize","params":{
+                    "clientInfo":{"name":"saydone-catalog-test","version":"1.0.0"},
+                    "capabilities":{"experimentalApi":true}
+                }}),
+                json!({"id":2,"method":"model/list","params":{}}),
+                json!({"id":3,"method":"thread/start","params":thread_start_params(&config).0}),
+            ];
+            let mut results = Vec::new();
+            for request in requests {
+                stdin.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+                stdin.flush().await.unwrap();
+                loop {
+                    let line = lines.next_line().await.unwrap().expect("real CLI closed stdout");
+                    let response: Value = serde_json::from_str(&line).unwrap();
+                    if response.get("id") != request.get("id") {
+                        continue;
+                    }
+                    assert!(response.get("error").is_none(), "real CLI rejected request: {response}");
+                    results.push(response["result"].clone());
+                    break;
+                }
+            }
+            results
+        })
+        .await;
+        process.kill(std::time::Duration::from_millis(200)).await.unwrap();
+        let stderr = process.peek_stderr_tail(100).await;
+        let results = result.expect("real CLI handshake timed out");
+        let models = results[1]["data"].as_array().expect("model/list returns data");
+        let model = models.iter().find(|model| model["model"] == "gpt-6.1-sol").unwrap();
+        assert_eq!(model["inputModalities"], json!(["text"]));
+        assert_eq!(model["defaultReasoningEffort"], "low");
+        assert_eq!(
+            model["supportedReasoningEfforts"],
+            json!([
+                {"reasoningEffort":"low","description":""},
+                {"reasoningEffort":"high","description":""}
+            ])
+        );
+        assert_eq!(results[2]["model"], "gpt-6.1-sol");
+        assert!(
+            !stderr.contains("Defaulting to fallback metadata") && !stderr.contains("fallback model metadata"),
+            "the real CLI must consume the generated catalog: {stderr}"
+        );
     }
 
     #[test]
@@ -7617,6 +8457,40 @@ mod tests {
                 "id `{option_id}` carries threadId, got: {written}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn managed_codex_accepts_the_wire_value_for_reasoning_off() {
+        let mut config = managed_codex_catalog_config();
+        set_catalog_env(
+            &mut config,
+            SAYDONE_MANAGED_REASONING_POLICY,
+            r#"{"efforts":["off","high"],"default_effort":"off","wire_protocol":"openai_reasoning_effort","off_value":"none"}"#,
+        );
+        let fake = fake_with_binding("th-managed-effort", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::spawn_with_wake(
+            "managed-effort".into(),
+            Box::new(fake),
+            CodexWakeRecipe {
+                spawner: None,
+                config,
+                managed_catalog: None,
+            },
+            None,
+            Arc::new(TitleGen::new(false, Arc::new(NoTitleIo))),
+        )
+        .await;
+        backend.bound_thread().await.expect("managed thread bound");
+        backend
+            .dispatch(Command::SetConfigOption {
+                option_id: "effort".into(),
+                value: "none".into(),
+            })
+            .await
+            .expect("the catalog's wire value must be accepted on the way back");
+        let written = captured_str(&captured).await;
+        assert!(written.contains(r#""effort":"none""#), "got: {written}");
     }
 
     #[tokio::test]
@@ -8835,19 +9709,63 @@ mod tests {
 
     #[tokio::test]
     async fn managed_codex_model_is_sent_to_the_cli_before_the_first_turn() {
-        let (backend, captured) = backend_with_catalog_and_binding().await;
+        let (backend, captured) = managed_backend_with_binding().await;
         backend
             .dispatch(Command::SetModel {
-                model: "deepseek-v4-flash".into(),
+                model: "gpt-6.1-sol".into(),
             })
             .await
             .unwrap();
         let written = captured_str(&captured).await;
         assert!(
-            written.contains(r#""method":"thread/settings/update""#)
-                && written.contains(r#""model":"deepseek-v4-flash""#),
+            written.contains(r#""method":"thread/settings/update""#) && written.contains(r#""model":"gpt-6.1-sol""#),
             "the SayDone-authorized model must be applied before the turn, got: {written}"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_codex_rejects_unauthorized_model_before_writing_or_mutating_state() {
+        let (backend, captured) = managed_backend_with_binding().await;
+        *backend.current_model.lock().await = Some("gpt-6.1-sol".into());
+        let error = backend
+            .dispatch(Command::SetModel {
+                model: "gpt-5.6-luna".into(),
+            })
+            .await
+            .expect_err("managed Codex must reject a model outside the backend lease");
+        assert!(matches!(error, BackendError::SetupRejected(_)));
+        assert_eq!(
+            backend.current_model.lock().await.as_deref(),
+            Some("gpt-6.1-sol"),
+            "a rejected model must not change the current model"
+        );
+        assert!(
+            captured_str_allow_empty(&captured).await.is_empty(),
+            "an unauthorized model must be rejected before a settings frame is written"
+        );
+        assert!(backend.pending_set.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_model_write_failure_clears_pending_state_and_keeps_current_model() {
+        let fake = fake_with_binding("th-write-failure", None);
+        let backend = CodexSessionBackend::build_with_io("codex-write-failure", Box::new(fake)).await;
+        *backend.current_model.lock().await = Some("gpt-5.5".into());
+        // Simulate a closed app-server stdin after the thread has bound.
+        backend.stdin.lock().await.take();
+        let error = backend
+            .dispatch(Command::SetModel {
+                model: "gpt-5.6".into(),
+            })
+            .await
+            .expect_err("closed stdin must reject the settings write");
+        assert!(matches!(error, BackendError::Transport(_)));
+        assert_eq!(
+            backend.current_model.lock().await.as_deref(),
+            Some("gpt-5.5"),
+            "a failed write must not mutate current_model"
+        );
+        assert!(backend.pending_set.lock().await.is_empty());
     }
 
     /// Drain captured stdin WITHOUT requiring non-empty output (the invalid-model

@@ -160,6 +160,22 @@ mod tests {
     }
 
     #[test]
+    fn codex_model_metadata_fallback_warning_is_not_a_user_error() {
+        for stderr in [
+            "WARN codex_core::models: Model metadata for `gpt-6.1-sol` not found. Defaulting to fallback metadata; this may degrade performance and cause issues.",
+            "WARN codex_models_manager::model_info: Unknown model gpt-6.1-sol is used. This will use fallback model metadata.",
+        ] {
+            assert!(extract_error_message(stderr).is_none());
+            let with_provider_error = format!("ERROR codex_api: connection refused\n{stderr}");
+            assert_eq!(
+                extract_error_message(&with_provider_error).as_deref(),
+                Some("connection refused"),
+                "a metadata warning must not replace a real provider error",
+            );
+        }
+    }
+
+    #[test]
     fn returns_none_for_empty_input() {
         assert!(extract_error_message("").is_none());
         assert!(extract_error_message("   \n\n  ").is_none());
