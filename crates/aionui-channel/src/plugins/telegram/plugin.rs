@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::constants::{TELEGRAM_MAX_RECONNECT_ATTEMPTS, TELEGRAM_MAX_RECONNECT_DELAY, TELEGRAM_MESSAGE_LIMIT};
 use crate::error::ChannelError;
+use crate::formatter::truncate_message;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{
     ActionButton, ActionCategory, ActionContext, BotInfo, MessageContentType, ParseMode, PluginConfig, PluginStatus,
@@ -689,16 +690,6 @@ fn parse_chat_id(chat_id: &str) -> Result<i64, ChannelError> {
         .map_err(|_| ChannelError::InvalidConfig(format!("Invalid chat_id: {chat_id}")))
 }
 
-/// Truncate a message to the platform limit, appending "..." if truncated.
-fn truncate_message(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    // Truncate at char boundary, leave room for "..."
-    let truncated: String = text.chars().take(limit - 3).collect();
-    format!("{truncated}...")
-}
-
 /// Build display name from first + last name.
 fn build_display_name(first: &str, last: Option<&str>) -> String {
     match last {
@@ -758,9 +749,9 @@ mod tests {
     #[test]
     fn truncate_unicode() {
         let text = "你好世界测试文本";
-        let result = truncate_message(text, 5);
-        // chars().take(2) = "你好", then "..."
+        let result = truncate_message(text, 9);
         assert_eq!(result, "你好...");
+        assert!(result.len() <= 9);
     }
 
     // -- parse_chat_id ------------------------------------------------------

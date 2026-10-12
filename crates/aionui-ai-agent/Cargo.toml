@@ -58,6 +58,7 @@ fs2.workspace = true
 test-support = []
 
 [dev-dependencies]
+aionui-session = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber.workspace = true

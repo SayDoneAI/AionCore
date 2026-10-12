@@ -4,6 +4,19 @@ use regex::Regex;
 
 use crate::types::PluginType;
 
+/// Truncate channel text within the encoded byte limit at a UTF-8 boundary.
+pub(crate) fn truncate_message(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let suffix = &"..."[..limit.min(3)];
+    let mut boundary = limit.saturating_sub(suffix.len());
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}{suffix}", &text[..boundary])
+}
+
 /// Convert text to the target IM platform format.
 ///
 /// - Telegram: escape HTML, then convert markdown → HTML tags

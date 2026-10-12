@@ -71,12 +71,11 @@ pub enum AgentStreamEvent {
     ///
     /// Unlike `Finish`, this does NOT terminate the turn or the relay: it only
     /// tells the relay to close the current text/thinking segment so the next
-    /// batch of text starts a fresh message bubble. Emitted by the direct-CLI
-    /// session pump when it suppresses a non-blocking Workflow's intermediate
-    /// launch `result` (claude produces one launch output while subagents run
-    /// and a separate completion output afterwards — two independent outputs
-    /// under one turn). The relay consumes it internally and never forwards it
-    /// to the WebSocket, so no frontend renderer is required.
+    /// batch of text starts a fresh message bubble. The session pump emits it
+    /// when a nonempty text delta belongs to a different assistant item, or
+    /// when it suppresses a non-blocking Workflow's intermediate launch
+    /// `result`. The relay consumes it internally and never forwards it to
+    /// the WebSocket, so no frontend renderer is required.
     SegmentBreak,
     /// Internal-only: the backend's OWN id for the turn that just started
     /// (codex `turn/started` → `Turn.id`). The relay consumes it to stamp

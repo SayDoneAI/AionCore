@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::constants::SLACK_MESSAGE_LIMIT;
 use crate::error::ChannelError;
+use crate::formatter::truncate_message;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{BotInfo, PluginConfig, PluginStatus, PluginType, UnifiedOutgoingMessage};
 
@@ -270,15 +271,6 @@ fn require_bot_token(config: &PluginConfig) -> Result<String, ChannelError> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| ChannelError::InvalidConfig("Missing Slack bot token (xoxb-)".into()))
-}
-
-/// Truncate a message to the platform limit, appending "..." if truncated.
-fn truncate_message(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(limit.saturating_sub(3)).collect();
-    format!("{truncated}...")
 }
 
 #[cfg(test)]

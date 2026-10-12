@@ -754,6 +754,27 @@ mod tests {
         assert_eq!(json["content"], "{\"elements\":[]}");
     }
 
+    #[test]
+    fn completion_patch_replaces_streaming_content_with_text_and_actions() {
+        use crate::message_service::ChannelMessageService;
+
+        let message = ChannelMessageService::build_final_message("Completed answer");
+        let content = build_interactive_card(message.text.as_deref().unwrap(), message.buttons.as_deref());
+        let request = serde_json::to_value(UpdateCardRequest { content }).unwrap();
+        let card: serde_json::Value = serde_json::from_str(request["content"].as_str().unwrap()).unwrap();
+
+        assert_eq!(
+            request.as_object().unwrap().len(),
+            1,
+            "PATCH supplies only the replacement content"
+        );
+        assert_eq!(
+            card["elements"][0],
+            serde_json::json!({"tag":"markdown","content":"Completed answer\n\n✅ worked"})
+        );
+        assert_eq!(card["elements"][1]["actions"].as_array().unwrap().len(), 3);
+    }
+
     // -- TenantAccessTokenRequest serializes --------------------------------
 
     #[test]

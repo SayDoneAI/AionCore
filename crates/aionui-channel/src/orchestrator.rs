@@ -12,7 +12,9 @@ use crate::action::{ActionExecutor, MessageResult};
 use crate::formatter::format_text_for_platform;
 use crate::message_service::ChannelMessageService;
 use crate::session::SessionManager;
-use crate::stream_relay::{ChannelSender, ChannelStreamRelay, RelayConfig, format_remote_reply};
+use crate::stream_relay::{
+    ChannelSender, ChannelStreamRelay, RelayConfig, format_remote_reply, throttle_ms_for_platform,
+};
 use crate::types::{ActionBehavior, OutgoingMessageType, UnifiedIncomingMessage, UnifiedOutgoingMessage};
 
 /// Orchestrates the full channel message lifecycle.
@@ -691,6 +693,7 @@ async fn handle_dispatched(
             plugin_id: plugin_id.to_owned(),
             chat_id: chat_id.to_owned(),
             prompt_text: text.to_owned(),
+            throttle_ms: throttle_ms_for_platform(platform),
         };
         let relay = ChannelStreamRelay::with_session_manager(relay_config, Arc::clone(sender), Arc::clone(session_mgr))
             .with_runtime_state(msg_svc.runtime_state());

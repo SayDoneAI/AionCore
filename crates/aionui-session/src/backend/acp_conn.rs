@@ -1700,6 +1700,19 @@ async fn write_reverse_error(
     let _ = write_frame_to(stdin, frame).await;
 }
 
+/// Keep ACP message boundaries and separate text/thought accumulator keys.
+/// Verified: agent-client-protocol-schema-1.5.0/src/v1/client.rs `ContentChunk`.
+fn acp_content_item_id(update: &Value, kind: &str) -> String {
+    match update
+        .get("messageId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => format!("acp:{id}:{kind}"),
+        None => format!("acp:{kind}"),
+    }
+}
+
 /// Map an ACP `session/update` notification `params` → canonical SessionEvent(s).
 /// A1 anti-panic: match on the `sessionUpdate` STRING, never deserialize a closed
 /// enum. Unknown `sessionUpdate` → `AdapterSpecific`. `update` shapes verified
@@ -1719,7 +1732,7 @@ async fn map_update(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             vec![SessionEvent::MessageDelta {
-                item_id: "acp:text".into(),
+                item_id: acp_content_item_id(update, "text"),
                 text: text.to_string(),
             }]
         }
@@ -1730,7 +1743,7 @@ async fn map_update(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             vec![SessionEvent::ThoughtDelta {
-                item_id: "acp:think".into(),
+                item_id: acp_content_item_id(update, "think"),
                 text: text.to_string(),
             }]
         }
@@ -2615,6 +2628,77 @@ mod tests {
     #[test]
     fn capabilities_do_not_advertise_midturn_delivery() {
         assert!(!acp_capabilities().supports_midturn_delivery);
+    }
+
+    #[tokio::test]
+    async fn content_chunks_preserve_acp_message_boundaries_and_separate_thoughts() {
+        let model = Arc::new(Mutex::new(None));
+        let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        let mut projected = Vec::new();
+        for (kind, id, text) in [
+            ("agent_thought_chunk", "first", "Inspect"),
+            ("agent_message_chunk", "first", "Checking "),
+            ("agent_message_chunk", "first", "the file."),
+            ("agent_message_chunk", "second", "Done."),
+        ] {
+            let params = json!({
+                "sessionId": "s",
+                "update": {
+                    "sessionUpdate": kind,
+                    "messageId": id,
+                    "content": { "type": "text", "text": text },
+                },
+            });
+            let events = map_update(&params, &model, &discovered).await;
+            for event in events {
+                match event {
+                    SessionEvent::MessageDelta { item_id, text } | SessionEvent::ThoughtDelta { item_id, text } => {
+                        projected.push((item_id, text));
+                    }
+                    other => panic!("content chunk must project to a delta, got {other:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            projected,
+            vec![
+                ("acp:first:think".into(), "Inspect".into()),
+                ("acp:first:text".into(), "Checking ".into()),
+                ("acp:first:text".into(), "the file.".into()),
+                ("acp:second:text".into(), "Done.".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn content_chunks_keep_default_item_keys_for_missing_or_invalid_message_ids() {
+        let model = Arc::new(Mutex::new(None));
+        let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
+        for id in [
+            None,
+            Some(Value::Null),
+            Some(json!("")),
+            Some(json!(42)),
+            Some(json!({})),
+        ] {
+            for (kind, expected) in [
+                ("agent_message_chunk", "acp:text"),
+                ("agent_thought_chunk", "acp:think"),
+            ] {
+                let mut params = json!({
+                    "sessionId": "s",
+                    "update": { "sessionUpdate": kind, "content": { "type": "text", "text": "delta" } },
+                });
+                if let Some(id) = id.as_ref() {
+                    params["update"]["messageId"] = id.clone();
+                }
+                let events = map_update(&params, &model, &discovered).await;
+                assert!(
+                    matches!(events.as_slice(), [SessionEvent::MessageDelta { item_id, text } | SessionEvent::ThoughtDelta { item_id, text }] if item_id == expected && text == "delta"),
+                    "invalid optional messageId must keep the default item key, got {events:?}"
+                );
+            }
+        }
     }
 
     /// PROPERTY (§F.3 input field-value boundary for the acp `map_update` entry,

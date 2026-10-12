@@ -11,6 +11,7 @@ use aionui_common::generate_id;
 
 use crate::constants::{LARK_EVENT_DEDUP_TTL, LARK_MESSAGE_LIMIT};
 use crate::error::ChannelError;
+use crate::formatter::truncate_message;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{
     ActionCategory, ActionContext, BotInfo, MessageContentType, PluginConfig, PluginStatus, PluginType, UnifiedAction,
@@ -309,18 +310,13 @@ async fn ws_loop(
         let service_id = extract_service_id(ws_url);
         debug!(url = %ws_url, service_id, initial_ping_secs, "Connecting to Lark WebSocket");
 
-        match connect_and_listen(
-            ws_url,
-            service_id,
-            initial_ping_secs,
-            &message_tx,
-            &confirm_tx,
-            &dedup_cache,
-            bot_open_id.as_deref(),
-            &mut shutdown_rx,
-        )
-        .await
-        {
+        let inbound = LarkInboundContext {
+            message_tx: &message_tx,
+            confirm_tx: &confirm_tx,
+            dedup_cache: &dedup_cache,
+            bot_open_id: bot_open_id.as_deref(),
+        };
+        match connect_and_listen(ws_url, service_id, initial_ping_secs, inbound, &mut shutdown_rx).await {
             Ok(()) => {
                 debug!("Lark WS connection closed cleanly");
                 break;
@@ -344,15 +340,19 @@ async fn ws_loop(
     debug!("Lark WS loop exited");
 }
 
+struct LarkInboundContext<'a> {
+    message_tx: &'a mpsc::Sender<UnifiedIncomingMessage>,
+    confirm_tx: &'a mpsc::Sender<(String, String)>,
+    dedup_cache: &'a Arc<Mutex<HashMap<String, Instant>>>,
+    bot_open_id: Option<&'a str>,
+}
+
 /// Connect to the WebSocket and listen for binary protobuf frames.
 async fn connect_and_listen(
     ws_url: &str,
     service_id: i32,
     initial_ping_secs: u64,
-    message_tx: &mpsc::Sender<UnifiedIncomingMessage>,
-    confirm_tx: &mpsc::Sender<(String, String)>,
-    dedup_cache: &Arc<Mutex<HashMap<String, Instant>>>,
-    bot_open_id: Option<&str>,
+    inbound: LarkInboundContext<'_>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), ChannelError> {
     use futures_util::{SinkExt, StreamExt};
@@ -415,10 +415,10 @@ async fn connect_and_listen(
                                             handle_ws_text_with_bot(
                                                 &text,
                                                 msg_type,
-                                                message_tx,
-                                                confirm_tx,
-                                                dedup_cache,
-                                                bot_open_id,
+                                                inbound.message_tx,
+                                                inbound.confirm_tx,
+                                                inbound.dedup_cache,
+                                                inbound.bot_open_id,
                                             )
                                             .await;
                                         } else {
@@ -939,15 +939,6 @@ async fn cleanup_expired_events(cache: &Arc<Mutex<HashMap<String, Instant>>>) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Truncate a message to the platform limit, appending "..." if truncated.
-fn truncate_message(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(limit - 3).collect();
-    format!("{truncated}...")
-}
-
 /// Calculate exponential backoff delay, capped at the maximum.
 fn backoff_delay(attempt: u32) -> Duration {
     let delay_secs = 2u64.saturating_pow(attempt).min(MAX_RECONNECT_DELAY.as_secs());
@@ -1030,8 +1021,9 @@ mod tests {
 
     #[test]
     fn truncate_unicode() {
-        let result = truncate_message("你好世界测试文本", 5);
+        let result = truncate_message("你好世界测试文本", 9);
         assert_eq!(result, "你好...");
+        assert!(result.len() <= 9);
     }
 
     // -- backoff_delay ------------------------------------------------------

@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::constants::DINGTALK_MESSAGE_LIMIT;
 use crate::error::ChannelError;
+use crate::formatter::truncate_message;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{
     ActionCategory, ActionContext, BotInfo, MessageContentType, PluginConfig, PluginStatus, PluginType, UnifiedAction,
@@ -175,7 +176,7 @@ impl ChannelPlugin for DingtalkPlugin {
         // Only use AI Card for streaming (messages without buttons).
         // Messages with buttons are one-shot and should go via Open API.
         if message.buttons.is_none() {
-            match send_via_ai_card(api, chat_id).await {
+            match send_via_ai_card(api, chat_id, &text).await {
                 Ok(card_id) => return Ok(card_id),
                 Err(e) => {
                     warn!(error = %e, "AI Card send failed, falling back to Open API");
@@ -256,10 +257,10 @@ impl ChannelPlugin for DingtalkPlugin {
 // AI Card operations
 // ---------------------------------------------------------------------------
 
-/// Create an empty AI Card for streaming (create + deliver + set INPUTING).
+/// Create an AI Card with the initial text (create + deliver + set INPUTING).
 ///
 /// Returns the `outTrackId` which is used as the message ID for subsequent streaming writes.
-async fn send_via_ai_card(api: &Arc<DingtalkApi>, chat_id: &str) -> Result<String, ChannelError> {
+async fn send_via_ai_card(api: &Arc<DingtalkApi>, chat_id: &str, text: &str) -> Result<String, ChannelError> {
     let (is_group, _) = decode_chat_id(chat_id);
 
     let out_track_id = generate_out_track_id();
@@ -302,22 +303,27 @@ async fn send_via_ai_card(api: &Arc<DingtalkApi>, chat_id: &str) -> Result<Strin
 
     api.deliver_card(&deliver_req).await?;
 
-    // Transition card to INPUTING state so streaming writes are accepted.
-    let inputing_req = UpdateCardRequest {
-        out_track_id: out_track_id.clone(),
-        card_data: CardData {
-            card_param_map: Some(serde_json::json!({
-                "flowStatus": "2",
-                "msgContent": "",
-                "staticMsgContent": "",
-                "sys_full_json_obj": serde_json::json!({"order": ["msgContent"]}).to_string(),
-            })),
-        },
-    };
+    // Display the first fragment when a new assistant segment starts without
+    // an existing placeholder, and keep the card open for streaming writes.
+    let inputing_req = build_inputing_card_request(&out_track_id, text);
     api.update_card(&inputing_req).await?;
 
     debug!(card_id = %out_track_id, "DingTalk AI Card delivered");
     Ok(out_track_id)
+}
+
+fn build_inputing_card_request(out_track_id: &str, text: &str) -> UpdateCardRequest {
+    UpdateCardRequest {
+        out_track_id: out_track_id.to_owned(),
+        card_data: CardData {
+            card_param_map: Some(serde_json::json!({
+                "flowStatus": "2",
+                "msgContent": text,
+                "staticMsgContent": "",
+                "sys_full_json_obj": serde_json::json!({"order": ["msgContent"]}).to_string(),
+            })),
+        },
+    }
 }
 
 /// Send a message via DingTalk Open API (fallback).
@@ -851,15 +857,6 @@ fn build_ack(message_id: &str) -> StreamAck {
     }
 }
 
-/// Truncate a message to the platform limit, appending "..." if truncated.
-fn truncate_message(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(limit - 3).collect();
-    format!("{truncated}...")
-}
-
 /// Calculate exponential backoff delay, capped at the maximum.
 fn backoff_delay(attempt: u32) -> Duration {
     let delay_secs = 2u64.saturating_pow(attempt).min(MAX_RECONNECT_DELAY.as_secs());
@@ -882,6 +879,15 @@ fn chrono_now() -> i64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn new_streaming_card_displays_initial_text_without_finishing() {
+        let request = build_inputing_card_request("card-1", "Second segment\n\n⏳ working");
+        let params = request.card_data.card_param_map.unwrap();
+        assert_eq!(request.out_track_id, "card-1");
+        assert_eq!(params["msgContent"], "Second segment\n\n⏳ working");
+        assert_eq!(params["flowStatus"], "2");
+    }
+
     // -- truncate_message ---------------------------------------------------
 
     #[test]
@@ -902,8 +908,9 @@ mod tests {
 
     #[test]
     fn truncate_unicode() {
-        let result = truncate_message("你好世界测试文本", 5);
+        let result = truncate_message("你好世界测试文本", 9);
         assert_eq!(result, "你好...");
+        assert!(result.len() <= 9);
     }
 
     // -- backoff_delay ------------------------------------------------------

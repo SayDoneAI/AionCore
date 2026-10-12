@@ -118,5 +118,7 @@ fn truncate_exceeds_limit() {
 
 #[test]
 fn truncate_unicode() {
-    assert_eq!(truncate_message("你好世界测试文本", 5), "你好...");
+    let result = truncate_message("你好世界测试文本", 9);
+    assert_eq!(result, "你好...");
+    assert!(result.len() <= 9);
 }

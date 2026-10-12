@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn truncation_respects_byte_limits_for_unicode_and_tiny_budgets() {
+    let text = "你好🌟世界";
+    for limit in 0..=text.len() {
+        let result = truncate_message(text, limit);
+        assert!(result.len() <= limit, "limit={limit}, result={result}");
+        if limit >= text.len() {
+            assert_eq!(result, text);
+        } else if limit >= 3 {
+            assert!(result.ends_with("..."));
+            assert!(text.starts_with(result.trim_end_matches('.')));
+        }
+    }
+    assert_eq!(truncate_message(text, 9), "你好...");
+}
+
+#[test]
 fn slack_escapes_special_chars() {
     let out = format_text_for_platform("a < b & c > d", PluginType::Slack);
     assert_eq!(out, "a &lt; b &amp; c &gt; d");

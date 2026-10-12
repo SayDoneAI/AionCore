@@ -3028,6 +3028,10 @@ fn spawn_event_pump(
         // gets a diagnostic Tip so the user isn't left staring at an empty bubble. Set as
         // events are observed, reset at the per-turn terminal (with `tool_output`/`tool_name`).
         let mut saw_visible_output = false;
+        // Preserve assistant item boundaries before the stateless translation
+        // discards item_id. Deltas of one item stay in the same text segment;
+        // only a different nonempty item opens another segment.
+        let mut last_text_item_id: Option<String> = None;
         // Did the CURRENT turn already reach a terminal `TurnResult`? Mirrors the
         // reducer's `Running{terminal_result_seen}` flag. The pump consumes RAW
         // pre-reducer events, so to classify a `Detached` the way the reducer's
@@ -3152,6 +3156,7 @@ fn spawn_event_pump(
                 last_seen_turn_gen = env.turn_gen;
                 runtime.set_status(ConversationStatus::Running);
                 terminal_result_seen = false;
+                last_text_item_id = None;
                 // Per-turn workflow-suppression state must not leak across turns —
                 // same rationale as the TurnStarted arm below, which claude never
                 // reaches.
@@ -3231,6 +3236,16 @@ fn spawn_event_pump(
                     }
                     _ => {}
                 }
+            }
+
+            if let SessionEvent::MessageDelta { item_id, text } = &env.event
+                && !text.is_empty()
+                && !item_id.is_empty()
+            {
+                if last_text_item_id.as_ref().is_some_and(|previous| previous != item_id) {
+                    runtime.emit(AgentStreamEvent::SegmentBreak);
+                }
+                last_text_item_id = Some(item_id.clone());
             }
 
             // Empty-turn diagnostic Tip to emit for THIS terminal, if the turn was a
@@ -3494,6 +3509,7 @@ fn spawn_event_pump(
                             tool_output.clear();
                             tool_name.clear();
                             saw_visible_output = false;
+                            last_text_item_id = None;
                             // Idempotent clean-converge shared with the watchdog kill
                             // path: sets status Finished + broadcasts the Finish that
                             // drives relay break → turn release → `cancelling` cleared.
@@ -3525,6 +3541,7 @@ fn spawn_event_pump(
             match &env.event {
                 SessionEvent::TurnStarted { .. } => {
                     runtime.set_status(ConversationStatus::Running);
+                    last_text_item_id = None;
                     // New turn: the prior turn's terminal no longer applies.
                     terminal_result_seen = false;
                     // Per-turn workflow-suppression state must not leak across turns:
@@ -3568,6 +3585,7 @@ fn spawn_event_pump(
                         continue;
                     }
                     finish_suppressed_pending = false;
+                    last_text_item_id = None;
                     if let Some((diff_turn_gen, diff)) = live_turn_diff.take()
                         && let Some(event) = codex_live_diff_event(
                             &conversation_id,
@@ -3776,6 +3794,7 @@ fn spawn_event_pump(
                     // real terminal) must settle it — see `finish_suppressed_pending`.
                     finish_suppressed_pending = true;
                     runtime.emit(AgentStreamEvent::SegmentBreak);
+                    last_text_item_id = None;
                     continue;
                 }
                 // Stamp the CLI session id onto the Finish frame, matching the ACP path
@@ -8362,6 +8381,158 @@ mod pump_tests {
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
             _ => "other",
         }
+    }
+
+    fn text_delta(item_id: &str, text: &str) -> SessionEvent {
+        SessionEvent::MessageDelta {
+            item_id: item_id.into(),
+            text: text.into(),
+        }
+    }
+
+    fn clean_turn_result() -> SessionEvent {
+        SessionEvent::TurnResult {
+            is_error: false,
+            api_error_status: None,
+            result_text: String::new(),
+            epoch: 0,
+            outcome: aionui_session::TurnOutcome::EndTurn,
+        }
+    }
+
+    #[tokio::test]
+    async fn recorded_claude_assistant_items_keep_separate_text_segments() {
+        use aionui_session::ClaudeSessionBackend;
+        use aionui_session::testing::FakeAgentIo;
+
+        // Verified: this recorded CLI turn contains an initial assistant reply,
+        // a tool lifecycle, and a final assistant reply with a different ID.
+        let fixture = include_bytes!("../../aionui-session/tests/fixtures/claude_2.1.169_single_tool_turn.ndjson");
+        let source_text: Vec<_> = std::str::from_utf8(fixture)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+                if frame["type"] != "assistant" {
+                    return None;
+                }
+                let text = frame["message"]["content"]
+                    .as_array()?
+                    .iter()
+                    .filter(|block| block["type"] == "text")
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<String>();
+                (!text.is_empty()).then(|| (frame["message"]["id"].as_str().unwrap().to_owned(), text))
+            })
+            .collect();
+        assert_eq!(source_text.len(), 2, "the recording must exercise two assistant items");
+        assert_ne!(source_text[0].0, source_text[1].0);
+
+        let io = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(fixture.to_vec());
+        let release = io.stdout_releaser();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(ClaudeSessionBackend::build_with_io("conv-1", Box::new(io)).await);
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+        );
+        let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
+        release();
+        let mut frames = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("the recorded turn must reach its terminal")
+                .unwrap();
+            let finished = matches!(frame, AgentStreamEvent::Finish(_));
+            frames.push(frame);
+            if finished {
+                break;
+            }
+        }
+        let projected: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::Text(data) if !data.content.is_empty() => Some(data.content.clone()),
+                AgentStreamEvent::SegmentBreak => Some("<segment>".into()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            projected,
+            vec![source_text[0].1.clone(), "<segment>".into(), source_text[1].1.clone()],
+            "the real assistant message boundary must survive the session pump"
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_item_boundary_waits_for_nonempty_text_and_keeps_incremental_chunks_together() {
+        let frames = drain_script(vec![
+            env(text_delta("first", "Before")),
+            env(text_delta("empty-item", "")),
+            env(SessionEvent::ThoughtDelta {
+                item_id: "thinking".into(),
+                text: "internal reasoning".into(),
+            }),
+            env(text_delta("first", " tools.")),
+            env(SessionEvent::ToolCall {
+                tool_use_id: "tool".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::ToolResult {
+                tool_use_id: "tool".into(),
+                is_error: false,
+                content: Vec::new(),
+                parent_tool_use_id: None,
+            }),
+            env(text_delta("second", "Final")),
+            env(text_delta("second", " answer.")),
+            env(clean_turn_result()),
+        ])
+        .await;
+        let mut segments = vec![String::new()];
+        for frame in frames {
+            match frame {
+                AgentStreamEvent::Text(data) => segments.last_mut().unwrap().push_str(&data.content),
+                AgentStreamEvent::SegmentBreak => segments.push(String::new()),
+                _ => {}
+            }
+        }
+        assert_eq!(segments, vec!["Before tools.", "Final answer."]);
+    }
+
+    #[tokio::test]
+    async fn assistant_item_state_resets_at_terminal_for_cli_initiated_turns() {
+        let frames = drain_script(vec![
+            env(text_delta("first", "First turn.")),
+            env(clean_turn_result()),
+            // A CLI-initiated turn can keep the same generation. Its first item
+            // must not inherit the already settled turn's text segment.
+            env(text_delta("second", "Second turn.")),
+            env(clean_turn_result()),
+        ])
+        .await;
+        let sequence: Vec<_> = frames.iter().map(frame_name).collect();
+        assert_eq!(sequence, vec!["content", "finish", "content", "finish"]);
+    }
+
+    #[tokio::test]
+    async fn assistant_item_state_resets_when_generation_advances_without_a_terminal() {
+        let frames = drain_script(vec![
+            env_gen(1, text_delta("first", "Old turn.")),
+            env_gen(2, text_delta("second", "New turn.")),
+            env_gen(2, clean_turn_result()),
+        ])
+        .await;
+        let sequence: Vec<_> = frames.iter().map(frame_name).collect();
+        assert_eq!(sequence, vec!["content", "content", "finish"]);
     }
 
     // SessionTitle (claude generate_session_title, spec 2026-08-04) maps to the

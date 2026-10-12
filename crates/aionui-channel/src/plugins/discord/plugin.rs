@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::constants::DISCORD_MESSAGE_LIMIT;
 use crate::error::ChannelError;
+use crate::formatter::truncate_message;
 use crate::plugin::{ChannelPlugin, PluginCallbacks};
 use crate::types::{BotInfo, PluginConfig, PluginStatus, PluginType, UnifiedOutgoingMessage};
 
@@ -234,15 +235,6 @@ impl ChannelPlugin for DiscordPlugin {
     fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
-}
-
-/// Truncate a message to the platform limit, appending "..." if truncated.
-fn truncate_message(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(limit.saturating_sub(3)).collect();
-    format!("{truncated}...")
 }
 
 #[cfg(test)]
