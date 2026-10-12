@@ -2962,7 +2962,7 @@ fn spawn_event_pump(
         // Codex sends the full cumulative file diff through turn/diff/updated.
         // Keep the latest snapshot so it can be replaced in one stable tool row
         // and closed before the turn's terminal frame.
-        let mut live_turn_diff: Option<(u64, String)> = None;
+        let mut live_turn_diff: Option<(u64, String, Option<String>)> = None;
         // In-flight workflow/subagent refs, mirroring `state::background_active`
         // (any non-terminal roster entry ⇒ in-flight). claude's non-blocking
         // Workflow turn emits MULTIPLE `result` frames: the LAUNCH result arrives
@@ -3142,9 +3142,14 @@ fn spawn_event_pump(
                         to = env.turn_gen,
                         "session-pump: turn gen advanced; per-turn suppression state reset"
                     );
-                    if let Some((diff_turn_gen, diff)) = live_turn_diff.take()
-                        && let Some(event) =
-                            codex_live_diff_event(&conversation_id, diff_turn_gen, &diff, ToolCallStatus::Canceled)
+                    if let Some((diff_turn_gen, diff, call_id)) = live_turn_diff.take()
+                        && let Some(event) = codex_live_diff_event(
+                            &conversation_id,
+                            diff_turn_gen,
+                            &diff,
+                            call_id.as_deref(),
+                            ToolCallStatus::Canceled,
+                        )
                     {
                         runtime.emit(event);
                     }
@@ -3276,11 +3281,24 @@ fn spawn_event_pump(
             // not a delta. Project it to one stable tool-call row so the client
             // can render the live file changes while the turn is still running.
             if let SessionEvent::TurnDiffUpdated { diff } = &env.event {
+                // A Codex fileChange item normally starts before its turn diff. When
+                // that ordering is observed, use the real item id so the later
+                // completed ToolResult updates the same persisted row. Keep the
+                // synthetic id only as a fallback for diff snapshots that arrive
+                // before item/started.
+                let call_id = open_tools
+                    .iter()
+                    .find_map(|(call_id, name)| (name == CODEX_LIVE_DIFF_TOOL_NAME).then_some(call_id.clone()));
                 if !diff.is_empty()
-                    && let Some(event) =
-                        codex_live_diff_event(&conversation_id, env.turn_gen, diff, ToolCallStatus::Running)
+                    && let Some(event) = codex_live_diff_event(
+                        &conversation_id,
+                        env.turn_gen,
+                        diff,
+                        call_id.as_deref(),
+                        ToolCallStatus::Running,
+                    )
                 {
-                    live_turn_diff = Some((env.turn_gen, diff.clone()));
+                    live_turn_diff = Some((env.turn_gen, diff.clone(), call_id));
                     saw_visible_output = true;
                     runtime.emit(event);
                 }
@@ -3494,11 +3512,12 @@ fn spawn_event_pump(
                                     files: None,
                                 }));
                             }
-                            if let Some((diff_turn_gen, diff)) = live_turn_diff.take()
+                            if let Some((diff_turn_gen, diff, call_id)) = live_turn_diff.take()
                                 && let Some(event) = codex_live_diff_event(
                                     &conversation_id,
                                     diff_turn_gen,
                                     &diff,
+                                    call_id.as_deref(),
                                     ToolCallStatus::Canceled,
                                 )
                             {
@@ -3561,17 +3580,92 @@ fn spawn_event_pump(
                     input,
                     ..
                 } => {
+                    // Codex can publish turn/diff/updated before the fileChange
+                    // item/started frame. The first snapshot had to use a synthetic
+                    // id, but once the real item arrives the diff must move onto
+                    // that id. Close the synthetic row so it cannot remain stuck in
+                    // `work`, then re-emit the current snapshot under the real id;
+                    // the following ToolResult will update that same row.
+                    let rebind_live_diff = name == CODEX_LIVE_DIFF_TOOL_NAME
+                        && live_turn_diff
+                            .as_ref()
+                            .is_some_and(|(turn_gen, _, call_id)| *turn_gen == env.turn_gen && call_id.is_none());
+                    if rebind_live_diff && let Some((diff_turn_gen, diff, None)) = live_turn_diff.take() {
+                        if let Some(event) = codex_live_diff_event(
+                            &conversation_id,
+                            diff_turn_gen,
+                            &diff,
+                            None,
+                            ToolCallStatus::Canceled,
+                        ) {
+                            runtime.emit(event);
+                        }
+                        if let Some(event) = codex_live_diff_event(
+                            &conversation_id,
+                            diff_turn_gen,
+                            &diff,
+                            Some(tool_use_id.as_str()),
+                            ToolCallStatus::Running,
+                        ) {
+                            runtime.emit(event);
+                        }
+                        live_turn_diff = Some((diff_turn_gen, diff, Some(tool_use_id.clone())));
+                    }
                     tool_name.insert(tool_use_id.clone(), name.clone());
                     open_tools.insert(tool_use_id.clone(), name.clone());
                     // Kept for a workflow progress frame to re-send (see `tool_args`).
                     tool_args.insert(tool_use_id.clone(), input.clone());
                 }
-                SessionEvent::ToolResult { tool_use_id, .. } => {
+                SessionEvent::ToolResult {
+                    tool_use_id, content, ..
+                } => {
                     // A full terminal result supersedes any pending live preview.
                     // Remove it BEFORE forwarding the result; no later timer may
                     // regress the card to Running or overwrite its full output.
                     tool_output.discard(tool_use_id);
                     open_tools.remove(tool_use_id);
+                    // A completed Codex fileChange carries the authoritative file
+                    // entries. Once it arrives, the real ToolResult will settle the
+                    // shared row; emitting a second synthetic terminal diff would
+                    // recreate the duplicate file-change panel.
+                    let live_diff_matches_turn = live_turn_diff
+                        .as_ref()
+                        .is_some_and(|(diff_turn_gen, _, _)| *diff_turn_gen == env.turn_gen);
+                    let result_is_file_change = tool_name
+                        .get(tool_use_id)
+                        .is_none_or(|name| name == CODEX_LIVE_DIFF_TOOL_NAME);
+                    if result_is_file_change
+                        && tool_result_file_changes(content).is_some()
+                        && live_diff_matches_turn
+                        && let Some((diff_turn_gen, diff, call_id)) = live_turn_diff.take()
+                    {
+                        match call_id.as_deref() {
+                            Some(call_id) if call_id == tool_use_id => {
+                                // The real fileChange item owns this live snapshot;
+                                // its ToolResult below is the sole terminal frame.
+                            }
+                            Some(_) => {
+                                // A different tool produced a file path. Keep the
+                                // pending Codex diff alive until its own call ends.
+                                live_turn_diff = Some((diff_turn_gen, diff, call_id));
+                            }
+                            None => {
+                                // Some adapters can omit item/started and send the
+                                // file result directly. Close the synthetic row;
+                                // the real terminal result below will create the
+                                // authoritative row under its own call id.
+                                if let Some(event) = codex_live_diff_event(
+                                    &conversation_id,
+                                    diff_turn_gen,
+                                    &diff,
+                                    None,
+                                    ToolCallStatus::Canceled,
+                                ) {
+                                    runtime.emit(event);
+                                }
+                            }
+                        }
+                    }
                 }
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
                     // A real (unsuppressed) terminal settles any owed launch Finish —
@@ -3586,11 +3680,12 @@ fn spawn_event_pump(
                     }
                     finish_suppressed_pending = false;
                     last_text_item_id = None;
-                    if let Some((diff_turn_gen, diff)) = live_turn_diff.take()
+                    if let Some((diff_turn_gen, diff, call_id)) = live_turn_diff.take()
                         && let Some(event) = codex_live_diff_event(
                             &conversation_id,
                             diff_turn_gen,
                             &diff,
+                            call_id.as_deref(),
                             codex_live_diff_terminal_status(&env.event),
                         )
                     {
@@ -3832,8 +3927,14 @@ fn spawn_event_pump(
         // The stream is terminating without a turn result. Settle the latest live
         // diff before any terminal tool output so the frontend cannot retain a
         // `running` file-change row after the backend disappears.
-        if let Some((diff_turn_gen, diff)) = live_turn_diff.take()
-            && let Some(event) = codex_live_diff_event(&conversation_id, diff_turn_gen, &diff, ToolCallStatus::Canceled)
+        if let Some((diff_turn_gen, diff, call_id)) = live_turn_diff.take()
+            && let Some(event) = codex_live_diff_event(
+                &conversation_id,
+                diff_turn_gen,
+                &diff,
+                call_id.as_deref(),
+                ToolCallStatus::Canceled,
+            )
         {
             runtime.emit(event);
         }
@@ -4840,12 +4941,15 @@ fn codex_live_diff_event(
     conversation_id: &str,
     turn_gen: u64,
     diff: &str,
+    call_id: Option<&str>,
     status: ToolCallStatus,
 ) -> Option<AgentStreamEvent> {
     let files = codex_live_diff_files(diff);
     (!files.is_empty()).then(|| {
         AgentStreamEvent::ToolCall(ToolCallEventData {
-            call_id: format!("codex-turn-diff:{conversation_id}:{turn_gen}"),
+            call_id: call_id
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("codex-turn-diff:{conversation_id}:{turn_gen}")),
             name: CODEX_LIVE_DIFF_TOOL_NAME.into(),
             args: serde_json::Value::Null,
             status,
@@ -4879,7 +4983,7 @@ fn translate_event_for_turn(
     terminal_result_seen: bool,
 ) -> Vec<AgentStreamEvent> {
     if let SessionEvent::TurnDiffUpdated { diff } = event {
-        return codex_live_diff_event(conversation_id, turn_gen, &diff, ToolCallStatus::Running)
+        return codex_live_diff_event(conversation_id, turn_gen, &diff, None, ToolCallStatus::Running)
             .into_iter()
             .collect();
     }
@@ -8714,6 +8818,281 @@ mod pump_tests {
             .position(|frame| matches!(frame, AgentStreamEvent::Finish(_)))
             .expect("turn must finish");
         assert!(terminal_pos < finish_pos, "the terminal diff must precede Finish");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_file_change_result_reuses_live_diff_call_and_does_not_emit_duplicate_terminal() {
+        use aionui_session::{SubagentKind, TurnOutcome};
+
+        let diff = [
+            "diff --git a/src/file.ts b/src/file.ts",
+            "--- a/src/file.ts",
+            "+++ b/src/file.ts",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ]
+        .join("\n");
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "file-change-call".into(),
+                name: CODEX_LIVE_DIFF_TOOL_NAME.into(),
+                subagent: SubagentKind::Inline,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::TurnDiffUpdated { diff }),
+            env(SessionEvent::ToolResult {
+                tool_use_id: "file-change-call".into(),
+                is_error: false,
+                content: vec![ToolResultContent::FilePath {
+                    path: "src/file.ts".into(),
+                    move_path: None,
+                    mime: None,
+                    old_text: None,
+                    new_text: Some("@@ -1 +1 @@\n-old\n+new".into()),
+                }],
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: "done".into(),
+                epoch: 1,
+                outcome: TurnOutcome::EndTurn,
+            }),
+        ];
+
+        let frames = drain_script(script).await;
+        let diffs: Vec<&ToolCallEventData> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::ToolCall(data) if data.name == CODEX_LIVE_DIFF_TOOL_NAME => Some(data),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            diffs.iter().all(|data| data.call_id == "file-change-call"),
+            "live and terminal file changes must share the real item id: {diffs:?}"
+        );
+        assert_eq!(
+            diffs
+                .iter()
+                .filter(|data| data.status == ToolCallStatus::Completed)
+                .count(),
+            1,
+            "the real ToolResult is the only terminal file-change frame"
+        );
+        assert!(
+            !frames.iter().any(|frame| matches!(
+                frame,
+                AgentStreamEvent::ToolCall(data) if data.call_id.starts_with("codex-turn-diff:")
+            )),
+            "a real fileChange call must not create a synthetic duplicate"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_live_diff_before_file_change_is_rebound_without_leaving_synthetic_work() {
+        use aionui_session::{SubagentKind, TurnOutcome};
+
+        let diff = [
+            "diff --git a/src/file.ts b/src/file.ts",
+            "--- a/src/file.ts",
+            "+++ b/src/file.ts",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ]
+        .join("\n");
+        let script = vec![
+            env(SessionEvent::TurnDiffUpdated { diff }),
+            env(SessionEvent::ToolCall {
+                tool_use_id: "file-change-call".into(),
+                name: CODEX_LIVE_DIFF_TOOL_NAME.into(),
+                subagent: SubagentKind::Inline,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::ToolResult {
+                tool_use_id: "file-change-call".into(),
+                is_error: false,
+                content: vec![ToolResultContent::FilePath {
+                    path: "src/file.ts".into(),
+                    move_path: None,
+                    mime: None,
+                    old_text: None,
+                    new_text: Some("@@ -1 +1 @@\n-old\n+new".into()),
+                }],
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: "done".into(),
+                epoch: 1,
+                outcome: TurnOutcome::EndTurn,
+            }),
+        ];
+
+        let frames = drain_script(script).await;
+        let diffs: Vec<&ToolCallEventData> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::ToolCall(data) if data.name == CODEX_LIVE_DIFF_TOOL_NAME => Some(data),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            diffs
+                .iter()
+                .any(|data| { data.call_id == "codex-turn-diff:conv-1:1" && data.status == ToolCallStatus::Canceled }),
+            "the synthetic row must be closed when the real item arrives: {diffs:?}"
+        );
+        assert!(
+            diffs
+                .iter()
+                .any(|data| { data.call_id == "file-change-call" && data.status == ToolCallStatus::Running }),
+            "the current diff must be rebound to the real fileChange call: {diffs:?}"
+        );
+        assert_eq!(
+            diffs
+                .iter()
+                .filter(|data| { data.call_id == "file-change-call" && data.status == ToolCallStatus::Completed })
+                .count(),
+            1,
+            "the real ToolResult must be the only terminal real file-change frame"
+        );
+        assert_eq!(
+            diffs
+                .iter()
+                .rev()
+                .find(|data| data.call_id == "codex-turn-diff:conv-1:1")
+                .map(|data| data.status),
+            Some(ToolCallStatus::Canceled),
+            "the synthetic call must end in Canceled after rebinding: {diffs:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrelated_file_result_does_not_consume_codex_live_diff() {
+        use aionui_session::{SubagentKind, TurnOutcome};
+
+        let diff = [
+            "diff --git a/src/file.ts b/src/file.ts",
+            "--- a/src/file.ts",
+            "+++ b/src/file.ts",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ]
+        .join("\n");
+        let frames = drain_script(vec![
+            env(SessionEvent::TurnDiffUpdated { diff }),
+            env(SessionEvent::ToolCall {
+                tool_use_id: "image-call".into(),
+                name: "imageGeneration".into(),
+                subagent: SubagentKind::Inline,
+                input: serde_json::Value::Null,
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::ToolResult {
+                tool_use_id: "image-call".into(),
+                is_error: false,
+                content: vec![ToolResultContent::FilePath {
+                    path: "generated.png".into(),
+                    move_path: None,
+                    mime: Some("image/png".into()),
+                    old_text: None,
+                    new_text: Some("saved".into()),
+                }],
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: "done".into(),
+                epoch: 1,
+                outcome: TurnOutcome::EndTurn,
+            }),
+        ])
+        .await;
+        let live_diffs: Vec<&ToolCallEventData> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::ToolCall(data) if data.name == CODEX_LIVE_DIFF_TOOL_NAME => Some(data),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            live_diffs.last().map(|data| data.status),
+            Some(ToolCallStatus::Completed),
+            "an unrelated file result must not terminate the live Codex diff: {live_diffs:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn codex_live_diff_without_item_started_is_closed_before_real_file_result() {
+        use aionui_session::{ToolResultContent, TurnOutcome};
+
+        let diff = [
+            "diff --git a/src/file.ts b/src/file.ts",
+            "--- a/src/file.ts",
+            "+++ b/src/file.ts",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+        ]
+        .join("\n");
+        let frames = drain_script(vec![
+            env(SessionEvent::TurnDiffUpdated { diff }),
+            env(SessionEvent::ToolResult {
+                tool_use_id: "file-change-call".into(),
+                is_error: false,
+                content: vec![ToolResultContent::FilePath {
+                    path: "src/file.ts".into(),
+                    move_path: None,
+                    mime: None,
+                    old_text: None,
+                    new_text: Some("@@ -1 +1 @@\n-old\n+new".into()),
+                }],
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: "done".into(),
+                epoch: 1,
+                outcome: TurnOutcome::EndTurn,
+            }),
+        ])
+        .await;
+        let live_diffs: Vec<&ToolCallEventData> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::ToolCall(data) if data.name == CODEX_LIVE_DIFF_TOOL_NAME => Some(data),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            live_diffs.last().map(|data| data.status),
+            Some(ToolCallStatus::Canceled),
+            "the synthetic row must be closed when only the real file result arrives: {live_diffs:?}"
+        );
+        assert!(
+            frames.iter().any(|frame| matches!(
+                frame,
+                AgentStreamEvent::ToolCall(data)
+                    if data.call_id == "file-change-call"
+                        && data.status == ToolCallStatus::Completed
+                        && data.files.as_ref().is_some_and(|files| !files.is_empty())
+            )),
+            "the real file result must remain authoritative: {frames:?}"
+        );
     }
 
     #[test]
