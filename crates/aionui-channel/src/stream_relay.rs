@@ -1,5 +1,5 @@
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use aionui_ai_agent::{AgentStreamEvent, AgentStreamReceiver};
 use aionui_conversation::runtime_state::ConversationRuntimeStateService;
@@ -16,11 +16,6 @@ use crate::formatter::{format_text_for_platform, truncate_message};
 use crate::message_service::{ChannelMessageService, StreamAction};
 use crate::session::SessionManager;
 use crate::types::{PluginType, UnifiedOutgoingMessage};
-
-// A timer alone still emits one-character edits when a slow model sends text
-// more slowly than the platform throttle. Require a small readable fragment
-// before exposing an intermediate working update; completion remains immediate.
-const MIN_STREAM_UPDATE_CHARS: usize = 8;
 
 /// Configuration for a stream relay session.
 #[derive(Debug, Clone)]
@@ -39,6 +34,13 @@ enum ContinuationOutcome {
     Event(Box<AgentStreamEvent>),
     AgentStopped,
     Interrupted,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegmentStatus {
+    Working,
+    Worked,
+    None,
 }
 
 /// Per-platform minimum interval between streaming `edit_message` calls.
@@ -95,6 +97,7 @@ pub struct ChannelStreamRelay {
     sender: Arc<dyn ChannelSender>,
     session_manager: Option<Arc<SessionManager>>,
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
+    project_name: Option<String>,
 }
 
 impl ChannelStreamRelay {
@@ -104,6 +107,7 @@ impl ChannelStreamRelay {
             sender,
             session_manager: None,
             runtime_state: None,
+            project_name: None,
         }
     }
 
@@ -117,11 +121,17 @@ impl ChannelStreamRelay {
             sender,
             session_manager: Some(session_manager),
             runtime_state: None,
+            project_name: None,
         }
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: Option<&str>) -> Self {
+        self.project_name = workspace_folder_name(workspace);
         self
     }
 
@@ -180,11 +190,12 @@ impl ChannelStreamRelay {
         }
     }
 
-    /// Buffered relay for channels where intermediate messages should not be
-    /// exposed as separate user-facing messages.
+    /// Buffered relay for channels that cannot edit messages. Each visible
+    /// tool/thinking boundary closes the text accumulated before it.
     async fn run_buffered(self, mut rx: AgentStreamReceiver) {
         let mut text_buffer = String::new();
         let mut pending_event = None;
+        let mut seen_boundary_keys = HashSet::new();
 
         loop {
             let received = match pending_event.take() {
@@ -192,12 +203,11 @@ impl ChannelStreamRelay {
                 None => rx.recv().await,
             };
             match received {
-                Ok(event) if is_segment_boundary(&event) => {
+                Ok(event) if is_new_segment_boundary(&event, &mut seen_boundary_keys) => {
                     if !text_buffer.trim().is_empty() {
-                        let reply = format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
-                        let formatted = format_text_for_platform(&reply, self.config.platform);
                         let preview = self.route_preview(&text_buffer);
-                        self.send_buffered_message(&formatted, false, Some(&preview)).await;
+                        self.send_buffered_message(&text_buffer, SegmentStatus::Working, Some(&preview))
+                            .await;
                         text_buffer.clear();
                     }
                 }
@@ -215,21 +225,17 @@ impl ChannelStreamRelay {
                             }
                             ContinuationOutcome::Interrupted => {
                                 let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                                let reply =
-                                    format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
-                                let formatted = format_text_for_platform(&reply, self.config.platform);
                                 let preview = self.route_preview(&error_text);
-                                self.send_buffered_message(&formatted, false, Some(&preview)).await;
+                                self.send_buffered_message(&error_text, SegmentStatus::None, Some(&preview))
+                                    .await;
                                 break;
                             }
                             ContinuationOutcome::AgentStopped => {}
                         }
                         if !text_buffer.trim().is_empty() {
-                            let reply =
-                                format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
-                            let formatted = format_text_for_platform(&reply, self.config.platform);
                             let preview = self.route_preview(&text_buffer);
-                            self.send_buffered_message(&formatted, true, Some(&preview)).await;
+                            self.send_buffered_message(&text_buffer, SegmentStatus::Worked, Some(&preview))
+                                .await;
                         }
                         info!(
                             plugin_id = %self.config.plugin_id,
@@ -242,20 +248,18 @@ impl ChannelStreamRelay {
                     }
                     Some(StreamAction::Error(msg)) => {
                         let error_text = stream_error_text(&text_buffer, &msg);
-                        let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
-                        let formatted = format_text_for_platform(&reply, self.config.platform);
                         let preview = self.route_preview(&error_text);
-                        self.send_buffered_message(&formatted, false, Some(&preview)).await;
+                        self.send_buffered_message(&error_text, SegmentStatus::None, Some(&preview))
+                            .await;
                         break;
                     }
                     None => {}
                 },
                 Err(broadcast::error::RecvError::Closed) => {
                     let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                    let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
-                    let formatted = format_text_for_platform(&reply, self.config.platform);
                     let preview = self.route_preview(&error_text);
-                    self.send_buffered_message(&formatted, false, Some(&preview)).await;
+                    self.send_buffered_message(&error_text, SegmentStatus::None, Some(&preview))
+                        .await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -265,10 +269,9 @@ impl ChannelStreamRelay {
                         "channel stream relay lagged (buffered)"
                     );
                     let error_text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                    let reply = format_remote_reply(&self.config.prompt_text, &error_text, self.config.platform);
-                    let formatted = format_text_for_platform(&reply, self.config.platform);
                     let preview = self.route_preview(&error_text);
-                    self.send_buffered_message(&formatted, false, Some(&preview)).await;
+                    self.send_buffered_message(&error_text, SegmentStatus::None, Some(&preview))
+                        .await;
                     break;
                 }
             }
@@ -282,10 +285,9 @@ impl ChannelStreamRelay {
         );
     }
 
-    /// Keep streaming updates on one message per assistant segment. Only a
-    /// completed segment or a size boundary creates another channel message.
+    /// Keep one message per assistant segment. A visible tool/thinking boundary
+    /// closes the accumulated text; individual text deltas never send a message.
     async fn run_editable(self, mut rx: AgentStreamReceiver) {
-        let throttle = Duration::from_millis(self.config.throttle_ms.max(1));
         let mut receipt = if self.config.platform == PluginType::Lark {
             None
         } else {
@@ -295,7 +297,11 @@ impl ChannelStreamRelay {
                     &self.config.owner_user_id,
                     &self.config.plugin_id,
                     &self.config.chat_id,
-                    ChannelMessageService::build_thinking_message(),
+                    build_initial_working_message(
+                        &self.config.prompt_text,
+                        self.project_name.as_deref(),
+                        self.config.platform,
+                    ),
                 )
                 .await
             {
@@ -310,64 +316,25 @@ impl ChannelStreamRelay {
                 }
             }
         };
-        let mut stream_updates_enabled = receipt.is_some() || self.config.platform == PluginType::Lark;
         let mut text_buffer = String::new();
-        let mut last_edit = Instant::now();
-        let mut pending_visible_chars = 0;
         let mut pending_event = None;
+        let mut seen_boundary_keys = HashSet::new();
 
         loop {
             let received = match pending_event.take() {
                 Some(event) => Ok(event),
-                None => {
-                    tokio::select! {
-                        event = rx.recv() => event,
-                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(last_edit + throttle)),
-                            if pending_visible_chars >= MIN_STREAM_UPDATE_CHARS && stream_updates_enabled => {
-                            let reply = format_remote_reply(&self.config.prompt_text, &text_buffer, self.config.platform);
-                            let formatted = format_text_for_platform(&reply, self.config.platform);
-                            let limit = message_limit(self.config.platform).saturating_sub("\n\n⏳ working".len());
-                            let preview = truncate_message(&formatted, limit);
-                            let message = ChannelMessageService::build_streaming_message(&preview);
-                            let result = if let Some(active) = receipt.as_ref() {
-                                self.sender.edit_message(&self.config.owner_user_id, &self.config.plugin_id,
-                                    &self.config.chat_id, &active.message_id, message).await
-                            } else {
-                                match self.sender.send_message(&self.config.owner_user_id, &self.config.plugin_id,
-                                    &self.config.chat_id, message).await {
-                                    Ok(sent) => {
-                                        self.register_message_route(&sent, None).await;
-                                        receipt = Some(sent);
-                                        Ok(())
-                                    }
-                                    Err(error) => Err(error),
-                                }
-                            };
-                            if let Err(error) = result {
-                                warn!(error = %error, platform = %self.config.platform,
-                                    "channel streaming update failed; buffering until segment completion");
-                                stream_updates_enabled = false;
-                            }
-                            last_edit = Instant::now();
-                            pending_visible_chars = 0;
-                            continue;
-                        }
-                    }
-                }
+                None => rx.recv().await,
             };
             match received {
-                Ok(event) if is_segment_boundary(&event) => {
+                Ok(event) if is_new_segment_boundary(&event, &mut seen_boundary_keys) => {
                     if !text_buffer.trim().is_empty() {
-                        self.deliver_editable_segment(&text_buffer, receipt.take(), false).await;
+                        self.deliver_editable_segment(&text_buffer, receipt.take(), SegmentStatus::Working)
+                            .await;
                         text_buffer.clear();
-                        pending_visible_chars = 0;
-                        stream_updates_enabled = true;
-                        last_edit = Instant::now();
                     }
                 }
                 Ok(event) => match ChannelMessageService::process_stream_event(&event) {
                     Some(StreamAction::AppendText(chunk)) => {
-                        pending_visible_chars += chunk.chars().filter(|character| !character.is_whitespace()).count();
                         text_buffer.push_str(&chunk);
                     }
                     Some(StreamAction::Finish) => {
@@ -378,13 +345,15 @@ impl ChannelStreamRelay {
                             }
                             ContinuationOutcome::Interrupted => {
                                 let text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                                self.deliver_editable_segment(&text, receipt.take(), false).await;
+                                self.deliver_editable_segment(&text, receipt.take(), SegmentStatus::None)
+                                    .await;
                                 break;
                             }
                             ContinuationOutcome::AgentStopped => {}
                         }
                         if !text_buffer.trim().is_empty() || receipt.is_some() {
-                            self.deliver_editable_segment(&text_buffer, receipt.take(), true).await;
+                            self.deliver_editable_segment(&text_buffer, receipt.take(), SegmentStatus::Worked)
+                                .await;
                         }
                         info!(plugin_id = %self.config.plugin_id, conversation_id = %self.config.conversation_id,
                             platform = %self.config.platform, "channel stream relay finished");
@@ -392,7 +361,8 @@ impl ChannelStreamRelay {
                     }
                     Some(StreamAction::Error(reason)) => {
                         let text = stream_error_text(&text_buffer, &reason);
-                        self.deliver_editable_segment(&text, receipt.take(), false).await;
+                        self.deliver_editable_segment(&text, receipt.take(), SegmentStatus::None)
+                            .await;
                         break;
                     }
                     _ => {}
@@ -400,29 +370,34 @@ impl ChannelStreamRelay {
                 Err(error) => {
                     warn!(error = %error, platform = %self.config.platform, "channel reply stream interrupted");
                     let text = stream_error_text(&text_buffer, "回复流中断，请重试");
-                    self.deliver_editable_segment(&text, receipt.take(), false).await;
+                    self.deliver_editable_segment(&text, receipt.take(), SegmentStatus::None)
+                        .await;
                     break;
                 }
             }
         }
     }
 
-    async fn deliver_editable_segment(&self, text: &str, receipt: Option<ChannelDeliveryReceipt>, complete: bool) {
-        let reply = format_remote_reply(&self.config.prompt_text, text, self.config.platform);
-        let formatted = format_text_for_platform(&reply, self.config.platform);
+    async fn deliver_editable_segment(
+        &self,
+        text: &str,
+        receipt: Option<ChannelDeliveryReceipt>,
+        status: SegmentStatus,
+    ) {
         let limit = message_limit(self.config.platform);
-        let mut chunks = split_text_for_limit(&formatted, limit);
-        if complete {
-            if chunks.is_empty() {
-                chunks.push(String::new());
-            }
-            reserve_completion_suffix(&mut chunks, limit);
-        }
+        let chunks = format_remote_reply_chunks(
+            &self.config.prompt_text,
+            self.project_name.as_deref(),
+            text,
+            self.config.platform,
+            limit,
+            status,
+        );
         let preview = self.route_preview(text);
         for (index, chunk) in chunks.iter().enumerate() {
             let is_last = index + 1 == chunks.len();
-            let mut message = if complete && is_last {
-                ChannelMessageService::build_final_message(chunk)
+            let mut message = if is_last {
+                build_segment_message(chunk, status)
             } else {
                 ChannelMessageService::build_text_message(chunk)
             };
@@ -475,19 +450,20 @@ impl ChannelStreamRelay {
         }
     }
 
-    async fn send_buffered_message(&self, formatted: &str, with_buttons: bool, preview: Option<&str>) {
+    async fn send_buffered_message(&self, text: &str, status: SegmentStatus, preview: Option<&str>) {
         let limit = message_limit(self.config.platform);
-        let mut chunks = split_text_for_limit(formatted, limit);
-        if with_buttons && chunks.is_empty() {
-            chunks.push(String::new());
-        }
-        if with_buttons {
-            reserve_completion_suffix(&mut chunks, limit);
-        }
+        let chunks = format_remote_reply_chunks(
+            &self.config.prompt_text,
+            self.project_name.as_deref(),
+            text,
+            self.config.platform,
+            limit,
+            status,
+        );
         for (index, chunk) in chunks.iter().enumerate() {
             let is_last = index + 1 == chunks.len();
-            let message = if with_buttons && is_last {
-                ChannelMessageService::build_final_message(chunk)
+            let message = if is_last {
+                build_segment_message(chunk, status)
             } else {
                 ChannelMessageService::build_text_message(chunk)
             };
@@ -545,8 +521,10 @@ impl ChannelStreamRelay {
     }
 
     fn route_preview(&self, assistant_text: &str) -> String {
+        let project_name = self.project_name.as_deref().unwrap_or("项目");
         format!(
-            "你：{}\n\nAI：{}",
+            "{}：{}\n\nAI：{}",
+            project_name,
             self.config.prompt_text.trim(),
             assistant_text.trim()
         )
@@ -556,16 +534,123 @@ impl ChannelStreamRelay {
     }
 }
 
-/// Include the original prompt in remote replies where users cannot reliably
-/// associate an answer with the originating message from the conversation list.
-/// Other platforms keep their existing answer-only message shape.
-pub(crate) fn format_remote_reply(prompt_text: &str, assistant_text: &str, platform: PluginType) -> String {
+/// Return the final directory component of a persisted workspace path.
+pub(crate) fn workspace_folder_name(workspace: Option<&str>) -> Option<String> {
+    let path = workspace?.trim().trim_end_matches(['/', '\\']);
+    let name = path.rsplit(['/', '\\']).next()?.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+/// Include the original prompt and project folder in every channel reply so
+/// users can associate each step with the originating conversation.
+pub(crate) fn format_remote_reply(
+    prompt_text: &str,
+    project_name: Option<&str>,
+    assistant_text: &str,
+    _platform: PluginType,
+) -> String {
     let prompt = prompt_text.trim();
     let answer = assistant_text.trim();
-    if matches!(platform, PluginType::Weixin | PluginType::Wecom | PluginType::Lark) && !prompt.is_empty() {
-        format!("**你：** {prompt}\n\n**AI：** {answer}")
+    if !prompt.is_empty() {
+        let project_name = project_name.filter(|name| !name.trim().is_empty()).unwrap_or("项目");
+        format!("**{project_name}：** {prompt}\n\n**AI：** {answer}")
     } else {
         answer.to_owned()
+    }
+}
+
+fn build_initial_working_message(
+    prompt_text: &str,
+    project_name: Option<&str>,
+    platform: PluginType,
+) -> UnifiedOutgoingMessage {
+    if prompt_text.trim().is_empty() {
+        return ChannelMessageService::build_thinking_message();
+    }
+
+    let limit = message_limit(platform).saturating_sub("\n\n⏳ working".len());
+    let prefix = format_remote_reply_prefix(prompt_text, project_name, platform, limit);
+    ChannelMessageService::build_streaming_message(&prefix)
+}
+
+fn format_remote_reply_chunks(
+    prompt_text: &str,
+    project_name: Option<&str>,
+    assistant_text: &str,
+    platform: PluginType,
+    limit: usize,
+    status: SegmentStatus,
+) -> Vec<String> {
+    let answer = format_text_for_platform(assistant_text.trim(), platform);
+    let status_suffix_len = status_suffix(status).map_or(0, str::len);
+    let answer_budget = if answer.len() <= limit.saturating_sub(status_suffix_len) {
+        answer.len()
+    } else {
+        // Leave room for substantial answer chunks when the context must repeat.
+        limit / 2
+    };
+    let prefix_limit = limit.saturating_sub(status_suffix_len).saturating_sub(answer_budget);
+    let prefix = format_remote_reply_prefix(prompt_text, project_name, platform, prefix_limit);
+    let answer_limit = limit.saturating_sub(prefix.len()).saturating_sub(status_suffix_len);
+    let mut chunks = split_text_for_limit(&answer, answer_limit);
+    if chunks.is_empty() && status == SegmentStatus::Worked {
+        chunks.push(String::new());
+    }
+
+    if prefix.is_empty() {
+        chunks
+    } else {
+        chunks.into_iter().map(|chunk| format!("{prefix}{chunk}")).collect()
+    }
+}
+
+fn format_remote_reply_prefix(
+    prompt_text: &str,
+    project_name: Option<&str>,
+    platform: PluginType,
+    max_bytes: usize,
+) -> String {
+    let prompt = prompt_text.trim();
+    if prompt.is_empty() {
+        return String::new();
+    }
+    let project_name = project_name.filter(|name| !name.trim().is_empty()).unwrap_or("项目");
+    let format_prefix =
+        |question: &str| format_text_for_platform(&format!("**{project_name}：** {question}\n\n**AI：** "), platform);
+    let full_prefix = format_prefix(prompt);
+    if full_prefix.len() <= max_bytes {
+        return full_prefix;
+    }
+
+    let total_chars = prompt.chars().count();
+    let mut low = 0;
+    let mut high = total_chars;
+    while low < high {
+        let keep_chars = low + (high - low).div_ceil(2);
+        let mut question: String = prompt.chars().take(keep_chars).collect();
+        if keep_chars < total_chars {
+            question.push_str("...");
+        }
+        if format_prefix(&question).len() <= max_bytes {
+            low = keep_chars;
+        } else {
+            high = keep_chars - 1;
+        }
+    }
+
+    let mut question: String = prompt.chars().take(low).collect();
+    if low < total_chars {
+        question.push_str("...");
+    }
+    let prefix = format_prefix(&question);
+    if prefix.len() <= max_bytes {
+        prefix
+    } else {
+        truncate_message(&prefix, max_bytes)
     }
 }
 
@@ -602,29 +687,20 @@ fn split_text_for_limit(text: &str, limit: usize) -> Vec<String> {
     chunks
 }
 
-/// `build_final_message` appends the completion marker to the last chunk.
-/// Move enough content into an additional chunk so that the marker itself is
-/// included in the channel's size limit.
-fn reserve_completion_suffix(chunks: &mut Vec<String>, limit: usize) {
-    const COMPLETION_SUFFIX: &str = "\n\n✅ worked";
-    let suffix_len = COMPLETION_SUFFIX.len();
-    let Some(last) = chunks.last_mut() else {
-        return;
-    };
-    let max_content_len = limit.saturating_sub(suffix_len);
-    let last_len = last.len();
-    if last_len <= max_content_len {
-        return;
+fn build_segment_message(text: &str, status: SegmentStatus) -> UnifiedOutgoingMessage {
+    match status {
+        SegmentStatus::Working => ChannelMessageService::build_streaming_message(text),
+        SegmentStatus::Worked => ChannelMessageService::build_final_message(text),
+        SegmentStatus::None => ChannelMessageService::build_text_message(text),
     }
+}
 
-    let split_at = last
-        .char_indices()
-        .map(|(index, _)| index)
-        .find(|index| last_len - *index <= max_content_len)
-        .unwrap_or(last_len);
-    let tail = last[split_at..].to_owned();
-    last.truncate(split_at);
-    chunks.push(tail);
+fn status_suffix(status: SegmentStatus) -> Option<&'static str> {
+    match status {
+        SegmentStatus::Working => Some("\n\n⏳ working"),
+        SegmentStatus::Worked => Some("\n\n✅ worked"),
+        SegmentStatus::None => None,
+    }
 }
 
 fn message_limit(platform: PluginType) -> usize {
@@ -639,7 +715,40 @@ fn message_limit(platform: PluginType) -> usize {
 }
 
 fn is_segment_boundary(event: &AgentStreamEvent) -> bool {
-    matches!(event, AgentStreamEvent::SegmentBreak)
+    matches!(
+        event,
+        AgentStreamEvent::SegmentBreak
+            | AgentStreamEvent::ToolCall(_)
+            | AgentStreamEvent::AcpToolCall(_)
+            | AgentStreamEvent::ToolGroup(_)
+    ) || matches!(
+        event,
+        AgentStreamEvent::Thinking(data)
+            if data.status.as_deref() != Some("done") && !data.content.is_empty()
+    )
+}
+
+fn is_new_segment_boundary(event: &AgentStreamEvent, seen_keys: &mut HashSet<String>) -> bool {
+    if !is_segment_boundary(event) {
+        return false;
+    }
+    let Some(key) = segment_boundary_key(event) else {
+        return true;
+    };
+    seen_keys.insert(key)
+}
+
+fn segment_boundary_key(event: &AgentStreamEvent) -> Option<String> {
+    let (kind, call_id) = match event {
+        AgentStreamEvent::ToolCall(data) => ("tool_call", data.call_id.as_str()),
+        AgentStreamEvent::AcpToolCall(data) => ("acp_tool_call", data.update.tool_call_id.as_str()),
+        AgentStreamEvent::ToolGroup(entries) => (
+            "tool_group",
+            entries.iter().find(|entry| !entry.call_id.is_empty())?.call_id.as_str(),
+        ),
+        _ => return None,
+    };
+    (!call_id.is_empty()).then(|| format!("{kind}:{call_id}"))
 }
 
 fn stream_error_text(text_buffer: &str, reason: &str) -> String {
@@ -724,23 +833,89 @@ impl ChannelSender for MessageRecorder {
 
 #[cfg(test)]
 mod tests {
-    use super::format_remote_reply;
+    use super::{
+        SegmentStatus, build_initial_working_message, build_segment_message, format_remote_reply,
+        format_remote_reply_chunks, workspace_folder_name,
+    };
+    use crate::constants::DISCORD_MESSAGE_LIMIT;
+    use crate::message_service::ChannelMessageService;
     use crate::types::PluginType;
 
     #[test]
-    fn remote_reply_uses_markdown_bold_context_labels() {
+    fn remote_reply_uses_workspace_folder_as_context_label() {
         assert_eq!(
-            format_remote_reply("原始问题", "回答内容", PluginType::Wecom),
-            "**你：** 原始问题\n\n**AI：** 回答内容"
+            format_remote_reply("原始问题", Some("project-a"), "回答内容", PluginType::Wecom),
+            "**project-a：** 原始问题\n\n**AI：** 回答内容"
         );
     }
 
     #[test]
-    fn remote_reply_omits_context_without_prompt_or_for_other_platforms() {
-        assert_eq!(format_remote_reply("   ", "回答内容", PluginType::Weixin), "回答内容");
+    fn remote_reply_uses_generic_project_label_when_workspace_is_missing() {
         assert_eq!(
-            format_remote_reply("原始问题", "回答内容", PluginType::Telegram),
+            format_remote_reply("原始问题", None, "回答内容", PluginType::Telegram),
+            "**项目：** 原始问题\n\n**AI：** 回答内容"
+        );
+        assert_eq!(
+            format_remote_reply("   ", Some("/Users/me/project-a"), "回答内容", PluginType::Weixin),
             "回答内容"
         );
+    }
+
+    #[test]
+    fn workspace_folder_name_handles_unix_windows_and_root_paths() {
+        assert_eq!(
+            workspace_folder_name(Some("/Users/me/project-a")),
+            Some("project-a".to_owned())
+        );
+        assert_eq!(
+            workspace_folder_name(Some(r"C:\Users\me\project-a")),
+            Some("project-a".to_owned())
+        );
+        assert_eq!(workspace_folder_name(Some("/")), None);
+        assert_eq!(workspace_folder_name(Some("  ")), None);
+    }
+
+    #[test]
+    fn long_question_and_answer_fit_discord_limits_without_losing_answer_text() {
+        let question = "question ".repeat(600);
+        let answer = "answer ".repeat(500);
+        let chunks = format_remote_reply_chunks(
+            &question,
+            Some("project-a"),
+            &answer,
+            PluginType::Discord,
+            DISCORD_MESSAGE_LIMIT,
+            SegmentStatus::Worked,
+        );
+
+        assert!(chunks.len() > 1);
+        let mut recovered_answer = String::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let message = if index + 1 == chunks.len() {
+                build_segment_message(chunk, SegmentStatus::Worked)
+            } else {
+                ChannelMessageService::build_text_message(chunk)
+            };
+            let text = message.text.unwrap();
+            assert!(text.len() <= DISCORD_MESSAGE_LIMIT);
+            assert!(text.starts_with("**project-a：** question"));
+            let content = text.split_once("**AI：** ").unwrap().1;
+            recovered_answer.push_str(if index + 1 == chunks.len() {
+                content.strip_suffix("\n\n✅ worked").unwrap()
+            } else {
+                content
+            });
+        }
+        assert_eq!(recovered_answer, answer.trim());
+    }
+
+    #[test]
+    fn initial_working_message_stays_within_platform_limit_for_long_question() {
+        let message = build_initial_working_message(&"question ".repeat(600), Some("project-a"), PluginType::Discord);
+        let text = message.text.unwrap();
+
+        assert!(text.len() <= DISCORD_MESSAGE_LIMIT);
+        assert!(text.starts_with("**project-a：** question"));
+        assert!(text.ends_with("\n\n⏳ working"));
     }
 }

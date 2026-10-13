@@ -59,7 +59,7 @@ fn finish_event() -> AgentStreamEvent {
 }
 
 #[tokio::test]
-async fn rapid_chunks_and_thinking_keep_one_message_on_every_platform() {
+async fn thinking_boundary_sends_working_segment_before_final_answer_on_every_platform() {
     for platform in [
         PluginType::Telegram,
         PluginType::Discord,
@@ -79,9 +79,11 @@ async fn rapid_chunks_and_thinking_keep_one_message_on_every_platform() {
         events.extend(" Second.".chars().map(|ch| text_event(&ch.to_string())));
         events.push(finish_event());
         let (sends, edits) = run_recorded_events(platform, events).await;
-        assert_eq!(sends.len(), 1, "platform={platform}, sends={sends:?}");
-        let final_message = edits.last().unwrap_or(&sends[0]);
-        assert_eq!(final_message.text.as_deref(), Some("First. Second.\n\n✅ worked"));
+        assert_eq!(sends.len(), 2, "platform={platform}, sends={sends:?}");
+        let working_message = edits.first().unwrap_or(&sends[0]);
+        assert_eq!(working_message.text.as_deref(), Some("First.\n\n⏳ working"));
+        let final_message = sends.last().expect("the final segment must be sent");
+        assert_eq!(final_message.text.as_deref(), Some("Second.\n\n✅ worked"));
         assert!(
             final_message
                 .buttons
@@ -114,7 +116,7 @@ async fn explicit_segment_break_separates_independent_outputs_on_every_platform(
         .await;
         assert_eq!(sends.len(), 2, "platform={platform}, sends={sends:?}");
         let first_output = edits.first().unwrap_or(&sends[0]);
-        assert_eq!(first_output.text.as_deref(), Some("Launched."));
+        assert_eq!(first_output.text.as_deref(), Some("Launched.\n\n⏳ working"));
         assert!(first_output.buttons.as_ref().is_none_or(Vec::is_empty));
         if platform == PluginType::Dingtalk {
             assert_eq!(
@@ -151,11 +153,11 @@ async fn finish_after_segment_break_does_not_send_an_empty_reply() {
         assert_eq!(sends.len(), 1, "platform={platform}, sends={sends:?}");
 
         if matches!(platform, PluginType::Weixin | PluginType::Wecom | PluginType::Lark) {
-            assert_eq!(sends[0].text.as_deref(), Some("First output."));
+            assert_eq!(sends[0].text.as_deref(), Some("First output.\n\n⏳ working"));
             assert!(edits.is_empty(), "platform={platform}, edits={edits:?}");
         } else {
             assert_eq!(edits.len(), 1, "platform={platform}, edits={edits:?}");
-            assert_eq!(edits[0].text.as_deref(), Some("First output."));
+            assert_eq!(edits[0].text.as_deref(), Some("First output.\n\n⏳ working"));
         }
     }
 }
@@ -304,7 +306,7 @@ fn relay_config_fields() {
 // ── Full relay run with mock ChannelSender ───────────────────────
 
 #[tokio::test]
-async fn relay_sends_thinking_then_final_message() {
+async fn relay_buffers_text_until_finish_then_sends_final_message() {
     let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
     let recorder = Arc::new(MessageRecorder::new());
 
@@ -318,7 +320,7 @@ async fn relay_sends_thinking_then_final_message() {
         prompt_text: "Test question".into(),
         throttle_ms: 10,
     };
-    let relay = ChannelStreamRelay::new(config, recorder.clone());
+    let relay = ChannelStreamRelay::new(config, recorder.clone()).with_workspace(Some("/Users/me/project-a"));
 
     let rx = event_tx.subscribe();
 
@@ -333,19 +335,6 @@ async fn relay_sends_thinking_then_final_message() {
         }))
         .unwrap();
     let relay_task = tokio::spawn(relay.run(rx));
-    let streaming_edits = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let edits = recorder.take_edits();
-            if !edits.is_empty() {
-                break edits;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("streaming text must be edited before Finish, even without another chunk");
-    assert_eq!(streaming_edits.len(), 1);
-    assert_eq!(streaming_edits[0].text.as_deref(), Some("Hello World\n\n⏳ working"));
     event_tx
         .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
         .unwrap();
@@ -354,16 +343,22 @@ async fn relay_sends_thinking_then_final_message() {
 
     let sends = recorder.take_sends();
     assert_eq!(sends.len(), 1);
-    assert_eq!(sends[0].text.as_deref(), Some("⏳ working"));
+    assert_eq!(
+        sends[0].text.as_deref(),
+        Some("<b>project-a：</b> Test question\n\n<b>AI：</b> \n\n⏳ working")
+    );
 
     let edits = recorder.take_edits();
     assert_eq!(edits.len(), 1);
-    assert_eq!(edits[0].text.as_deref(), Some("Hello World\n\n✅ worked"));
+    assert_eq!(
+        edits[0].text.as_deref(),
+        Some("<b>project-a：</b> Test question\n\n<b>AI：</b> Hello World\n\n✅ worked")
+    );
     assert!(edits[0].buttons.is_some());
 }
 
 #[tokio::test]
-async fn slow_single_character_chunks_wait_for_a_meaningful_stream_update() {
+async fn slow_single_character_chunks_wait_until_finish_without_working_updates() {
     let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
     let recorder = Arc::new(MessageRecorder::new());
     let relay = ChannelStreamRelay::new(
@@ -392,6 +387,32 @@ async fn slow_single_character_chunks_wait_for_a_meaningful_stream_update() {
     for character in "bcdefgh".chars() {
         event_tx.send(text_event(&character.to_string())).unwrap();
     }
+    assert!(
+        recorder.take_edits().is_empty(),
+        "text deltas alone must not emit working updates"
+    );
+
+    event_tx.send(finish_event()).unwrap();
+    relay_task.await.unwrap();
+    let final_edits = recorder.take_edits();
+    assert_eq!(final_edits.len(), 1);
+    assert_eq!(
+        final_edits[0].text.as_deref(),
+        Some("<b>项目：</b> Test question\n\n<b>AI：</b> abcdefgh\n\n✅ worked")
+    );
+}
+
+#[tokio::test]
+async fn dingtalk_step_boundary_edits_working_card_before_final_segment() {
+    let (event_tx, rx) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+    let mut config = test_config(PluginType::Dingtalk);
+    config.throttle_ms = 5;
+    let relay_task = tokio::spawn(ChannelStreamRelay::new(config, recorder.clone()).run(rx));
+
+    event_tx.send(text_event("First fragment")).unwrap();
+    event_tx.send(text_event(" and another fragment")).unwrap();
+    event_tx.send(AgentStreamEvent::SegmentBreak).unwrap();
     let streaming_edits = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             let edits = recorder.take_edits();
@@ -402,62 +423,21 @@ async fn slow_single_character_chunks_wait_for_a_meaningful_stream_update() {
         }
     })
     .await
-    .expect("the accumulated stream should eventually be visible");
+    .expect("DingTalk must receive an intermediate edit at the step boundary");
     assert_eq!(streaming_edits.len(), 1);
-    let streaming_text = streaming_edits[0].text.as_deref().unwrap();
-    assert!(streaming_text.ends_with("\n\n⏳ working"));
-    assert!(streaming_text.trim_end_matches("\n\n⏳ working").chars().count() >= 8);
+    assert!(streaming_edits[0].text.as_deref().unwrap().ends_with("\n\n⏳ working"));
+    assert_eq!(streaming_edits[0].buttons, Some(Vec::new()));
 
+    event_tx.send(text_event("Final fragment")).unwrap();
     event_tx.send(finish_event()).unwrap();
     relay_task.await.unwrap();
+    let sends = recorder.take_sends();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[1].text.as_deref(), Some("Final fragment\n\n✅ worked"));
     let final_edits = recorder.take_edits();
-    assert_eq!(final_edits.len(), 1);
-    assert_eq!(final_edits[0].text.as_deref(), Some("abcdefgh\n\n✅ worked"));
-}
-
-#[tokio::test]
-async fn dingtalk_streaming_edits_keep_the_card_open_until_finish() {
-    let (event_tx, rx) = broadcast::channel::<AgentStreamEvent>(64);
-    let recorder = Arc::new(MessageRecorder::new());
-    let mut config = test_config(PluginType::Dingtalk);
-    config.throttle_ms = 5;
-    let relay_task = tokio::spawn(ChannelStreamRelay::new(config, recorder.clone()).run(rx));
-
-    for text in ["First fragment", " and another fragment"] {
-        event_tx.send(text_event(text)).unwrap();
-        let streaming_edits = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                let edits = recorder.take_edits();
-                if !edits.is_empty() {
-                    break edits;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("DingTalk must receive intermediate edits before Finish");
-        assert_eq!(streaming_edits.len(), 1);
-        assert!(streaming_edits[0].text.as_deref().unwrap().ends_with("\n\n⏳ working"));
-        assert!(
-            streaming_edits[0].buttons.is_none(),
-            "an intermediate edit must not finalize the card"
-        );
-    }
-
-    event_tx.send(finish_event()).unwrap();
-    relay_task.await.unwrap();
-    assert_eq!(recorder.take_sends().len(), 1);
-    let final_edits = recorder.take_edits();
-    assert_eq!(final_edits.len(), 1);
-    assert_eq!(
-        final_edits[0].text.as_deref(),
-        Some("First fragment and another fragment\n\n✅ worked")
-    );
     assert!(
-        final_edits[0]
-            .buttons
-            .as_ref()
-            .is_some_and(|buttons| !buttons.is_empty())
+        final_edits.is_empty(),
+        "the working card was already closed at the step boundary"
     );
 }
 
@@ -578,7 +558,7 @@ async fn relay_registers_sent_message_id_and_delivery_window_as_reply_routes() {
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(preview, "你：Test question\n\nAI：Hello");
+    assert_eq!(preview, "项目：Test question\n\nAI：Hello");
 }
 
 #[tokio::test]
@@ -665,11 +645,58 @@ async fn weixin_sends_one_complete_answer_after_tool_call() {
     relay.run(rx).await;
 
     let sends = recorder.take_sends();
-    assert_eq!(sends.len(), 1, "WeChat must send only the final answer: {sends:?}");
+    assert_eq!(
+        sends.len(),
+        2,
+        "WeChat sends one working segment and one final segment: {sends:?}"
+    );
     assert_eq!(
         sends[0].text.as_deref(),
-        Some("**你：** Test question\n\n**AI：** Here is the plan: Done.\n\n✅ worked")
+        Some("**项目：** Test question\n\n**AI：** Here is the plan:\n\n⏳ working")
     );
+    assert_eq!(
+        sends[1].text.as_deref(),
+        Some("**项目：** Test question\n\n**AI：** Done.\n\n✅ worked")
+    );
+}
+
+#[tokio::test]
+async fn repeated_tool_updates_with_the_same_id_do_not_create_extra_segments() {
+    let tool_call = |call_id: &str, status| {
+        AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: call_id.to_owned(),
+            name: "read_file".into(),
+            args: serde_json::Value::Null,
+            status,
+            description: None,
+            parent_call_id: None,
+            input: None,
+            output: None,
+            files: None,
+        })
+    };
+    let (sends, _) = run_recorded_events(
+        PluginType::Weixin,
+        vec![
+            text_event("Before tool."),
+            tool_call("call-1", ToolCallStatus::Running),
+            text_event("After initial update."),
+            tool_call("call-1", ToolCallStatus::Completed),
+            text_event(" Still same step."),
+            tool_call("call-2", ToolCallStatus::Running),
+            text_event("Final."),
+            finish_event(),
+        ],
+    )
+    .await;
+
+    assert_eq!(sends.len(), 3);
+    assert_eq!(sends[0].text.as_deref(), Some("Before tool.\n\n⏳ working"));
+    assert_eq!(
+        sends[1].text.as_deref(),
+        Some("After initial update. Still same step.\n\n⏳ working")
+    );
+    assert_eq!(sends[2].text.as_deref(), Some("Final.\n\n✅ worked"));
 }
 
 #[tokio::test]
@@ -677,7 +704,7 @@ async fn weixin_splits_long_answers_and_keeps_buttons_on_the_final_chunk() {
     let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
     let recorder = Arc::new(MessageRecorder::new());
     let answer = "答".repeat(WEIXIN_MESSAGE_LIMIT);
-    let expected = format!("**你：** Test question\n\n**AI：** {answer}");
+    let prefix = "**项目：** Test question\n\n**AI：** ";
 
     let relay = ChannelStreamRelay::new(
         RelayConfig {
@@ -695,7 +722,9 @@ async fn weixin_splits_long_answers_and_keeps_buttons_on_the_final_chunk() {
     let rx = event_tx.subscribe();
 
     event_tx
-        .send(AgentStreamEvent::Text(TextEventData { content: answer }))
+        .send(AgentStreamEvent::Text(TextEventData {
+            content: answer.clone(),
+        }))
         .unwrap();
     event_tx
         .send(AgentStreamEvent::Finish(FinishEventData { session_id: None }))
@@ -711,11 +740,24 @@ async fn weixin_splits_long_answers_and_keeps_buttons_on_the_final_chunk() {
             .as_deref()
             .is_some_and(|text| text.len() <= WEIXIN_MESSAGE_LIMIT)
     }));
-    let joined = sends
+    assert!(
+        sends
+            .iter()
+            .all(|message| { message.text.as_deref().is_some_and(|text| text.starts_with(prefix)) })
+    );
+    let answer_parts = sends
         .iter()
-        .filter_map(|message| message.text.as_deref())
+        .enumerate()
+        .map(|(index, message)| {
+            let text = message.text.as_deref().unwrap().strip_prefix(prefix).unwrap();
+            if index + 1 == sends.len() {
+                text.strip_suffix("\n\n✅ worked").unwrap_or(text)
+            } else {
+                text.strip_suffix("\n\n⏳ working").unwrap_or(text)
+            }
+        })
         .collect::<String>();
-    assert_eq!(joined, format!("{expected}\n\n✅ worked"));
+    assert_eq!(answer_parts, answer);
     assert!(sends[..sends.len() - 1].iter().all(|message| message.buttons.is_none()));
     assert!(sends.last().is_some_and(|message| message.buttons.is_some()));
 }
@@ -772,7 +814,7 @@ async fn weixin_waits_for_the_whole_turn_after_an_intermediate_finish() {
     assert_eq!(sends.len(), 1);
     assert_eq!(
         sends[0].text.as_deref(),
-        Some("**你：** Test question\n\n**AI：** Preparing. Final answer.\n\n✅ worked")
+        Some("**项目：** Test question\n\n**AI：** Preparing. Final answer.\n\n✅ worked")
     );
 }
 
@@ -861,14 +903,14 @@ async fn lark_sends_one_complete_answer_when_the_turn_finishes_within_the_thrott
     assert_eq!(sends.len(), 1);
     assert_eq!(
         sends[0].text.as_deref(),
-        Some("**你：** 请总结这个文件\n\n**AI：** 文件已总结\n\n✅ worked")
+        Some("**项目：** 请总结这个文件\n\n**AI：** 文件已总结\n\n✅ worked")
     );
     assert!(sends[0].buttons.as_ref().is_some_and(|buttons| !buttons.is_empty()));
     assert!(recorder.take_edits().is_empty());
 }
 
 #[tokio::test]
-async fn lark_streams_into_one_card_after_a_meaningful_fragment() {
+async fn lark_waits_for_finish_before_sending_when_no_step_boundary_arrives() {
     let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
     let recorder = Arc::new(MessageRecorder::new());
     let relay = ChannelStreamRelay::new(
@@ -897,37 +939,30 @@ async fn lark_streams_into_one_card_after_a_meaningful_fragment() {
     for character in "bcdefgh".chars() {
         event_tx.send(text_event(&character.to_string())).unwrap();
     }
-    let streaming_message = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        loop {
-            let sends = recorder.snapshot_sends();
-            if let Some(message) = sends.first() {
-                break message.clone();
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("a meaningful Lark stream fragment should be sent");
-    assert!(streaming_message.text.as_deref().unwrap().ends_with("\n\n⏳ working"));
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        recorder.snapshot_sends().is_empty(),
+        "text deltas alone must not create a Lark message"
+    );
 
     event_tx.send(finish_event()).unwrap();
     relay_task.await.unwrap();
 
     let sends = recorder.take_sends();
-    assert_eq!(sends.len(), 1, "the streamed reply must remain on one Lark card");
+    assert_eq!(sends.len(), 1, "the completed reply must use one Lark card");
     let edits = recorder.take_edits();
-    assert_eq!(edits.len(), 1);
+    assert!(edits.is_empty());
     assert_eq!(
-        edits[0].text.as_deref(),
-        Some("**你：** 请总结这个文件\n\n**AI：** abcdefgh\n\n✅ worked")
+        sends[0].text.as_deref(),
+        Some("**项目：** 请总结这个文件\n\n**AI：** abcdefgh\n\n✅ worked")
     );
-    assert!(edits[0].buttons.as_ref().is_some_and(|buttons| !buttons.is_empty()));
+    assert!(sends[0].buttons.as_ref().is_some_and(|buttons| !buttons.is_empty()));
 }
 
 #[tokio::test]
-async fn telegram_does_not_flush_text_before_tool_call() {
-    // Editable platforms keep one placeholder and update it in place instead
-    // of issuing a new send_message for the buffered text.
+async fn telegram_flushes_text_at_tool_step_boundary() {
+    // Editable platforms keep one placeholder and update it in place when a
+    // tool step closes the accumulated assistant text.
     let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
     let recorder = Arc::new(MessageRecorder::new());
 
@@ -969,8 +1004,14 @@ async fn telegram_does_not_flush_text_before_tool_call() {
     relay.run(rx).await;
 
     let sends = recorder.take_sends();
-    // Only the "Thinking..." placeholder is sent — no flush on non-WeChat.
+    // The placeholder is updated with the text that ended at the tool step.
     assert_eq!(sends.len(), 1, "unexpected extra sends: {:?}", sends);
+    let edits = recorder.take_edits();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(
+        edits[0].text.as_deref(),
+        Some("<b>项目：</b> Test question\n\n<b>AI：</b> Here is the plan:\n\n⏳ working")
+    );
 }
 
 #[tokio::test]
@@ -1116,7 +1157,7 @@ async fn lark_reports_stream_lag_when_no_text_was_received() {
     assert_eq!(sends.len(), 1);
     assert_eq!(
         sends[0].text.as_deref(),
-        Some("**你：** Test question\n\n**AI：** ❌ 回复流中断，请重试")
+        Some("**项目：** Test question\n\n**AI：** ❌ 回复流中断，请重试")
     );
     assert!(sends[0].buttons.is_none(), "interrupted replies must not look complete");
 }

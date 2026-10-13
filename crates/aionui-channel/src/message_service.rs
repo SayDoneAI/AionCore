@@ -63,6 +63,27 @@ impl ChannelMessageService {
         self.conversation_svc.runtime_state()
     }
 
+    /// Resolve the persisted workspace for a conversation so channel replies
+    /// can identify the project that produced them.
+    pub async fn conversation_workspace(
+        &self,
+        owner_user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, ChannelError> {
+        let conversation = self
+            .conversation_svc
+            .get(owner_user_id, conversation_id)
+            .await
+            .map_err(|error| ChannelError::MessageSendFailed(error.to_string()))?;
+        Ok(conversation
+            .extra
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+            .map(str::to_owned))
+    }
+
     /// Deliver a channel-originated tool confirmation through the same
     /// ConversationService path as the desktop UI.
     pub async fn confirm(
@@ -221,6 +242,14 @@ impl ChannelMessageService {
         } else {
             agent_config.backend.as_deref()
         });
+        if let Some(workspace) = session
+            .workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|workspace| !workspace.is_empty())
+        {
+            extra["workspace"] = serde_json::Value::String(workspace.to_owned());
+        }
         if assistant_id.is_none()
             && model_config
                 .as_ref()
