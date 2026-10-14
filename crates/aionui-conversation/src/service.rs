@@ -76,8 +76,8 @@ const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
-pub(crate) const SAYDONE_SKILL_DISCOVERY_CONTEXT: &str = "Before starting a substantive task, use the saydone-skills MCP server tool saydone_skill_search with concise task keywords in Chinese and/or English to find relevant skills. Search matches names and descriptions, without translating between languages. Load matching skill instructions with saydone_skill_read or saydone_skill_select before applying them. Search results contain summaries. If no skill matches, retry once with fewer keywords or the other language, then inspect saydone_skill_list before proceeding without a skill. Reuse instructions already read when they still cover the current task.";
-const SAYDONE_SKILL_DISCOVERY_MCP_NAMES: &[&str] = &[
+const LEGACY_SAYDONE_SKILL_DISCOVERY_CONTEXT: &str = "Before starting a substantive task, use the saydone-skills MCP server tool saydone_skill_search with concise task keywords in Chinese and/or English to find relevant skills. Search matches names and descriptions, without translating between languages. Load matching skill instructions with saydone_skill_read or saydone_skill_select before applying them. Search results contain summaries. If no skill matches, retry once with fewer keywords or the other language, then inspect saydone_skill_list before proceeding without a skill. Reuse instructions already read when they still cover the current task.";
+const SAYDONE_APP_MCP_NAMES: &[&str] = &[
     "saydone-skills",
     "saydone-browser",
     "saydone-image-generation",
@@ -93,13 +93,13 @@ fn is_gemini_agent(agent_type: AgentType, backend: Option<&str>) -> bool {
 
 fn is_saydone_skill_mcp(name: &str) -> bool {
     !name.trim().eq_ignore_ascii_case("saydone-image-generation")
-        && SAYDONE_SKILL_DISCOVERY_MCP_NAMES
+        && SAYDONE_APP_MCP_NAMES
             .iter()
             .any(|known| name.trim().eq_ignore_ascii_case(known))
 }
 
-fn without_saydone_skill_guidance(context: &str) -> Option<String> {
-    let context = context.replace(SAYDONE_SKILL_DISCOVERY_CONTEXT, "");
+fn strip_legacy_skill_discovery_guidance(context: &str) -> Option<String> {
+    let context = context.replace(LEGACY_SAYDONE_SKILL_DISCOVERY_CONTEXT, "");
     let context = context
         .lines()
         .filter(|line| !line.trim().starts_with("The user selected these SayDoneAI skills:"))
@@ -107,6 +107,33 @@ fn without_saydone_skill_guidance(context: &str) -> Option<String> {
         .join("\n");
     let context = context.trim();
     (!context.is_empty()).then(|| context.to_owned())
+}
+
+fn sanitize_legacy_skill_delivery(options: &mut BuildTaskOptions) {
+    let gemini = is_gemini_agent(options.context.agent_type(), build_options_backend(options));
+    if gemini {
+        options.context.skills.clear();
+    }
+
+    let AgentSessionKind::Acp(context) = &mut options.context.kind else {
+        return;
+    };
+    context.config.preset_context = context
+        .config
+        .preset_context
+        .take()
+        .and_then(|context| strip_legacy_skill_discovery_guidance(&context));
+    if !gemini {
+        return;
+    }
+
+    // Gemini does not support the upstream Skill snapshot protocol. Keep this
+    // compatibility guard for restored rows created before native delivery.
+    context.config.skills.clear();
+    context
+        .config
+        .session_mcp_servers
+        .retain(|server| !is_saydone_skill_mcp(&server.name));
 }
 
 #[derive(Debug, Clone)]
@@ -1496,8 +1523,8 @@ impl ConversationService {
                     // Antigravity joins ACP here: both carry rules through the
                     // session-init `preset_context` surface.
                     AgentType::Acp | AgentType::Antigravity => {
-                        // Keep request-specific guidance (such as MCP skill
-                        // discovery) alongside the frozen assistant rules.
+                        // Keep request-specific context alongside the frozen
+                        // assistant rules.
                         let supplemental_context = obj
                             .get("preset_context")
                             .and_then(serde_json::Value::as_str)
@@ -1570,17 +1597,20 @@ impl ConversationService {
             None => (Vec::new(), Vec::new()),
         };
 
-        let initial_skills = if gemini_skills_unsupported {
-            if let Some(obj) = extra.as_object_mut() {
-                let context = obj
-                    .get("preset_context")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(without_saydone_skill_guidance);
-                obj.remove("preset_context");
-                if let Some(context) = context {
+        if let Some(obj) = extra.as_object_mut()
+            && let Some(value) = obj.get("preset_context").and_then(serde_json::Value::as_str)
+        {
+            match strip_legacy_skill_discovery_guidance(value) {
+                Some(context) => {
                     obj.insert("preset_context".to_owned(), serde_json::Value::String(context));
                 }
+                None => {
+                    obj.remove("preset_context");
+                }
             }
+        }
+
+        let initial_skills = if gemini_skills_unsupported {
             Vec::new()
         } else {
             let auto_inject_names = self.skill_resolver.auto_inject_names().await;
@@ -1594,19 +1624,9 @@ impl ConversationService {
             .as_ref()
             .map(PathBuf::from)
             .or_else(|| auto_provisioned_workspace.clone());
-        let mcp_only_skills = self
-            .uses_saydone_mcp_skills(
-                user_id,
-                effective_type,
-                effective_backend.as_deref(),
-                extra.get("agent_id").and_then(serde_json::Value::as_str),
-                extra.get("agent_source").and_then(serde_json::Value::as_str),
-            )
-            .await?;
         if let Some(ws_path) = skill_link_workspace.as_ref()
             && !initial_skills.is_empty()
             && !gemini_skills_unsupported
-            && !mcp_only_skills
             && let Some(rel_dirs) = native_skills_dirs(
                 &self.agent_metadata_repo,
                 user_id,
@@ -5723,7 +5743,7 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options(row, seed)
                 .await?;
-        self.add_saydone_skill_discovery_context(row, &mut options).await?;
+        sanitize_legacy_skill_delivery(&mut options);
         Ok(options)
     }
 
@@ -5738,188 +5758,8 @@ impl ConversationService {
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
                 .build_options_with_workspace_override(row, workspace_override, seed)
                 .await?;
-        self.add_saydone_skill_discovery_context(row, &mut options).await?;
+        sanitize_legacy_skill_delivery(&mut options);
         Ok(options)
-    }
-
-    pub(crate) async fn uses_saydone_mcp_skills(
-        &self,
-        user_id: &str,
-        agent_type: AgentType,
-        backend: Option<&str>,
-        agent_id: Option<&str>,
-        agent_source: Option<&str>,
-    ) -> Result<bool, ConversationError> {
-        if is_gemini_agent(agent_type, backend)
-            || agent_type != AgentType::Acp
-            || agent_source.is_some_and(|source| source != "builtin")
-        {
-            return Ok(false);
-        }
-        let supported_backend = |backend: Option<&str>| {
-            backend.is_some_and(|backend| {
-                matches!(backend.trim().to_ascii_lowercase().as_str(), "codex" | "claude" | "pi")
-            })
-        };
-        if let Some(id) = agent_id.filter(|id| !id.is_empty()) {
-            let metadata = self
-                .agent_metadata_repo
-                .get_for_user(user_id, id)
-                .await
-                .map_err(|error| ConversationError::internal(format!("agent_metadata lookup: {error}")))?;
-            return Ok(metadata.is_some_and(|metadata| {
-                metadata.agent_source == "builtin" && supported_backend(metadata.backend.as_deref())
-            }));
-        }
-
-        // Legacy clients may only persist the backend label. Resolve that
-        // label through the managed metadata catalog before enabling the
-        // SayDone skills MCP; a bare `codex`/`claude`/`pi` value is not enough
-        // to identify a bundled builtin runtime.
-        let Some(backend) = backend.map(str::trim).filter(|backend| !backend.is_empty()) else {
-            return Ok(false);
-        };
-        let backend = backend.to_ascii_lowercase();
-        if !supported_backend(Some(&backend)) {
-            return Ok(false);
-        }
-        let metadata = self
-            .agent_metadata_repo
-            .find_builtin_by_backend_for_user(user_id, &backend)
-            .await
-            .map_err(|error| ConversationError::internal(format!("agent_metadata lookup: {error}")))?;
-        Ok(metadata.is_some_and(|metadata| {
-            metadata.agent_source == "builtin" && supported_backend(metadata.backend.as_deref())
-        }))
-    }
-
-    async fn add_saydone_skill_discovery_context(
-        &self,
-        row: &ConversationRow,
-        options: &mut BuildTaskOptions,
-    ) -> Result<(), ConversationError> {
-        let agent_type = options.context.agent_type();
-        let gemini_skills_unsupported = is_gemini_agent(agent_type, build_options_backend(options));
-        if gemini_skills_unsupported {
-            options.context.skills.clear();
-        }
-        let AgentSessionKind::Acp(context) = &mut options.context.kind else {
-            return Ok(());
-        };
-        if gemini_skills_unsupported {
-            // Apply the same boundary to restored rows and stale task options.
-            context.config.skills.clear();
-            context
-                .config
-                .session_mcp_servers
-                .retain(|server| !is_saydone_skill_mcp(&server.name));
-            context.config.preset_context = context
-                .config
-                .preset_context
-                .as_deref()
-                .and_then(without_saydone_skill_guidance);
-            return Ok(());
-        }
-        let extra: serde_json::Value = serde_json::from_str(&row.extra)
-            .map_err(|error| ConversationError::internal(format!("Invalid conversation extra: {error}")))?;
-        if !self
-            .uses_saydone_mcp_skills(
-                &row.user_id,
-                agent_type,
-                context.config.backend.as_deref(),
-                context.config.agent_id.as_deref(),
-                extra.get("agent_source").and_then(serde_json::Value::as_str),
-            )
-            .await?
-        {
-            return Ok(());
-        }
-
-        // Persisted skills are a UI snapshot, not managed CLI input. Disable
-        // both Core's first-message skill index and native workspace links even
-        // when the MCP server is unavailable; there is no native fallback.
-        options.context.skills.clear();
-        context.config.skills.clear();
-
-        let has_skill_server = context
-            .config
-            .session_mcp_servers
-            .iter()
-            .any(|server| server.name.trim().eq_ignore_ascii_case("saydone-skills"));
-        let repo = self
-            .mcp_server_repo
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned());
-        let rows = match repo {
-            Some(repo) => match repo.list(&row.user_id).await {
-                Ok(rows) => rows,
-                Err(error) => {
-                    warn!(
-                        conversation_id = %row.id,
-                        error = %error,
-                        "skill discovery MCP lookup failed; retaining session MCP snapshot"
-                    );
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
-        };
-        if !has_skill_server
-            && !rows.iter().any(|server| {
-                server.builtin && server.enabled && server.name.trim().eq_ignore_ascii_case("saydone-skills")
-            })
-        {
-            return Ok(());
-        }
-        // Channels, scheduled tasks and teams can bypass the new-chat adapter.
-        // Attach enabled app-owned tools here too so a discovered skill can use
-        // them. Unknown built-ins and unselected user MCPs remain outside this path.
-        for mcp_row in rows.iter().filter(|server| {
-            server.builtin
-                && server.enabled
-                && SAYDONE_SKILL_DISCOVERY_MCP_NAMES
-                    .iter()
-                    .any(|name| server.name.trim().eq_ignore_ascii_case(name))
-        }) {
-            if context
-                .config
-                .session_mcp_servers
-                .iter()
-                .any(|server| server.id == mcp_row.id || server.name.trim().eq_ignore_ascii_case(mcp_row.name.trim()))
-            {
-                continue;
-            }
-            match aionui_ai_agent::mcp_resolve::row_to_session_mcp_server(mcp_row).await {
-                Ok(server) => {
-                    context.config.session_mcp_servers.push(server);
-                }
-                Err(error) => {
-                    warn!(
-                        conversation_id = %row.id,
-                        server_id = %mcp_row.id,
-                        error = %error,
-                        "skill discovery MCP conversion failed; skipping runtime injection"
-                    );
-                }
-            }
-        }
-
-        if context
-            .config
-            .session_mcp_servers
-            .iter()
-            .any(|server| server.name.trim().eq_ignore_ascii_case("saydone-skills"))
-        {
-            let preset_context = context.config.preset_context.get_or_insert_with(String::new);
-            if !preset_context.contains(SAYDONE_SKILL_DISCOVERY_CONTEXT) {
-                if !preset_context.trim().is_empty() {
-                    preset_context.push_str("\n\n");
-                }
-                preset_context.push_str(SAYDONE_SKILL_DISCOVERY_CONTEXT);
-            }
-        }
-        Ok(())
     }
 
     /// Re-read the persisted resume anchor into a turn's `BuildTaskOptions`
@@ -6170,46 +6010,6 @@ impl ConversationService {
             backend.as_ref().and_then(serde_json::Value::as_str),
         ) {
             return;
-        }
-
-        let (agent_id, agent_source) = match &context.kind {
-            AgentSessionKind::Acp(acp) => {
-                let source = serde_json::from_str::<serde_json::Value>(&row.extra)
-                    .ok()
-                    .and_then(|extra| {
-                        extra
-                            .get("agent_source")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    });
-                (acp.config.agent_id.as_deref(), source)
-            }
-            _ => (None, None),
-        };
-        // Managed Codex, Claude Code and SayDone/Pi sessions use the
-        // saydone-skills MCP server exclusively. Keep this guard here as well
-        // as in the options builder so a future runtime entry point cannot
-        // recreate native skill directories from a stale context snapshot.
-        match self
-            .uses_saydone_mcp_skills(
-                &context.conversation.user_id,
-                context.conversation.agent_type,
-                backend.as_ref().and_then(serde_json::Value::as_str),
-                agent_id,
-                agent_source.as_deref(),
-            )
-            .await
-        {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                warn!(
-                    conversation_id = %row.id,
-                    error = %error,
-                    "skipping native skill links because managed CLI detection failed"
-                );
-                return;
-            }
         }
 
         let workspace = PathBuf::from(context.workspace.path.trim());

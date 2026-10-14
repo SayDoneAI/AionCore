@@ -50,9 +50,11 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 
-use crate::service::{ConversationService, SAYDONE_SKILL_DISCOVERY_CONTEXT};
+use crate::service::ConversationService;
 use crate::skill_resolver::{FixedSkillResolver, ResolvedAgentSkill, SkillResolver};
 use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationError};
+
+const LEGACY_SAYDONE_SKILL_DISCOVERY_CONTEXT: &str = "Before starting a substantive task, use the saydone-skills MCP server tool saydone_skill_search with concise task keywords in Chinese and/or English to find relevant skills. Search matches names and descriptions, without translating between languages. Load matching skill instructions with saydone_skill_read or saydone_skill_select before applying them. Search results contain summaries. If no skill matches, retry once with fewer keywords or the other language, then inspect saydone_skill_list before proceeding without a skill. Reuse instructions already read when they still cover the current task.";
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
@@ -759,7 +761,12 @@ fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
         command: backend.map(ToOwned::to_owned),
         args: Some("[]".to_owned()),
         env: Some("[]".to_owned()),
-        native_skills_dirs: None,
+        native_skills_dirs: match backend {
+            Some("claude") => Some(r#"[".claude/skills"]"#.to_owned()),
+            Some("codex") => Some(r#"[".codex/skills"]"#.to_owned()),
+            Some("pi") => Some(r#"[".pi/skills"]"#.to_owned()),
+            _ => None,
+        },
         behavior_policy: None,
         yolo_id: None,
         agent_capabilities: None,
@@ -9058,95 +9065,75 @@ async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_cont
 }
 
 #[tokio::test]
-async fn assistant_backed_acp_build_options_preserve_skill_discovery_context_and_tools() {
-    let discovery_context =
-        format!("{SAYDONE_SKILL_DISCOVERY_CONTEXT}\nThe user selected these SayDoneAI skills: content-diagram-design.");
-    let mcp_names = [
-        "saydone-skills",
-        "saydone-svg-diagram",
-        "saydone-pdf",
-        "saydone-browser",
-    ];
+async fn assistant_backed_acp_build_options_preserve_skill_snapshot_and_tools() {
+    let mcp_names = ["saydone-svg-diagram", "saydone-pdf"];
 
     for backend in ["codex", "claude", "pi"] {
-        for assistant_rules in ["assistant rule body", ""] {
-            let resolver = Arc::new(FixedSkillResolver { names: vec![] });
-            let dispatcher = Arc::new(StaticAssistantDispatcher {
-                rules: std::collections::HashMap::from([("preset-discovery".to_string(), assistant_rules.to_string())]),
-            });
-            let (svc, _broadcaster, repo, definition_repo, _state_repo, _preference_repo) =
-                make_service_with_assistant_support(resolver, dispatcher).await;
-            upsert_test_assistant_definition(
-                &definition_repo,
-                "asstdef_preset_discovery",
-                "preset-discovery",
-                backend,
-                "auto",
-                "auto",
-            )
-            .await;
-            let session_servers: Vec<_> = mcp_names
-                .iter()
-                .map(|name| {
-                    json!({
-                        "id": format!("builtin-{name}"),
-                        "name": name,
-                        "transport": { "type": "stdio", "command": "node", "args": [format!("/builtin/{name}.js")] }
-                    })
+        let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+        let dispatcher = Arc::new(StaticAssistantDispatcher {
+            rules: std::collections::HashMap::from([("preset-skills".to_string(), "assistant rule body".to_string())]),
+        });
+        let (svc, _broadcaster, repo, definition_repo, _state_repo, _preference_repo) =
+            make_service_with_assistant_support(resolver, dispatcher).await;
+        upsert_test_assistant_definition(
+            &definition_repo,
+            "asstdef_preset_skills",
+            "preset-skills",
+            backend,
+            "auto",
+            "auto",
+        )
+        .await;
+        let session_servers: Vec<_> = mcp_names
+            .iter()
+            .map(|name| {
+                json!({
+                    "id": format!("builtin-{name}"),
+                    "name": name,
+                    "transport": { "type": "stdio", "command": "node", "args": [format!("/builtin/{name}.js")] }
                 })
-                .collect();
-            let req: CreateConversationRequest = serde_json::from_value(json!({
-                "assistant": {
-                    "id": "preset-discovery",
-                    "conversation_overrides": { "skill_ids": [] }
-                },
-                "extra": {
-                    "workspace": ensure_test_workspace_path(),
-                    "preset_context": discovery_context,
-                    "preset_enabled_skills": [],
-                    "selected_mcp_server_ids": [],
-                    "selected_session_mcp_servers": session_servers
-                }
-            }))
-            .unwrap();
-            let conv = svc.create("user_1", req).await.unwrap();
-            let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
-            let options = svc.build_task_options(&row).await.unwrap();
-            let expected_context = if assistant_rules.is_empty() {
-                discovery_context.to_owned()
-            } else {
-                format!("{assistant_rules}\n\n{discovery_context}")
-            };
-
-            match options.context.kind {
-                AgentSessionKind::Acp(ctx) => {
-                    assert_eq!(ctx.config.preset_context.as_deref(), Some(expected_context.as_str()));
-                    assert_eq!(
-                        ctx.config
-                            .session_mcp_servers
-                            .iter()
-                            .map(|server| server.name.as_str())
-                            .collect::<Vec<_>>(),
-                        mcp_names
-                    );
-                    assert!(
-                        ctx.config.skills.is_empty(),
-                        "discovery must not preload skill instructions"
-                    );
-                }
-                _ => panic!("test conversation should build ACP options"),
+            })
+            .collect();
+        let req: CreateConversationRequest = serde_json::from_value(json!({
+            "assistant": {
+                "id": "preset-skills",
+                "conversation_overrides": { "skill_ids": ["content-diagram-design"] }
+            },
+            "extra": {
+                "workspace": ensure_test_workspace_path(),
+                "preset_context": "request-specific context",
+                "preset_enabled_skills": ["content-diagram-design"],
+                "selected_mcp_server_ids": [],
+                "selected_session_mcp_servers": session_servers
             }
-            let snapshot = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
-            assert_eq!(
-                snapshot.rules_content,
-                if assistant_rules.is_empty() {
-                    discovery_context.as_str()
-                } else {
-                    assistant_rules
-                },
-                "session-specific context must not replace the assistant rule snapshot"
-            );
+        }))
+        .unwrap();
+        let conv = svc.create("user_1", req).await.unwrap();
+        let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+        let options = svc.build_task_options(&row).await.unwrap();
+
+        assert_eq!(options.context.skills, vec!["content-diagram-design"]);
+        match options.context.kind {
+            AgentSessionKind::Acp(ctx) => {
+                assert_eq!(ctx.config.skills, vec!["content-diagram-design"]);
+                assert_eq!(
+                    ctx.config
+                        .session_mcp_servers
+                        .iter()
+                        .map(|server| server.name.as_str())
+                        .collect::<Vec<_>>(),
+                    mcp_names
+                );
+                assert_eq!(
+                    ctx.config.preset_context.as_deref(),
+                    Some("assistant rule body\n\nrequest-specific context")
+                );
+            }
+            _ => panic!("test conversation should build ACP options"),
         }
+        let snapshot = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
+        assert_eq!(snapshot.rules_content, "assistant rule body");
+        assert_eq!(snapshot.resolved_skill_ids, r#"["content-diagram-design"]"#);
     }
 }
 
@@ -9212,7 +9199,7 @@ async fn configure_skill_discovery_mcp(
 }
 
 #[tokio::test]
-async fn supported_acp_backends_receive_enabled_skill_discovery_mcp_in_both_build_paths() {
+async fn supported_acp_backends_do_not_receive_automatic_skill_discovery_mcp() {
     for backend in ["codex", "claude", "pi"] {
         let resolver = Arc::new(FixedSkillResolver { names: vec![] });
         let dispatcher = Arc::new(StaticAssistantDispatcher {
@@ -9257,7 +9244,7 @@ async fn supported_acp_backends_receive_enabled_skill_discovery_mcp_in_both_buil
         .await;
         let req: CreateConversationRequest = serde_json::from_value(json!({
             "assistant": { "id": "runtime-discovery" },
-            "extra": { "workspace": ensure_test_workspace_path(), "preset_context": "A rule mentions saydone_skill_search." }
+            "extra": { "workspace": ensure_test_workspace_path(), "preset_context": "A normal request context." }
         }))
         .unwrap();
         let conversation = svc.create("user_1", req).await.unwrap();
@@ -9273,31 +9260,20 @@ async fn supported_acp_backends_receive_enabled_skill_discovery_mcp_in_both_buil
         for options in [&options, &runtime_options] {
             match &options.context.kind {
                 AgentSessionKind::Acp(context) => {
-                    let mut names = context
+                    let names = context
                         .config
                         .session_mcp_servers
                         .iter()
                         .map(|server| server.name.as_str())
                         .collect::<Vec<_>>();
-                    names.sort_unstable();
-                    assert_eq!(
-                        names,
-                        [
-                            "saydone-browser",
-                            "saydone-image-generation",
-                            "saydone-skills",
-                            "saydone-svg-diagram",
-                            "saydone-video-generation",
-                            "saydone-wealth"
-                        ]
-                    );
+                    assert!(names.is_empty());
                     assert!(
-                        context
+                        !context
                             .config
                             .preset_context
                             .as_deref()
                             .unwrap_or_default()
-                            .contains(SAYDONE_SKILL_DISCOVERY_CONTEXT)
+                            .contains("saydone_skill_search")
                     );
                 }
                 _ => panic!("test conversation should build ACP options"),
@@ -9353,33 +9329,7 @@ async fn disabled_skill_mcp_and_gemini_do_not_receive_discovery_guidance() {
 }
 
 #[tokio::test]
-async fn legacy_backend_only_discovery_requires_builtin_metadata() {
-    let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver_and_agent_metadata_repo(
-        Arc::new(FixedSkillResolver { names: vec![] }),
-        Arc::new(ClaudeNativeSkillMetadataRepo),
-    );
-
-    assert!(
-        svc.uses_saydone_mcp_skills("user-1", AgentType::Acp, Some(" claude "), None, None)
-            .await
-            .unwrap(),
-        "legacy backend-only builtin sessions should resolve through metadata"
-    );
-    assert!(
-        !svc.uses_saydone_mcp_skills("user-1", AgentType::Acp, Some("codex"), None, None)
-            .await
-            .unwrap(),
-        "a bare supported backend without a builtin metadata row must not enable discovery"
-    );
-    assert!(
-        !svc.uses_saydone_mcp_skills("user-1", AgentType::Acp, Some("gemini"), None, None)
-            .await
-            .unwrap()
-    );
-}
-
-#[tokio::test]
-async fn managed_cli_persisted_skills_never_enter_runtime_or_native_directories() {
+async fn managed_cli_persisted_skills_use_upstream_native_delivery() {
     for (backend, agent_id) in [("codex", "8e1acf31"), ("claude", "2d23ff1c"), ("pi", "agent-pi")] {
         for skills_mcp_enabled in [None, Some(false), Some(true)] {
             let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
@@ -9409,35 +9359,32 @@ async fn managed_cli_persisted_skills_never_enter_runtime_or_native_directories(
                 .unwrap();
 
             for options in [&options, &runtime_options] {
-                assert!(options.context.skills.is_empty(), "Core must not inject a skill index");
+                assert_eq!(options.context.skills, vec!["cron"]);
                 let AgentSessionKind::Acp(context) = &options.context.kind else {
                     panic!("expected ACP build context");
                 };
-                assert!(context.config.skills.is_empty(), "native skill input must be empty");
-                assert_eq!(
-                    context
+                assert_eq!(context.config.skills, vec!["cron"]);
+                assert!(
+                    !context
                         .config
                         .preset_context
                         .as_deref()
                         .unwrap_or_default()
-                        .contains(SAYDONE_SKILL_DISCOVERY_CONTEXT),
-                    skills_mcp_enabled == Some(true)
+                        .contains("saydone_skill_search")
                 );
                 svc.ensure_workspace_skill_links(&row, options).await;
             }
             assert_eq!(response.extra["skills"], json!(["cron"]), "retain the UI snapshot");
-            assert!(links.lock().unwrap().is_empty());
-            for workspace in [workspace, runtime_workspace] {
-                for directory in [".claude/skills", ".codex/skills", ".pi/skills"] {
-                    assert!(!workspace.join(directory).exists());
-                }
-            }
+            assert!(!links.lock().unwrap().is_empty());
+            let native_dir = format!(".{backend}/skills/cron");
+            assert!(workspace.join(&native_dir).exists());
+            assert!(runtime_workspace.join(&native_dir).exists());
         }
     }
 }
 
 #[tokio::test]
-async fn gemini_and_custom_acp_skills_are_outside_managed_discovery() {
+async fn gemini_and_custom_acp_skill_delivery_boundaries() {
     for (backend, source, agent_id) in [
         ("gemini", "builtin", "cc126dd5"),
         ("codex", "custom", "custom-acp-1"),
@@ -9448,7 +9395,6 @@ async fn gemini_and_custom_acp_skills_are_outside_managed_discovery() {
             names: vec!["cron".into()],
         });
         let (svc, _broadcaster, repo, _task_mgr) = make_service_with_resolver(resolver);
-        configure_skill_discovery_mcp(&svc, "user-1", true).await;
         let req: CreateConversationRequest = serde_json::from_value(json!({
             "type": "acp",
             "extra": {
@@ -9477,7 +9423,7 @@ async fn gemini_and_custom_acp_skills_are_outside_managed_discovery() {
                 .preset_context
                 .as_deref()
                 .unwrap_or_default()
-                .contains(SAYDONE_SKILL_DISCOVERY_CONTEXT)
+                .contains("saydone_skill_search")
         );
     }
 }
@@ -9509,7 +9455,7 @@ async fn gemini_create_rejects_skill_injection_and_preserves_ordinary_mcp() {
             "workspace": unique_test_workspace_path("gemini-no-skills"),
             "backend": "gemini", "agent_source": "builtin", "agent_id": "cc126dd5",
             "preset_enabled_skills": ["pdf"], "skills": ["stale-skill"],
-            "preset_context": format!("Ordinary assistant rule.\n\n{SAYDONE_SKILL_DISCOVERY_CONTEXT}\nThe user selected these SayDoneAI skills: pdf."),
+            "preset_context": format!("Ordinary assistant rule.\n\n{LEGACY_SAYDONE_SKILL_DISCOVERY_CONTEXT}\nThe user selected these SayDoneAI skills: pdf."),
             "selected_mcp_server_ids": [], "selected_session_mcp_servers": servers
         }
     })).unwrap();
@@ -9545,6 +9491,33 @@ async fn gemini_create_rejects_skill_injection_and_preserves_ordinary_mcp() {
 }
 
 #[tokio::test]
+async fn create_drops_legacy_skill_discovery_context_when_nothing_remains() {
+    let resolver = Arc::new(FixedSkillResolver { names: vec![] });
+    let (svc, _broadcaster, repo, _task_mgr) = make_service_with_resolver(resolver);
+    let req = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": {
+            "workspace": ensure_test_workspace_path(),
+            "backend": "codex",
+            "agent_source": "builtin",
+            "agent_id": "8e1acf31",
+            "preset_context": LEGACY_SAYDONE_SKILL_DISCOVERY_CONTEXT
+        }
+    }))
+    .unwrap();
+
+    let response = svc.create("user-1", req).await.unwrap();
+
+    assert!(response.extra.get("preset_context").is_none());
+    let row = repo.get("user-1", &response.id).await.unwrap().unwrap();
+    let options = svc.build_task_options(&row).await.unwrap();
+    let AgentSessionKind::Acp(context) = options.context.kind else {
+        panic!("expected ACP build context");
+    };
+    assert!(context.config.preset_context.is_none());
+}
+
+#[tokio::test]
 async fn gemini_restore_discards_stale_skills_and_cannot_recreate_native_links() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
     let links = resolver.links.clone();
@@ -9556,7 +9529,7 @@ async fn gemini_restore_discards_stale_skills_and_cannot_recreate_native_links()
     let mut row = repo.get("user-1", &response.id).await.unwrap().unwrap();
     let mut extra = response.extra;
     extra["skills"] = json!(["cron", "pdf"]);
-    extra["preset_context"] = json!(format!("Keep this rule.\n\n{SAYDONE_SKILL_DISCOVERY_CONTEXT}"));
+    extra["preset_context"] = json!(format!("Keep this rule.\n\n{LEGACY_SAYDONE_SKILL_DISCOVERY_CONTEXT}"));
     extra["session_mcp_servers"] = json!([
         {"id":"builtin-skills", "name":"saydone-skills", "transport":{"type":"stdio", "command":"node", "args":["/skills.js"]}},
         {"id":"builtin-image", "name":"saydone-image-generation", "transport":{"type":"stdio", "command":"node", "args":["/image.js"]}}
@@ -10075,7 +10048,7 @@ async fn create_writes_empty_skills_when_no_auto_inject_and_no_preset() {
 }
 
 #[tokio::test]
-async fn create_keeps_managed_claude_skills_snapshot_without_native_links() {
+async fn create_links_managed_claude_skills_into_custom_workspace() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
     let links = resolver.links.clone();
     let (svc, _broadcaster, _repo, _task_mgr) =
@@ -10093,8 +10066,11 @@ async fn create_keeps_managed_claude_skills_snapshot_without_native_links() {
     let resp = svc.create("user-1", req).await.unwrap();
 
     assert_eq!(resp.extra["skills"], json!(["cron"]));
-    assert!(!workspace.join(".claude/skills/cron").exists());
-    assert!(links.lock().unwrap().is_empty());
+    assert!(workspace.join(".claude/skills/cron").exists());
+    let calls = links.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
+    assert_eq!(calls[0].skill_names, vec!["cron"]);
 }
 
 #[tokio::test]
@@ -10129,7 +10105,7 @@ async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
 }
 
 #[tokio::test]
-async fn warmup_does_not_restore_native_skills_for_managed_claude_custom_workspace() {
+async fn warmup_restores_native_skills_for_managed_claude_custom_workspace() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
     let links = resolver.links.clone();
     let (svc, _broadcaster, _repo, _task_mgr) =
@@ -10147,14 +10123,19 @@ async fn warmup_does_not_restore_native_skills_for_managed_claude_custom_workspa
     .unwrap();
     let resp = svc.create("user-1", req).await.unwrap();
 
-    assert!(!workspace.join(".claude/skills/cron").exists());
+    assert!(workspace.join(".claude/skills/cron").exists());
+    std::fs::remove_dir_all(workspace.join(".claude")).unwrap();
+    links.lock().unwrap().clear();
 
     let task_mgr: Arc<dyn IWorkerTaskManager> =
         Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
     svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
 
-    assert!(!workspace.join(".claude/skills/cron").exists());
-    assert!(links.lock().unwrap().is_empty());
+    assert!(workspace.join(".claude/skills/cron").exists());
+    let calls = links.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].rel_dirs, vec![".claude/skills"]);
+    assert_eq!(calls[0].skill_names, vec!["cron"]);
 }
 
 #[tokio::test]
