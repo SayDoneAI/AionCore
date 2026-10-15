@@ -307,6 +307,52 @@ async fn send_to_agent_warms_cold_task_before_returning_stream_subscription() {
 }
 
 #[tokio::test]
+async fn send_to_agent_preserves_session_workspace_in_conversation_extra() {
+    let db = init_database_memory().await.unwrap();
+    let pool = db.pool().clone();
+    let workspace = std::env::temp_dir().join("aionui-channel-custom-project");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.to_string_lossy().into_owned();
+    let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(RecordingTaskManager::new());
+    let conversation_repo = Arc::new(SqliteConversationRepository::new(pool.clone()));
+    let conversation_svc = Arc::new(ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(TestBroadcaster::new()),
+        Arc::new(NoopSkillResolver),
+        Arc::clone(&task_manager),
+        conversation_repo.clone(),
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
+        Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
+    ));
+    let settings = Arc::new(ChannelSettingsService::new(Arc::new(
+        SqliteClientPreferenceRepository::new(pool),
+    )));
+    let message_svc = ChannelMessageService::new(conversation_svc, Arc::clone(&task_manager), settings);
+    let session = AssistantSessionRow {
+        id: "session-with-workspace".to_owned(),
+        user_id: "channel-user-workspace".to_owned(),
+        agent_type: "aionrs".to_owned(),
+        conversation_id: None,
+        workspace: Some(workspace.clone()),
+        chat_id: Some("workspace-chat".to_owned()),
+        created_at: 1,
+        last_activity: 1,
+    };
+
+    let conversation_id = message_svc
+        .ensure_conversation(TEST_OWNER_USER_ID, &session, PluginType::Telegram)
+        .await
+        .unwrap();
+    let conversation = conversation_repo
+        .get(TEST_OWNER_USER_ID, &conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&conversation.extra).unwrap();
+    assert_eq!(extra["workspace"], workspace);
+}
+
+#[tokio::test]
 async fn managed_channel_runtime_is_prepared_before_agent_warmup() {
     let db = init_database_memory().await.unwrap();
     let pool = db.pool().clone();

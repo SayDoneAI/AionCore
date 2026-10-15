@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use crate::message_service::ChannelMessageService;
 use crate::session::SessionManager;
 use crate::stream_relay::{
     ChannelSender, ChannelStreamRelay, RelayConfig, format_remote_reply, throttle_ms_for_platform,
+    workspace_folder_name,
 };
 use crate::types::{ActionBehavior, OutgoingMessageType, UnifiedIncomingMessage, UnifiedOutgoingMessage};
 
@@ -685,6 +686,20 @@ async fn handle_dispatched(
 
     // Spawn stream relay if we got a subscription
     if let Some(rx) = send_result.stream_rx {
+        let workspace = match msg_svc
+            .conversation_workspace(owner_user_id, &send_result.conversation_id)
+            .await
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                warn!(
+                    conversation_id = %send_result.conversation_id,
+                    error = %error,
+                    "failed to resolve conversation workspace for channel reply"
+                );
+                None
+            }
+        };
         let relay_config = RelayConfig {
             owner_user_id: owner_user_id.to_owned(),
             session_id: session_id.to_owned(),
@@ -696,7 +711,8 @@ async fn handle_dispatched(
             throttle_ms: throttle_ms_for_platform(platform),
         };
         let relay = ChannelStreamRelay::with_session_manager(relay_config, Arc::clone(sender), Arc::clone(session_mgr))
-            .with_runtime_state(msg_svc.runtime_state());
+            .with_runtime_state(msg_svc.runtime_state())
+            .with_workspace(workspace.as_deref());
         relay.run(rx).await;
     } else {
         warn!(
@@ -730,11 +746,21 @@ struct MirrorTurnState {
     latest_user_text: String,
     assistant_text: String,
     assistant_segments: Vec<MirrorTextSegment>,
+    seen_step_keys: HashSet<String>,
+    closed_segment_ids: HashSet<String>,
     excluded_target: Option<ChannelMirrorTargetRef>,
 }
 
-/// Mirrors completed desktop conversations to every authorized channel and
-/// records each delivered message as a future quoted-reply target.
+#[derive(Debug, Clone)]
+struct MirrorSegment {
+    owner_user_id: String,
+    latest_user_text: String,
+    assistant_text: String,
+    excluded_target: Option<ChannelMirrorTargetRef>,
+}
+
+/// Mirrors desktop assistant segments to every authorized channel and records
+/// each delivered message as a future quoted-reply target.
 pub struct ChannelMirrorService {
     channel_repo: Arc<dyn IChannelRepository>,
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -771,6 +797,8 @@ impl ChannelMirrorService {
                 latest_user_text: normalize_mirror_text(text),
                 assistant_text: String::new(),
                 assistant_segments: Vec::new(),
+                seen_step_keys: HashSet::new(),
+                closed_segment_ids: HashSet::new(),
                 excluded_target: Some(excluded_target),
             },
         );
@@ -835,6 +863,8 @@ impl ChannelMirrorService {
                     latest_user_text: normalize_mirror_text(text),
                     assistant_text: String::new(),
                     assistant_segments: Vec::new(),
+                    seen_step_keys: HashSet::new(),
+                    closed_segment_ids: HashSet::new(),
                     excluded_target: previous_exclusion,
                 },
             );
@@ -843,6 +873,16 @@ impl ChannelMirrorService {
 
         if event.name == "message.stream" {
             match event.data.get("type").and_then(serde_json::Value::as_str) {
+                Some(kind) if is_mirror_step_boundary(kind) => {
+                    // Tool/thinking cards are the visible "view steps" boundary:
+                    // close only the text accumulated before this event. Empty
+                    // boundaries do not create a channel message.
+                    if self.mark_step_seen(conversation_id, &event.data, kind)
+                        && let Some(segment) = self.take_pending_segment(conversation_id)
+                    {
+                        self.mirror_segment(conversation_id, &segment, false).await;
+                    }
+                }
                 Some("text" | "content") => {
                     let chunk = event
                         .data
@@ -856,6 +896,33 @@ impl ChannelMirrorService {
                         .get("msg_id")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
+                    let closed_segment = {
+                        let turns = self.turns.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let Some(state) = turns.get(conversation_id) else {
+                            return;
+                        };
+                        replace && !msg_id.is_empty() && state.closed_segment_ids.contains(msg_id)
+                    };
+                    if closed_segment {
+                        // A terminal middleware replacement can arrive for a
+                        // segment that was already sent at a step boundary.
+                        // Send-only channel targets cannot edit that message;
+                        // dropping the stale replacement avoids duplicating the
+                        // already delivered segment at turn completion.
+                        return;
+                    }
+                    if !replace && !msg_id.is_empty() {
+                        let starts_new_segment = {
+                            let turns = self.turns.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            turns.get(conversation_id).is_some_and(|state| {
+                                !state.assistant_text.trim().is_empty()
+                                    && !state.assistant_segments.iter().any(|segment| segment.msg_id == msg_id)
+                            })
+                        };
+                        if starts_new_segment && let Some(segment) = self.take_pending_segment(conversation_id) {
+                            self.mirror_segment(conversation_id, &segment, false).await;
+                        }
+                    }
                     let mut turns = self.turns.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Some(state) = turns.get_mut(conversation_id) {
                         let segment_index = state
@@ -911,30 +978,84 @@ impl ChannelMirrorService {
         }
     }
 
+    fn take_pending_segment(&self, conversation_id: &str) -> Option<MirrorSegment> {
+        let mut turns = self.turns.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = turns.get_mut(conversation_id)?;
+        if state.assistant_text.trim().is_empty() {
+            return None;
+        }
+
+        let segment = MirrorSegment {
+            owner_user_id: state.owner_user_id.clone(),
+            latest_user_text: state.latest_user_text.clone(),
+            assistant_text: std::mem::take(&mut state.assistant_text),
+            excluded_target: state.excluded_target.clone(),
+        };
+        state.closed_segment_ids.extend(
+            state
+                .assistant_segments
+                .iter()
+                .filter(|segment| !segment.msg_id.is_empty())
+                .map(|segment| segment.msg_id.clone()),
+        );
+        state.assistant_segments.clear();
+        Some(segment)
+    }
+
+    fn mark_step_seen(&self, conversation_id: &str, event: &serde_json::Value, kind: &str) -> bool {
+        let mut turns = self.turns.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(state) = turns.get_mut(conversation_id) else {
+            return false;
+        };
+        let Some(key) = mirror_step_key(event, kind) else {
+            // Older or malformed frames may not carry a stable tool/thinking
+            // identity. Treat each such frame as a boundary instead of
+            // collapsing every missing-ID event into one shared key.
+            return true;
+        };
+        state.seen_step_keys.insert(key)
+    }
+
     async fn mirror_completed_turn(&self, conversation_id: &str, state: MirrorTurnState) {
-        let answer = normalize_mirror_text(&state.assistant_text);
+        let segment = MirrorSegment {
+            owner_user_id: state.owner_user_id,
+            latest_user_text: state.latest_user_text,
+            assistant_text: state.assistant_text,
+            excluded_target: state.excluded_target,
+        };
+        self.mirror_segment(conversation_id, &segment, true).await;
+    }
+
+    async fn mirror_segment(&self, conversation_id: &str, segment: &MirrorSegment, completed: bool) {
+        let answer = normalize_mirror_text(&segment.assistant_text);
         if answer.is_empty() {
             return;
         }
-        let exists = self
+        let conversation = self
             .conversation_repo
-            .get(&state.owner_user_id, conversation_id)
+            .get(&segment.owner_user_id, conversation_id)
             .await
             .ok()
-            .flatten()
-            .is_some();
-        if !exists {
-            return;
-        }
+            .flatten();
+        let Some(conversation) = conversation else { return };
+        let project_name = serde_json::from_str::<serde_json::Value>(&conversation.extra)
+            .ok()
+            .and_then(|extra| {
+                extra
+                    .get("workspace")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .and_then(|workspace| workspace_folder_name(Some(&workspace)));
 
-        let plugins = match self.channel_repo.get_all_plugins(&state.owner_user_id).await {
+        let plugins = match self.channel_repo.get_all_plugins(&segment.owner_user_id).await {
             Ok(plugins) => plugins,
             Err(error) => {
                 warn!(error = %error, "failed to list channel plugins for conversation mirror");
                 return;
             }
         };
-        let users = match self.channel_repo.get_all_users(&state.owner_user_id).await {
+        let users = match self.channel_repo.get_all_users(&segment.owner_user_id).await {
             Ok(users) => users,
             Err(error) => {
                 warn!(error = %error, "failed to list channel users for conversation mirror");
@@ -958,7 +1079,7 @@ impl ChannelMirrorService {
             ) {
                 continue;
             }
-            if is_excluded_mirror_target(platform, &user.platform_user_id, state.excluded_target.as_ref()) {
+            if is_excluded_mirror_target(platform, &user.platform_user_id, segment.excluded_target.as_ref()) {
                 continue;
             }
             let Some(plugin_id) = plugin_by_type.get(&user.platform_type) else {
@@ -967,7 +1088,11 @@ impl ChannelMirrorService {
             if !delivered.insert((plugin_id.clone(), user.platform_user_id.clone())) {
                 continue;
             }
-            let mirror_text = format_remote_reply(&state.latest_user_text, &answer, platform);
+            let status = if completed { "✅ worked" } else { "⏳ working" };
+            let mirror_text = format!(
+                "{}\n\n{status}",
+                format_remote_reply(&segment.latest_user_text, project_name.as_deref(), &answer, platform)
+            );
             let outgoing = UnifiedOutgoingMessage {
                 message_type: OutgoingMessageType::Text,
                 text: Some(mirror_text.clone()),
@@ -983,7 +1108,7 @@ impl ChannelMirrorService {
             };
             match self
                 .sender
-                .send_message(&state.owner_user_id, plugin_id, &user.platform_user_id, outgoing)
+                .send_message(&segment.owner_user_id, plugin_id, &user.platform_user_id, outgoing)
                 .await
             {
                 Ok(receipt) => {
@@ -1000,7 +1125,7 @@ impl ChannelMirrorService {
                     };
                     if let Err(error) = self
                         .channel_repo
-                        .upsert_conversation_route(&state.owner_user_id, &route)
+                        .upsert_conversation_route(&segment.owner_user_id, &route)
                         .await
                     {
                         warn!(error = %error, "failed to register mirrored conversation route");
@@ -1020,6 +1145,32 @@ impl ChannelMirrorService {
 
 fn normalize_mirror_text(text: &str) -> String {
     text.replace("\r\n", "\n").trim().to_owned()
+}
+
+fn is_mirror_step_boundary(kind: &str) -> bool {
+    matches!(kind, "thinking" | "tool_call" | "acp_tool_call" | "tool_group")
+}
+
+fn mirror_step_key(event: &serde_json::Value, kind: &str) -> Option<String> {
+    let data = event.get("data");
+    let key = match kind {
+        "thinking" => event.get("msg_id").and_then(serde_json::Value::as_str),
+        "tool_call" => data
+            .and_then(|value| value.get("call_id"))
+            .and_then(serde_json::Value::as_str),
+        "acp_tool_call" => data
+            .and_then(|value| value.get("update"))
+            .and_then(|value| value.get("tool_call_id"))
+            .and_then(serde_json::Value::as_str),
+        "tool_group" => data
+            .and_then(serde_json::Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(|entry| entry.get("call_id"))
+            .and_then(serde_json::Value::as_str),
+        _ => None,
+    };
+    key.filter(|value| !value.is_empty())
+        .map(|value| format!("{kind}:{value}"))
 }
 
 fn mirror_route_chat_id(platform: crate::types::PluginType, platform_user_id: &str) -> String {
@@ -1113,7 +1264,7 @@ mod tests {
                 user_id: "system_default_user".to_owned(),
                 name: "Desktop conversation".to_owned(),
                 r#type: "acp".to_owned(),
-                extra: "{}".to_owned(),
+                extra: r#"{"workspace":"/Users/test/project-a"}"#.to_owned(),
                 model: None,
                 status: Some("pending".to_owned()),
                 source: Some("aionui".to_owned()),
@@ -1258,7 +1409,7 @@ mod tests {
         assert!(
             sends
                 .iter()
-                .all(|(_, _, text)| text == "**你：** Question\n\n**AI：** Answer")
+                .all(|(_, _, text)| text == "**project-a：** Question\n\n**AI：** Answer\n\n✅ worked")
         );
         assert_eq!(
             repo.resolve_conversation_route("system_default_user", "lark", "lark-user", "lark-lark-user",)
@@ -1274,6 +1425,38 @@ mod tests {
                 .as_deref(),
             Some("desktop-conversation")
         );
+    }
+
+    #[tokio::test]
+    async fn missing_step_ids_do_not_merge_later_mirror_segments() {
+        let (service, sender, _repo, _db) = setup_mirror().await;
+
+        service.handle_event(user_event("Question")).await;
+        service.handle_event(stream_event("text", Some("First"))).await;
+        service.handle_event(stream_event("tool_call", None)).await;
+        service.handle_event(stream_event("text", Some("Second"))).await;
+        service.handle_event(stream_event("tool_call", None)).await;
+        service.handle_event(stream_event("text", Some("Final"))).await;
+        service.handle_event(completed_event()).await;
+
+        let mut actual: Vec<String> = sender
+            .sends
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, text)| text.clone())
+            .collect();
+        let mut expected = vec![
+            "**project-a：** Question\n\n**AI：** First\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** First\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** Second\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** Second\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** Final\n\n✅ worked".to_owned(),
+            "**project-a：** Question\n\n**AI：** Final\n\n✅ worked".to_owned(),
+        ];
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
@@ -1362,12 +1545,12 @@ mod tests {
         assert!(
             sends
                 .iter()
-                .all(|(_, _, text)| text == "**你：** Question\n\n**AI：** Final answer")
+                .all(|(_, _, text)| text == "**project-a：** Question\n\n**AI：** Final answer\n\n✅ worked")
         );
     }
 
     #[tokio::test]
-    async fn multi_segment_final_replacements_keep_the_complete_mirrored_answer() {
+    async fn multi_segment_final_replacements_keep_closed_segments_from_duplication() {
         let (service, sender, _repo, _db) = setup_mirror().await;
 
         service.handle_event(user_event("Question")).await;
@@ -1403,12 +1586,131 @@ mod tests {
         }
         service.handle_event(completed_event()).await;
 
-        let sends = sender.sends.lock().unwrap().clone();
-        assert_eq!(sends.len(), 2);
-        assert!(
-            sends
-                .iter()
-                .all(|(_, _, text)| text == "**你：** Question\n\n**AI：** Final AFinal B")
-        );
+        let mut actual: Vec<String> = sender
+            .sends
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, text)| text.clone())
+            .collect();
+        actual.sort();
+        let mut expected = vec![
+            "**project-a：** Question\n\n**AI：** Draft A\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** Draft A\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** Final B\n\n✅ worked".to_owned(),
+            "**project-a：** Question\n\n**AI：** Final B\n\n✅ worked".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn new_text_segment_ids_mirror_independent_segments_without_a_visible_boundary() {
+        let (service, sender, _repo, _db) = setup_mirror().await;
+
+        service.handle_event(user_event("Question")).await;
+        for (msg_id, text) in [("segment-a", "First"), ("segment-b", "Second")] {
+            service
+                .handle_event(WebSocketMessage::new(
+                    "message.stream",
+                    serde_json::json!({
+                        "conversation_id": "desktop-conversation",
+                        "msg_id": msg_id,
+                        "type": "text",
+                        "data": { "content": text },
+                    }),
+                ))
+                .await;
+        }
+        service.handle_event(completed_event()).await;
+
+        let mut actual: Vec<String> = sender
+            .sends
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, text)| text.clone())
+            .collect();
+        actual.sort();
+        let mut expected = vec![
+            "**project-a：** Question\n\n**AI：** First\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** First\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** Second\n\n✅ worked".to_owned(),
+            "**project-a：** Question\n\n**AI：** Second\n\n✅ worked".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn replacements_for_closed_mirror_segments_are_not_sent_again() {
+        let (service, sender, _repo, _db) = setup_mirror().await;
+
+        service.handle_event(user_event("Question")).await;
+        service
+            .handle_event(WebSocketMessage::new(
+                "message.stream",
+                serde_json::json!({
+                    "conversation_id": "desktop-conversation",
+                    "msg_id": "segment-a",
+                    "type": "text",
+                    "data": { "content": "First" },
+                }),
+            ))
+            .await;
+        service.handle_event(stream_event("tool_call", None)).await;
+        service
+            .handle_event(WebSocketMessage::new(
+                "message.stream",
+                serde_json::json!({
+                    "conversation_id": "desktop-conversation",
+                    "msg_id": "segment-b",
+                    "type": "text",
+                    "data": { "content": "Second" },
+                }),
+            ))
+            .await;
+        service
+            .handle_event(WebSocketMessage::new(
+                "message.stream",
+                serde_json::json!({
+                    "conversation_id": "desktop-conversation",
+                    "msg_id": "segment-a",
+                    "type": "content",
+                    "data": { "content": "First rewritten" },
+                    "replace": true,
+                }),
+            ))
+            .await;
+        service
+            .handle_event(WebSocketMessage::new(
+                "message.stream",
+                serde_json::json!({
+                    "conversation_id": "desktop-conversation",
+                    "msg_id": "segment-b",
+                    "type": "content",
+                    "data": { "content": "Second rewritten" },
+                    "replace": true,
+                }),
+            ))
+            .await;
+        service.handle_event(completed_event()).await;
+
+        let mut actual: Vec<String> = sender
+            .sends
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, text)| text.clone())
+            .collect();
+        actual.sort();
+        let mut expected = vec![
+            "**project-a：** Question\n\n**AI：** First\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** First\n\n⏳ working".to_owned(),
+            "**project-a：** Question\n\n**AI：** Second rewritten\n\n✅ worked".to_owned(),
+            "**project-a：** Question\n\n**AI：** Second rewritten\n\n✅ worked".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 }
