@@ -663,6 +663,9 @@ fn split_text_for_limit(text: &str, limit: usize) -> Vec<String> {
     let mut remaining = text;
     // Plugins guard the encoded byte length before their platform request.
     // Split at UTF-8 boundaries so no downstream guard truncates the answer.
+    // Prefer a paragraph, line, or sentence boundary before falling back to a
+    // hard limit; a platform limit should never be the first reason to cut a
+    // readable reply in the middle of a sentence.
     while remaining.len() > limit {
         let boundary = remaining
             .char_indices()
@@ -673,11 +676,8 @@ fn split_text_for_limit(text: &str, limit: usize) -> Vec<String> {
         if boundary == 0 {
             return chunks;
         }
-        let split_at = remaining[..boundary]
-            .rfind('\n')
-            .map(|index| index + 1)
-            .filter(|index| *index > 0)
-            .unwrap_or(boundary);
+        let continuation = remaining[boundary..].chars().next();
+        let split_at = preferred_split_at(&remaining[..boundary], continuation).unwrap_or(boundary);
         chunks.push(remaining[..split_at].to_owned());
         remaining = &remaining[split_at..];
     }
@@ -685,6 +685,51 @@ fn split_text_for_limit(text: &str, limit: usize) -> Vec<String> {
         chunks.push(remaining.to_owned());
     }
     chunks
+}
+
+fn preferred_split_at(text: &str, continuation: Option<char>) -> Option<usize> {
+    // Keep readable units intact whenever the platform limit allows it. Do
+    // not compare all candidates with `max`: a later space inside a sentence
+    // is a worse boundary than an earlier paragraph or sentence ending.
+    if let Some(index) = text.rfind("\n\n") {
+        return Some(index + 2);
+    }
+    if let Some(index) = text.rfind('\n') {
+        return Some(index + 1);
+    }
+    if let Some(index) = last_sentence_boundary(text, continuation) {
+        return Some(index);
+    }
+    if let Some((index, ch)) = text.char_indices().rev().find(|(_, ch)| ch.is_whitespace()) {
+        return Some(index + ch.len_utf8());
+    }
+    None
+}
+
+fn last_sentence_boundary(text: &str, continuation: Option<char>) -> Option<usize> {
+    let trimmed = text.trim_end();
+    for (index, ch) in trimmed.char_indices().rev() {
+        let end = index + ch.len_utf8();
+        let boundary_end = trimmed[end..]
+            .char_indices()
+            .take_while(|(_, suffix)| is_closing_delimiter(*suffix))
+            .last()
+            .map_or(end, |(offset, suffix)| end + offset + suffix.len_utf8());
+        let is_cjk_terminal = matches!(ch, '。' | '！' | '？');
+        let next_char = text[boundary_end..].chars().next().or(continuation);
+        let is_ascii_terminal = matches!(ch, '.' | '!' | '?') && next_char.is_none_or(char::is_whitespace);
+        if is_cjk_terminal || is_ascii_terminal {
+            return Some(boundary_end);
+        }
+    }
+    None
+}
+
+fn is_closing_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        ')' | ']' | '}' | '"' | '\'' | '”' | '’' | '）' | '】' | '》' | '」' | '』'
+    )
 }
 
 fn build_segment_message(text: &str, status: SegmentStatus) -> UnifiedOutgoingMessage {
@@ -835,7 +880,7 @@ impl ChannelSender for MessageRecorder {
 mod tests {
     use super::{
         SegmentStatus, build_initial_working_message, build_segment_message, format_remote_reply,
-        format_remote_reply_chunks, workspace_folder_name,
+        format_remote_reply_chunks, split_text_for_limit, workspace_folder_name,
     };
     use crate::constants::DISCORD_MESSAGE_LIMIT;
     use crate::message_service::ChannelMessageService;
@@ -917,5 +962,42 @@ mod tests {
         assert!(text.len() <= DISCORD_MESSAGE_LIMIT);
         assert!(text.starts_with("**project-a：** question"));
         assert!(text.ends_with("\n\n⏳ working"));
+    }
+
+    #[test]
+    fn answer_chunks_prefer_sentence_boundaries_over_hard_cuts() {
+        let text = "First sentence. Second sentence.";
+        let chunks = split_text_for_limit(text, "First sentence. Second".len());
+
+        assert_eq!(chunks, vec!["First sentence.", " Second sentence."],);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn answer_chunks_prefer_paragraph_boundaries_and_preserve_long_paragraphs() {
+        let text = "第一段已经结束。\n\n第二段内容很长但没有额外换行。";
+        let chunks = split_text_for_limit(text, "第一段已经结束。\n\n".len());
+
+        assert_eq!(chunks.first().map(String::as_str), Some("第一段已经结束。\n\n"));
+        assert_eq!(chunks.concat(), text);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= "第一段已经结束。\n\n".len()));
+    }
+
+    #[test]
+    fn answer_chunks_keep_sentence_closers_together() {
+        let text = "第一句。”第二句内容很长但没有额外换行。";
+        let chunks = split_text_for_limit(text, "第一句。”".len());
+
+        assert_eq!(chunks.first().map(String::as_str), Some("第一句。”"));
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn answer_chunks_do_not_treat_a_truncated_decimal_as_a_sentence_boundary() {
+        let text = "版本 1.2 继续";
+        let chunks = split_text_for_limit(text, "版本 1.".len());
+
+        assert_eq!(chunks.first().map(String::as_str), Some("版本 "));
+        assert_eq!(chunks.concat(), text);
     }
 }

@@ -2838,6 +2838,28 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
     }
 }
 
+/// Return whether a text fragment ends at a boundary suitable for a new reply segment.
+fn text_ends_at_natural_boundary(text: &str) -> bool {
+    let ends_with_line_break = text.trim_end_matches([' ', '\t', '\r']).ends_with('\n');
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if ends_with_line_break || trimmed.ends_with("```") {
+        return true;
+    }
+
+    let terminal = trimmed.chars().rev().find(|ch| !is_closing_delimiter(*ch));
+    matches!(terminal, Some('.' | '!' | '?' | '。' | '！' | '？'))
+}
+
+fn is_closing_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        ')' | ']' | '}' | '"' | '\'' | '”' | '’' | '）' | '】' | '》' | '」' | '』'
+    )
+}
+
 /// Drain the backend's `events()` and re-broadcast each as an `AgentStreamEvent`.
 /// Project the direct-CLI catalog into a WHOLE `acp_config_option` snapshot and
 /// broadcast it.
@@ -3029,9 +3051,12 @@ fn spawn_event_pump(
         // events are observed, reset at the per-turn terminal (with `tool_output`/`tool_name`).
         let mut saw_visible_output = false;
         // Preserve assistant item boundaries before the stateless translation
-        // discards item_id. Deltas of one item stay in the same text segment;
-        // only a different nonempty item opens another segment.
+        // discards item_id. A new item is only allowed to open another text
+        // segment after the previous item reached a natural boundary. Closing
+        // delimiters may arrive in a later delta, so they must not erase the
+        // boundary already established by the item's preceding text.
         let mut last_text_item_id: Option<String> = None;
+        let mut last_text_item_ended_naturally = false;
         // Did the CURRENT turn already reach a terminal `TurnResult`? Mirrors the
         // reducer's `Running{terminal_result_seen}` flag. The pump consumes RAW
         // pre-reducer events, so to classify a `Detached` the way the reducer's
@@ -3162,6 +3187,7 @@ fn spawn_event_pump(
                 runtime.set_status(ConversationStatus::Running);
                 terminal_result_seen = false;
                 last_text_item_id = None;
+                last_text_item_ended_naturally = false;
                 // Per-turn workflow-suppression state must not leak across turns —
                 // same rationale as the TurnStarted arm below, which claude never
                 // reaches.
@@ -3247,10 +3273,15 @@ fn spawn_event_pump(
                 && !text.is_empty()
                 && !item_id.is_empty()
             {
-                if last_text_item_id.as_ref().is_some_and(|previous| previous != item_id) {
+                if last_text_item_id.as_ref().is_some_and(|previous| previous != item_id)
+                    && last_text_item_ended_naturally
+                {
                     runtime.emit(AgentStreamEvent::SegmentBreak);
                 }
                 last_text_item_id = Some(item_id.clone());
+                if !text.chars().all(|ch| ch.is_whitespace() || is_closing_delimiter(ch)) {
+                    last_text_item_ended_naturally = text_ends_at_natural_boundary(text);
+                }
             }
 
             // Empty-turn diagnostic Tip to emit for THIS terminal, if the turn was a
@@ -3529,6 +3560,7 @@ fn spawn_event_pump(
                             tool_name.clear();
                             saw_visible_output = false;
                             last_text_item_id = None;
+                            last_text_item_ended_naturally = false;
                             // Idempotent clean-converge shared with the watchdog kill
                             // path: sets status Finished + broadcasts the Finish that
                             // drives relay break → turn release → `cancelling` cleared.
@@ -3561,6 +3593,7 @@ fn spawn_event_pump(
                 SessionEvent::TurnStarted { .. } => {
                     runtime.set_status(ConversationStatus::Running);
                     last_text_item_id = None;
+                    last_text_item_ended_naturally = false;
                     // New turn: the prior turn's terminal no longer applies.
                     terminal_result_seen = false;
                     // Per-turn workflow-suppression state must not leak across turns:
@@ -3680,6 +3713,7 @@ fn spawn_event_pump(
                     }
                     finish_suppressed_pending = false;
                     last_text_item_id = None;
+                    last_text_item_ended_naturally = false;
                     if let Some((diff_turn_gen, diff, call_id)) = live_turn_diff.take()
                         && let Some(event) = codex_live_diff_event(
                             &conversation_id,
@@ -3890,6 +3924,7 @@ fn spawn_event_pump(
                     finish_suppressed_pending = true;
                     runtime.emit(AgentStreamEvent::SegmentBreak);
                     last_text_item_id = None;
+                    last_text_item_ended_naturally = false;
                     continue;
                 }
                 // Stamp the CLI session id onto the Finish frame, matching the ACP path
@@ -8610,6 +8645,67 @@ mod pump_tests {
             }
         }
         assert_eq!(segments, vec!["Before tools.", "Final answer."]);
+    }
+
+    #[tokio::test]
+    async fn assistant_item_boundary_does_not_cut_an_incomplete_sentence() {
+        let frames = drain_script(vec![
+            env(text_delta("first", "当前")),
+            env(text_delta("second", "工作区还在准备中。")),
+            env(clean_turn_result()),
+        ])
+        .await;
+        let projected: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::Text(data) if !data.content.is_empty() => Some(data.content.clone()),
+                AgentStreamEvent::SegmentBreak => Some("<segment>".into()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(projected, vec!["当前".to_owned(), "工作区还在准备中。".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn assistant_item_boundary_recognizes_line_break_as_natural_boundary() {
+        let frames = drain_script(vec![
+            env(text_delta("first", "步骤一\n")),
+            env(text_delta("second", "步骤二")),
+            env(clean_turn_result()),
+        ])
+        .await;
+        let projected: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                AgentStreamEvent::Text(data) if !data.content.is_empty() => Some(data.content.clone()),
+                AgentStreamEvent::SegmentBreak => Some("<segment>".into()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            projected,
+            vec!["步骤一\n".to_owned(), "<segment>".to_owned(), "步骤二".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn assistant_item_boundary_keeps_late_closing_delimiter_with_sentence() {
+        let frames = drain_script(vec![
+            env(text_delta("first", "第一句。")),
+            env(text_delta("first", "”")),
+            env(text_delta("second", "第二句。")),
+            env(clean_turn_result()),
+        ])
+        .await;
+        let mut segments = vec![String::new()];
+        for frame in frames {
+            match frame {
+                AgentStreamEvent::Text(data) => segments.last_mut().unwrap().push_str(&data.content),
+                AgentStreamEvent::SegmentBreak => segments.push(String::new()),
+                _ => {}
+            }
+        }
+        assert_eq!(segments, vec!["第一句。”", "第二句。"]);
     }
 
     #[tokio::test]

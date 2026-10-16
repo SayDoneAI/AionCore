@@ -203,6 +203,21 @@ async fn editable_platforms_preserve_long_unicode_answers_within_the_byte_limit(
     }
 }
 
+#[tokio::test]
+async fn relay_keeps_sentence_closers_in_the_same_long_answer_chunk() {
+    let answer = format!("第一句。”{}", "后续内容".repeat(2_000));
+    let (sends, edits) = run_recorded_events(PluginType::Telegram, vec![text_event(&answer), finish_event()]).await;
+    let chunks: Vec<_> = edits.iter().chain(sends.iter().skip(1)).collect();
+
+    assert!(chunks.len() > 1);
+    assert_eq!(
+        chunks.first().and_then(|message| message.text.as_deref()),
+        Some("第一句。”")
+    );
+    let joined: String = chunks.iter().filter_map(|message| message.text.as_deref()).collect();
+    assert_eq!(joined, format!("{answer}\n\n✅ worked"));
+}
+
 struct FailingSender {
     recorder: MessageRecorder,
     send_failures: std::sync::atomic::AtomicUsize,
