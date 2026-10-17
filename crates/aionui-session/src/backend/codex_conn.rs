@@ -2400,20 +2400,19 @@ async fn reader_task(
                                     .get("goal")
                                     .and_then(|value| value.get("status"))
                                     .and_then(Value::as_str),
-                            ) {
-                                if let Some(ev) = goal.lock().await.observe_goal(status) {
-                                    *active_turn_id.lock().await = None;
-                                    turn_in_flight.store(false, Ordering::SeqCst);
-                                    if let SessionEvent::TurnResult {
-                                        is_error: false,
-                                        result_text,
-                                        ..
-                                    } = &ev
-                                    {
-                                        title_gen.fire(&session_id, result_text, &event_tx, cur);
-                                    }
-                                    emit(&event_tx, &session_id, cur, ev);
+                            ) && let Some(ev) = goal.lock().await.observe_goal(status)
+                            {
+                                *active_turn_id.lock().await = None;
+                                turn_in_flight.store(false, Ordering::SeqCst);
+                                if let SessionEvent::TurnResult {
+                                    is_error: false,
+                                    result_text,
+                                    ..
+                                } = &ev
+                                {
+                                    title_gen.fire(&session_id, result_text, &event_tx, cur);
                                 }
+                                emit(&event_tx, &session_id, cur, ev);
                             }
                             // Goal updates are consumed by the backend's logical
                             // turn coalescer. They are not ordinary message
