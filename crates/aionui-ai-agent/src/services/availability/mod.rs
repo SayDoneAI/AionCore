@@ -485,6 +485,7 @@ mod tests {
             args: Some("[]"),
             env: Some("[]"),
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: None,
             yolo_id: None,
             agent_capabilities: None,
@@ -559,6 +560,7 @@ mod tests {
             args: Some("[]"),
             env: Some("[]"),
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: None,
             yolo_id: None,
             agent_capabilities: None,
@@ -641,6 +643,7 @@ mod tests {
             args: vec!["--yes".into(), "@agentclientprotocol/claude-agent-acp@0.58.1".into()],
             env: vec![],
             native_skills_dirs: Some(vec![".claude/skills".into()]),
+            skill_delivery: None,
             behavior_policy: BehaviorPolicy::default(),
             yolo_id: Some("bypassPermissions".into()),
             sort_order: 3100,
@@ -686,7 +689,7 @@ mod tests {
         pi.agent_source_info.binary_name = Some("pi".into());
         pi.agent_source_info.bridge_binary = Some("npx".into());
         pi.args = vec!["-y".into(), "pi-acp".into()];
-        assert_eq!(explicit_probe_args(&pi).unwrap(), ["-y", "pi-acp@0.0.33"]);
+        assert_eq!(explicit_probe_args(&pi).unwrap(), ["-y", "pi-acp@0.0.34"]);
     }
 
     // ---- #675: manual health check runs --version for direct CLIs and is
@@ -721,6 +724,7 @@ mod tests {
             args: Some("[]"),
             env: Some("[]"),
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: None,
             yolo_id: None,
             agent_capabilities: None,
@@ -836,6 +840,7 @@ mod tests {
                 args: Some("[]"),
                 env: Some("[]"),
                 native_skills_dirs: None,
+                skill_delivery: None,
                 behavior_policy: None,
                 yolo_id: None,
                 agent_capabilities: None,
@@ -907,6 +912,7 @@ mod tests {
             args: vec![],
             env: vec![],
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: BehaviorPolicy::default(),
             yolo_id: None,
             sort_order: 0,

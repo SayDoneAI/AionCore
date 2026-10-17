@@ -677,6 +677,7 @@ fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>)
         args: meta.args,
         env: Vec::new(),
         native_skills_dirs: meta.native_skills_dirs,
+        skill_delivery: meta.skill_delivery,
         behavior_policy: meta.behavior_policy,
         yolo_id: meta.yolo_id,
         config_options: handshake.config_options.clone(),
@@ -733,6 +734,9 @@ fn same_runtime_availability_inputs(a: &AgentMetadata, b: &AgentMetadata) -> boo
         && a.args == b.args
         && json_values_equal(&a.env, &b.env)
         && a.native_skills_dirs == b.native_skills_dirs
+        // Spawn-relevant, exactly like `args`: an `argv`-mode row appends launch
+        // flags, so a change here must not reuse a snapshot taken without them.
+        && a.skill_delivery == b.skill_delivery
         && json_values_equal(&a.behavior_policy, &b.behavior_policy)
         && a.yolo_id == b.yolo_id
 }
@@ -786,6 +790,7 @@ fn decode_row(
     let args = decode_json_field::<Vec<String>>(row.args.as_deref(), "args").unwrap_or_default();
     let env = decode_json_field::<Vec<AgentEnvEntry>>(row.env.as_deref(), "env").unwrap_or_default();
     let native_skills_dirs = decode_json_field::<Vec<String>>(row.native_skills_dirs.as_deref(), "native_skills_dirs");
+    let skill_delivery = Some(decode_skill_delivery(&row.id, row.skill_delivery.as_deref()));
     let behavior_policy =
         decode_json_field(row.behavior_policy.as_deref(), "behavior_policy").unwrap_or_else(BehaviorPolicy::default);
 
@@ -836,6 +841,7 @@ fn decode_row(
         args,
         env,
         native_skills_dirs,
+        skill_delivery,
         behavior_policy,
         yolo_id: row.yolo_id,
         sort_order: row.sort_order,
@@ -1408,6 +1414,40 @@ pub(crate) fn guidance_for_snapshot_error_code(error_code: &str) -> &'static str
     }
 }
 
+/// Decode `agent_metadata.skill_delivery`, deliberately NOT through
+/// [`decode_json_field`].
+///
+/// That helper logs one "failed to decode JSON column" line for every problem,
+/// which would merge two situations that need opposite responses:
+///   * an unknown `mode` means a NEWER registry wrote this row — expected, the
+///     fix is to upgrade, and the delivery still degrades safely to `injected`;
+///   * malformed JSON means damaged data — an anomaly worth investigating.
+///
+/// Sharing one line makes a registry rollout problem impossible to triage, so
+/// each gets its own message and the unknown-mode one carries the actual value.
+fn decode_skill_delivery(agent_id: &str, raw: Option<&str>) -> aionui_api_types::SkillDelivery {
+    match aionui_api_types::parse_skill_delivery(raw) {
+        aionui_api_types::SkillDeliveryParse::Ok(delivery) => delivery,
+        aionui_api_types::SkillDeliveryParse::UnknownMode { raw_mode, delivery } => {
+            warn!(
+                agent_id,
+                unknown_mode = %raw_mode,
+                "agent_metadata.skill_delivery: unrecognized mode from a newer registry; \
+                 falling back to injected"
+            );
+            delivery
+        }
+        aionui_api_types::SkillDeliveryParse::Malformed { error } => {
+            warn!(
+                agent_id,
+                error = %error,
+                "agent_metadata.skill_delivery: malformed JSON; falling back to injected"
+            );
+            aionui_api_types::SkillDelivery::injected_default()
+        }
+    }
+}
+
 fn decode_json_field<T: serde::de::DeserializeOwned>(raw: Option<&str>, field: &str) -> Option<T> {
     raw.and_then(|s| match serde_json::from_str(s) {
         Ok(v) => Some(v),
@@ -1604,7 +1644,7 @@ mod tests {
         // when none of the CLIs are installed on the test host.
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
-        assert_eq!(all.len(), 43, "seed rows: 42 pre-existing + antigravity");
+        assert_eq!(all.len(), 44, "seed rows: 42 pre-existing + antigravity + minimax-code");
     }
 
     #[tokio::test]
@@ -1732,7 +1772,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("missing release lock for {backend}: {error}"));
             locked += 1;
         }
-        assert_eq!(locked, 12);
+        assert_eq!(locked, 13);
     }
 
     /// On a host that has *none* of the seeded CLIs installed, the
@@ -1767,7 +1807,7 @@ mod tests {
         let reg = registry().await;
         let all = reg.list_all_including_hidden().await;
         let count = |t: AgentType| all.iter().filter(|m| m.agent_type == t).count();
-        assert_eq!(count(AgentType::Acp), 39);
+        assert_eq!(count(AgentType::Acp), 40);
         assert_eq!(count(AgentType::Nanobot), 1);
         assert_eq!(count(AgentType::OpenclawGateway), 1);
         assert_eq!(count(AgentType::Aionrs), 1);
@@ -1989,7 +2029,7 @@ mod tests {
     async fn diagnostic_snapshot_pairs_rows_with_reasons() {
         let reg = registry().await;
         let snapshot = reg.diagnostic_snapshot().await;
-        assert_eq!(snapshot.len(), 43, "every row appears once");
+        assert_eq!(snapshot.len(), 44, "every row appears once");
 
         for (meta, reason) in &snapshot {
             match (meta.available, reason) {
@@ -2095,6 +2135,7 @@ mod tests {
             args: None,
             env: None,
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: None,
             yolo_id: None,
             agent_capabilities: None,
@@ -2142,6 +2183,7 @@ mod tests {
             args: None,
             env: None,
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: None,
             yolo_id: None,
             agent_capabilities: None,
@@ -2198,6 +2240,7 @@ mod tests {
             args: None,
             env: Some(r#"[{"name":"BASE","value":"seed","description":""}]"#.to_string()),
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: None,
             yolo_id: None,
             agent_capabilities: None,

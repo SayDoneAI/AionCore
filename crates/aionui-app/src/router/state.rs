@@ -42,6 +42,7 @@ use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
 use aionui_shell::ShellRouterState;
 use aionui_sidebar::{ArchiveTeardownPorts, SidebarRouterState, SidebarService};
+use aionui_skill_runtime::{SkillRuntimeRouterState, SkillRuntimeService};
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
     ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
@@ -144,6 +145,7 @@ pub struct ModuleStates {
     pub channel: ChannelRouterState,
     pub team: TeamRouterState,
     pub session_message: SessionMessageRouterState,
+    pub skill_runtime: SkillRuntimeRouterState,
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
@@ -281,7 +283,7 @@ pub async fn build_module_states(
 
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool.clone()));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         services.event_bus.clone(),
@@ -330,6 +332,7 @@ pub async fn build_module_states(
             )
         }),
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
+        skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
@@ -375,6 +378,21 @@ pub async fn build_module_states(
 /// The drainer is spawned here rather than in `routes.rs` because this is where
 /// this crate already starts background work — see
 /// `spawn_assistant_mcp_binding_watcher`, called from `build_assistant_state`.
+/// Channel A's state. Read-only, so it takes the conversation repo (for the
+/// snapshot allow-list), the skill paths + repo (to resolve and read), and the
+/// runtime token service (to authenticate). Deliberately NOT the skill WRITE
+/// surface's state: this domain can never import, delete, or enable a skill.
+pub fn build_skill_runtime_state(services: &AppServices) -> SkillRuntimeRouterState {
+    SkillRuntimeRouterState {
+        service: Arc::new(SkillRuntimeService::new(
+            services.conversation_repo.clone(),
+            services.skill_paths.clone(),
+            services.skill_repo.clone(),
+        )),
+        runtime_token_service: services.runtime_token_service.clone(),
+    }
+}
+
 pub fn build_session_message_state(services: &AppServices) -> SessionMessageRouterState {
     let state = SessionMessageRouterState {
         service: services.session_message_service.clone(),
@@ -461,7 +479,7 @@ pub fn build_assistant_state(services: &AppServices) -> AssistantRouterState {
 
 /// Build the default `SystemRouterState` from application services.
 pub fn build_system_state(services: &AppServices) -> SystemRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let pool = services.database.pool().clone();
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
     let http_client = reqwest::Client::new();
@@ -510,7 +528,7 @@ pub fn build_conversation_state(
 
 /// Build the default `RemoteAgentRouterState` from application services.
 pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
     let pool = services.database.pool().clone();
     let repo = Arc::new(SqliteRemoteAgentRepository::new(pool));
     RemoteAgentRouterState {
@@ -810,7 +828,7 @@ pub async fn build_channel_state(
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn aionui_db::IChannelRepository> = Arc::new(aionui_db::SqliteChannelRepository::new(pool));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = derive_encryption_key(&services.encryption_secret_raw);
 
     let (message_tx, message_rx) = tokio::sync::mpsc::channel(256);
     let (confirm_tx, confirm_rx) = tokio::sync::mpsc::channel(256);

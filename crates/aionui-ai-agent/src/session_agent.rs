@@ -146,8 +146,9 @@ struct SessionRuntime {
     /// The pump needs these because a pushed frame REPLACES the frontend's whole
     /// snapshot, so every axis it re-sends overwrites the picker — including axes the
     /// user never touched, whose override is `None`. Without this the effort level went
-    /// blank on every mode confirmation. Filled by `get_config_options`, which is the one
-    /// place holding both the backend handle and the same fallback order.
+    /// blank on every mode confirmation. Filled by `prime_caps_fallback` (at `build()` and
+    /// on every `get_config_options`), which holds both the backend handle and the same
+    /// fallback order.
     /// Order is `override → this`, identical to REST.
     caps_fallback: std::sync::Mutex<CapsFallback>,
 }
@@ -694,15 +695,7 @@ impl SessionAgentTask {
         // stream to the pump — never a backend Arc (see `spawn_event_pump` for why
         // capturing a backend Arc there would leak the child process).
         let events = backend.events();
-        spawn_event_pump(
-            events,
-            runtime.clone(),
-            conversation_id.clone(),
-            user_id.clone(),
-            session_repo.clone(),
-            broadcaster,
-        );
-        Arc::new(Self {
+        let task = Arc::new(Self {
             agent_type,
             conversation_id,
             user_id,
@@ -713,7 +706,25 @@ impl SessionAgentTask {
             catalog_preload,
             command_seq: AtomicI64::new(0),
             prompt_dump,
-        })
+        });
+        // Seed the pump's fallback now: a task rebuilt by `send_message` (idle reclaim)
+        // never goes through REST `get_config_options`, so the `CatalogUpdated` frame
+        // would otherwise carry `None` for every untouched axis and the frontend would
+        // fall back to the creation-time model. `open_session` has already written the
+        // spawn model/mode into `capabilities()`, and this is seeded before the pump
+        // starts consuming, so ordering is by construction. It MUST reuse
+        // `effective_catalog()` — a separate lookup would give the pump frame and REST
+        // two sources of truth.
+        task.prime_caps_fallback();
+        spawn_event_pump(
+            events,
+            task.runtime.clone(),
+            task.conversation_id.clone(),
+            task.user_id.clone(),
+            task.session_repo.clone(),
+            broadcaster,
+        );
+        task
     }
 
     fn next_command_id(&self) -> u64 {
@@ -1153,22 +1164,23 @@ impl SessionAgentTask {
         &self.runtime
     }
 
-    /// Config-options (mode + model selects). For each select the optimistic override
-    /// (last set_config_option) wins over the capabilities snapshot's current_value —
-    /// this is what makes set_config_option's observed re-read succeed (the snapshot
-    /// lags an in-band claude switch).
-    pub async fn get_config_options(&self) -> Result<aionui_api_types::GetConfigOptionsResponse, AgentError> {
-        // Live catalog wins; cold-start resume falls back to the persisted-handshake
-        // preload (per-axis) so the picker renders before the initialize round-trip lands.
+    /// Mirror `effective_catalog()` into the runtime for the backend-Arc-free event pump,
+    /// returning the same tuple for the caller's own use. Runs at `build()` and on every
+    /// REST `get_config_options`, both from the one source so their values agree.
+    fn prime_caps_fallback(
+        &self,
+    ) -> (
+        Vec<aionui_session::ModelInfo>,
+        Option<String>,
+        Vec<aionui_session::ModeInfo>,
+        Option<String>,
+    ) {
         let (models, current_model, modes, current_mode) = self.effective_catalog();
-        // The effort catalog depends on the EFFECTIVE current model (override wins over the
-        // snapshot's current_model), resolved before the model option consumes it below.
-        let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
         // Mirror what the BACKEND reports into the runtime so the event pump can apply the
         // same `override → caps` fallback when it re-projects this snapshot. The pump holds
         // no backend Arc and would otherwise send `None` for every axis the user never
         // picked — and since the frontend REPLACES its whole snapshot on that frame, those
-        // pickers would go blank (this is the one path that sees both sides).
+        // pickers would go blank.
         self.runtime.set_caps_fallback(CapsFallback {
             mode: current_mode.clone(),
             model: current_model.clone(),
@@ -1178,11 +1190,24 @@ impl SessionAgentTask {
         // WHOLE snapshot, and the pump can only do that from a catalog it was handed.
         // `CatalogUpdated` is not a reliable supply — agy emits none at all (its modes are
         // static), so gating on it left agy's picker stuck on "switching…" with no signal
-        // that could ever clear it. This path always runs first: the frontend reads
-        // config-options on mount, before any switch is possible.
+        // that could ever clear it.
         if !modes.is_empty() || !models.is_empty() {
             self.runtime.set_last_catalog(modes.clone(), models.clone());
         }
+        (models, current_model, modes, current_mode)
+    }
+
+    /// Config-options (mode + model selects). For each select the optimistic override
+    /// (last set_config_option) wins over the capabilities snapshot's current_value —
+    /// this is what makes set_config_option's observed re-read succeed (the snapshot
+    /// lags an in-band claude switch).
+    pub async fn get_config_options(&self) -> Result<aionui_api_types::GetConfigOptionsResponse, AgentError> {
+        // Live catalog wins; cold-start resume falls back to the persisted-handshake
+        // preload (per-axis) so the picker renders before the initialize round-trip lands.
+        let (models, current_model, modes, current_mode) = self.prime_caps_fallback();
+        // The effort catalog depends on the EFFECTIVE current model (override wins over the
+        // snapshot's current_model), resolved before the model option consumes it below.
+        let effective_model = self.runtime.model_override().or_else(|| current_model.clone());
         let mut config_options = Vec::new();
         if !modes.is_empty() {
             config_options.push(aionui_api_types::AcpConfigOptionDto {
@@ -1765,6 +1790,11 @@ pub struct SessionBuildInputs<'a> {
     /// generic alias resumes by handing the raw alias to the backend (claude rejects
     /// an unknown permission-mode id; codex gets a non-native mode → wrong policy).
     pub metadata: &'a aionui_api_types::AgentMetadata,
+    /// This conversation's resolved skill delivery: the already-substituted
+    /// launch flags for an `argv` vendor, the skills root for a `protocol` one,
+    /// and the real skill source dirs. Resolved by the factory so this function
+    /// stays free of skill-resolution I/O.
+    pub skill_delivery: crate::factory::ResolvedSkillDelivery,
     /// The persisted runtime snapshot, when present. Its `current_mode_id` /
     /// `current_model_id` are the interactive-switch-persisted selections and take
     /// precedence over the create-time `config` values — the same precedence
@@ -1914,11 +1944,58 @@ fn spec_mode_model(
     // through unchanged. Runs BEFORE the codex sandbox/approval derivation downstream
     // (which matches both the alias and the native id, so ordering is safe).
     let mode = resolved_session_mode(config, session_snapshot, metadata);
-    let model = session_snapshot
-        .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
-        .or_else(|| config.current_model_id.clone())
-        .filter(|s| !s.is_empty());
+    // Same drop-if-not-in-catalog discipline the mode path applies: a persisted
+    // selection outlives the catalog it came from, and no backend validates a model id
+    // at spawn — claude in particular ACCEPTS a bogus id and only fails once the user
+    // sends a message (LIVE-PROBED 2.1.231: both `--model <bogus>` and
+    // `set_model{<bogus>}` echo the id into `system.init.model`, then the turn dies with
+    // `result{is_error:true}`). Dropping it here turns that into a silent fall back to
+    // the agent's default, which is the difference between "my old pick quietly stopped
+    // applying" and "every message errors".
+    let model = clear_stale_model(
+        metadata,
+        session_snapshot
+            .and_then(|s| s.current_model_id.as_ref().map(|m| m.as_str().to_owned()))
+            .or_else(|| config.current_model_id.clone())
+            .filter(|s| !s.is_empty()),
+        conversation_id,
+    );
     (spec, mode, model)
+}
+
+/// Drop a model selection the agent's advertised catalog does not contain.
+///
+/// Pass-through when the catalog is absent or empty — that is the first-ever open of an
+/// agent (nothing handshaked yet), NOT evidence that the selection is invalid. Only a
+/// non-empty catalog that lacks the id is proof, and the id can legitimately go stale:
+/// the concrete rows depend on the user's `ANTHROPIC_DEFAULT_*` / provider env and on
+/// the CLI version, so an id stored months ago may simply no longer exist.
+fn clear_stale_model(
+    metadata: &aionui_api_types::AgentMetadata,
+    model: Option<String>,
+    conversation_id: &str,
+) -> Option<String> {
+    use crate::manager::acp::config_option_catalog::extract_models_from_value;
+    let model = model?;
+    let Some(catalog) = metadata
+        .handshake
+        .available_models
+        .as_ref()
+        .and_then(extract_models_from_value)
+    else {
+        return Some(model);
+    };
+    if catalog.available_models.is_empty() || catalog.available_models.iter().any(|entry| entry.model_id == model) {
+        return Some(model);
+    }
+    tracing::warn!(
+        conversation_id,
+        agent_id = %metadata.id,
+        requested_model = %model,
+        "persisted model selection is absent from the agent's catalog — falling back to \
+         the agent default for this session"
+    );
+    None
 }
 
 /// Build a claude/codex `SessionAgentTask` (the session-model port's `IAgentTask`)
@@ -1949,6 +2026,7 @@ pub async fn build_antigravity_instance(
         workspace,
         config,
         metadata,
+        skill_delivery,
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
@@ -1991,7 +2069,19 @@ pub async fn build_antigravity_instance(
     let init = SessionInit {
         mcp_servers,
         skills: config.skills.clone(),
-        preset_context: config.preset_context.clone(),
+        // The COMPOSED block (preset context + skills index + dual-channel
+        // instructions), not the raw preset context: agy has no prompt pipeline,
+        // so this is its only injection channel. Falls back to the raw context so
+        // a layer-1 agy (should one ever exist) still gets its assistant rules.
+        preset_context: skill_delivery
+            .injected_prefix
+            .clone()
+            .or_else(|| config.preset_context.clone()),
+        // agy is a layer-2 vendor, so no protocol root. The skill dirs still
+        // travel: agy needs name+path to build its slash-command list, which it
+        // used to get by scanning the workspace.
+        skill_view_skills_dir: None,
+        skill_dirs: skill_delivery.skill_dirs.clone(),
         session_snapshot: None,
         resume: matches!(spec, aionui_session::SessionSpec::Resume { .. }),
     };
@@ -2006,6 +2096,9 @@ pub async fn build_antigravity_instance(
         // installs themselves, so there is no bundled path to resolve and the
         // backend always spawns the `agy` on PATH.
         cli_program: None,
+        // agy is layer 2, so this carries only the allow-list entries (one
+        // `--add-dir` per enabled skill) and never a plugin flag.
+        extra_args: skill_delivery.plan.extra_args.clone(),
         ..Default::default()
     };
     session_config.spawn_env = assemble_spawn_env(&metadata.env, runtime_env);
@@ -2062,6 +2155,7 @@ pub async fn build_session_instance(
         workspace,
         config,
         metadata,
+        skill_delivery,
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
@@ -2119,6 +2213,11 @@ pub async fn build_session_instance(
         mcp_servers,
         skills: config.skills.clone(),
         preset_context: config.preset_context.clone(),
+        // Layer 1. `Some` only for a protocol vendor (codex): the backend has to
+        // send the skills root itself. An argv vendor (claude) gets its flags
+        // through `extra_args` below instead.
+        skill_view_skills_dir: skill_delivery.plan.protocol_skills_root.clone(),
+        skill_dirs: skill_delivery.skill_dirs.clone(),
         // acp/codex resume via SessionSpec::Resume; no in-band snapshot needed.
         session_snapshot: None,
         resume: matches!(spec, SessionSpec::Resume { .. }),
@@ -2140,6 +2239,17 @@ pub async fn build_session_instance(
         // keeps the bare name so the spawn error stays diagnosable. Detection
         // (cli_probe) stays PATH-only and is unaffected.
         cli_program: resolve_session_cli_program(backend_label, metadata),
+        // Layer 1 (argv). `--plugin-dir <view>` plus one `--add-dir <source>` per
+        // enabled skill, already substituted by the delivery plan. Empty for a
+        // non-argv vendor or an empty snapshot.
+        //
+        // Deliberately routed through `extra_args` rather than hard-coded in
+        // `build_claude_init_args`: that makes claude's layer-1 delivery
+        // DATA-driven like every ACP vendor's, so a flag change is a registry
+        // row rather than a code change. claude's builder positions its own init
+        // flags first and appends these after, with no de-duplication, so the
+        // repeated `--add-dir` survives intact (probe-verified).
+        extra_args: skill_delivery.plan.extra_args.clone(),
         ..Default::default()
     };
 
@@ -5681,6 +5791,7 @@ mod build_mapping_tests {
             args: vec![],
             env: vec![],
             native_skills_dirs: None,
+            skill_delivery: None,
             behavior_policy: BehaviorPolicy::default(),
             yolo_id: yolo_id.map(ToOwned::to_owned),
             sort_order: 0,
@@ -5890,6 +6001,9 @@ mod build_mapping_tests {
                     .into_owned(),
                 config: &config,
                 metadata: &metadata,
+                // This test is about MCP injection; skill delivery contributes
+                // nothing so the argv it asserts on stays unchanged.
+                skill_delivery: Default::default(),
                 session_snapshot: None,
                 backend_session_id: None,
                 mcp_server_repo: Some(&repo),
@@ -5970,6 +6084,71 @@ mod build_mapping_tests {
         ));
         assert_eq!(mode.as_deref(), Some("plan"));
         assert_eq!(model.as_deref(), Some("claude-x"));
+    }
+
+    // A catalog row carrying the persisted `{available_models:[{id,label}]}` shape the
+    // handshake write-back stores, for the stale-selection guard.
+    fn metadata_with_models(ids: &[&str]) -> aionui_api_types::AgentMetadata {
+        let mut md = test_metadata(Some("claude"), None);
+        md.handshake.available_models = Some(serde_json::json!({
+            "available_models": ids.iter().map(|id| serde_json::json!({"id": id, "label": id})).collect::<Vec<_>>(),
+            "current_model_id": ids.first().copied().unwrap_or_default(),
+        }));
+        md
+    }
+
+    /// A persisted selection the agent no longer advertises is DROPPED at build time,
+    /// so the session falls back to the agent default instead of failing on the user's
+    /// first message. No backend validates a model id at spawn — claude echoes a bogus
+    /// one into `system.init.model` and only dies at turn time (LIVE-PROBED 2.1.231 for
+    /// both `--model` and in-band `set_model`) — so this is the only guard that runs
+    /// before the user is affected.
+    #[test]
+    fn stale_model_selection_is_dropped_before_it_reaches_the_backend() {
+        let cfg = AcpBuildExtra {
+            // A concrete id that only existed under a previous ANTHROPIC_DEFAULT_* /
+            // provider env or CLI version.
+            current_model_id: Some("claude-opus-4-8[1m]".into()),
+            ..Default::default()
+        };
+        let md = metadata_with_models(&["default", "sonnet", "opus", "haiku"]);
+        let (_spec, _mode, model) = spec_mode_model("conv_stale", None, &cfg, None, &md);
+        assert_eq!(model, None, "an id absent from the catalog must not be sent");
+
+        // A selection the catalog DOES advertise survives untouched.
+        let live = AcpBuildExtra {
+            current_model_id: Some("haiku".into()),
+            ..Default::default()
+        };
+        let (_spec, _mode, model) = spec_mode_model("conv_live", None, &live, None, &md);
+        assert_eq!(model.as_deref(), Some("haiku"));
+
+        // `default` is a real catalog row, so it survives here; suppressing it is the
+        // claude backend's job (`desired_model_from_config`), not this guard's.
+        let default_row = AcpBuildExtra {
+            current_model_id: Some("default".into()),
+            ..Default::default()
+        };
+        let (_spec, _mode, model) = spec_mode_model("conv_default", None, &default_row, None, &md);
+        assert_eq!(model.as_deref(), Some("default"));
+    }
+
+    /// No catalog (first-ever open, nothing handshaked) is NOT evidence the selection is
+    /// invalid — dropping it there would break the very first session of every agent,
+    /// including codex/ACP backends that share this path.
+    #[test]
+    fn model_selection_passes_through_when_no_catalog_is_known_yet() {
+        let cfg = AcpBuildExtra {
+            current_model_id: Some("gpt-5.6-terra".into()),
+            ..Default::default()
+        };
+        // handshake.available_models = None
+        let (_spec, _mode, model) = spec_mode_model("conv_a", None, &cfg, None, &test_metadata(Some("codex"), None));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "absent catalog ⇒ pass through");
+
+        // An EMPTY catalog is equally uninformative.
+        let (_spec, _mode, model) = spec_mode_model("conv_b", None, &cfg, None, &metadata_with_models(&[]));
+        assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "empty catalog ⇒ pass through");
     }
 
     /// Fork-spec quadrant matrix (sid x fork): a bound sid ALWAYS resumes (the
@@ -8413,6 +8592,9 @@ mod pump_tests {
     struct GatedScriptBackend {
         script: Vec<SessionEnvelope>,
         gate: Arc<tokio::sync::Notify>,
+        /// What `capabilities()` reports — lets a test seed the backend-side
+        /// current model/mode that `open_session` would have written.
+        caps: Capabilities,
     }
 
     #[async_trait::async_trait]
@@ -8439,7 +8621,7 @@ mod pump_tests {
                 .boxed()
         }
         fn capabilities(&self) -> Capabilities {
-            Capabilities::default()
+            self.caps.clone()
         }
     }
 
@@ -8483,10 +8665,16 @@ mod pump_tests {
     // before releasing is what makes the collection deterministic — see
     // `GatedScriptBackend`.
     async fn drain_script(script: Vec<SessionEnvelope>) -> Vec<AgentStreamEvent> {
+        drain_script_with_caps(script, Capabilities::default()).await
+    }
+
+    // `drain_script` over a backend whose `capabilities()` reports `caps`.
+    async fn drain_script_with_caps(script: Vec<SessionEnvelope>, caps: Capabilities) -> Vec<AgentStreamEvent> {
         let gate = Arc::new(tokio::sync::Notify::new());
         let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
             script,
             gate: gate.clone(),
+            caps,
         });
         let task = SessionAgentTask::new(
             AgentType::Acp,
@@ -9313,6 +9501,66 @@ mod pump_tests {
             model_values,
             vec!["default", "opus"],
             "the parsed model ids ride the frame"
+        );
+    }
+
+    // A task rebuilt after an idle reclaim is driven by `send_message`, which never
+    // goes through REST `get_config_options` — so the pushed catalog frame is the only
+    // source of the picker's highlight. `open_session` has already written the spawn
+    // model/mode into `capabilities()`; the frame must carry them instead of `None`,
+    // which made the frontend fall back to the creation-time model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_updated_carries_spawn_seeded_current_model() {
+        use aionui_session::{ModeInfo, ModelInfo};
+        let model = |id: &str| ModelInfo {
+            id: id.into(),
+            name: id.into(),
+            description: None,
+            reasoning_efforts: Vec::new(),
+        };
+        let caps = Capabilities {
+            current_model: Some("fable".into()),
+            current_mode: Some("bypassPermissions".into()),
+            ..Capabilities::default()
+        };
+        let script = vec![env(SessionEvent::CatalogUpdated {
+            models: vec![model("fable"), model("opus")],
+            modes: vec![ModeInfo {
+                id: "bypassPermissions".into(),
+                name: "Bypass Permissions".into(),
+                description: None,
+            }],
+            slash_commands: Vec::new(),
+        })];
+        let frames = drain_script_with_caps(script, caps).await;
+        let config = frames
+            .iter()
+            .find_map(|f| match f {
+                AgentStreamEvent::AcpConfigOption(v) => Some(v),
+                _ => None,
+            })
+            .expect("CatalogUpdated must project to an AcpConfigOption frame");
+        let options = config
+            .get("config_options")
+            .and_then(|v| v.as_array())
+            .expect("config_options array");
+        let current = |category: &str| {
+            options
+                .iter()
+                .find(|o| o.get("category").and_then(|c| c.as_str()) == Some(category))
+                .unwrap_or_else(|| panic!("{category} category"))
+                .get("current_value")
+                .cloned()
+        };
+        assert_eq!(
+            current("model"),
+            Some(serde_json::json!("fable")),
+            "the spawn model from capabilities() must ride the catalog frame"
+        );
+        assert_eq!(
+            current("mode"),
+            Some(serde_json::json!("bypassPermissions")),
+            "the spawn mode from capabilities() must ride the catalog frame"
         );
     }
 
@@ -10497,6 +10745,7 @@ mod pump_tests {
         let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
             script,
             gate: gate.clone(),
+            caps: Capabilities::default(),
         });
         let task = SessionAgentTask::new(
             AgentType::Acp,
