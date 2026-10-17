@@ -22,7 +22,7 @@
 //! `emit`) are now production-reachable via `open_session`'s live spawn (R4) and
 //! independently contract-tested via the `build_with_io` seam.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1179,6 +1179,10 @@ fn builtin_slash_commands() -> Vec<crate::capability::SlashCommandInfo> {
             name: "logout".into(),
             description: Some("logout of Codex".into()),
         },
+        SlashCommandInfo {
+            name: "goal".into(),
+            description: Some("run a persistent Codex goal until it reaches a terminal state".into()),
+        },
     ]
 }
 
@@ -1193,7 +1197,7 @@ pub struct CodexSessionBackend {
     session_id: String,
     capabilities: Capabilities,
     /// JSON-RPC request id counter (outbound client requests).
-    rpc_id: AtomicU64,
+    rpc_id: Arc<AtomicU64>,
     /// Live turn epoch (set on dispatch(Send), read by the reader to stamp).
     turn_gen: Arc<AtomicU64>,
     /// stdin shared with the reader task: dispatch writes client requests; the
@@ -1245,6 +1249,14 @@ pub struct CodexSessionBackend {
     /// first Send would poll forever for a `thread/started` that never comes.
     /// A success needs no action (`thread/started` for the NEW thread binds it).
     pending_fork: Arc<Mutex<Option<u64>>>,
+    /// Goal requests are serialized as clear → set. The reader starts the set
+    /// only after the clear response, matching the upstream client contract.
+    pending_goal_clears: Arc<Mutex<HashMap<u64, PendingGoalStart>>>,
+    /// `thread/goal/get` response ids used during resume hydration.
+    pending_goal_gets: Arc<Mutex<HashSet<u64>>>,
+    /// Shared Codex Goal state. The reader owns lifecycle coalescing; dispatch
+    /// only uses it to prevent a second ordinary turn from racing a Goal.
+    goal: Arc<Mutex<CodexGoalRuntime>>,
     /// The id of the in-flight turn (codex `turn/started.turn.id`), needed by
     /// `turn/interrupt{turnId}` and `turn/steer{expectedTurnId}` (optimistic
     /// concurrency token). Set on `turn/started`, cleared on terminal.
@@ -1347,6 +1359,132 @@ struct PendingSend {
     opens_turn: bool,
 }
 
+#[derive(Clone)]
+struct PendingGoalStart {
+    objective: String,
+    client_msg_id: Option<String>,
+}
+
+/// The Codex Goal lifecycle is thread-scoped and can span several physical
+/// turns. Keep this state at the transport boundary so the rest of AionCore
+/// continues to see one logical turn and one terminal event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexGoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+impl CodexGoalStatus {
+    fn from_wire(value: Option<&str>) -> Option<Self> {
+        Some(match value? {
+            "active" => Self::Active,
+            "paused" => Self::Paused,
+            "blocked" => Self::Blocked,
+            "usageLimited" => Self::UsageLimited,
+            "budgetLimited" => Self::BudgetLimited,
+            "complete" => Self::Complete,
+            _ => return None,
+        })
+    }
+
+    fn is_terminal(self) -> bool {
+        !matches!(self, Self::Active)
+    }
+}
+
+#[derive(Default)]
+struct CodexGoalRuntime {
+    active: bool,
+    cleared: bool,
+    status: Option<CodexGoalStatus>,
+    physical_turn_active: bool,
+    last_terminal: Option<SessionEvent>,
+    failed_terminal: Option<SessionEvent>,
+}
+
+impl CodexGoalRuntime {
+    fn begin(&mut self) {
+        *self = Self {
+            active: true,
+            status: Some(CodexGoalStatus::Active),
+            ..Self::default()
+        };
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn mark_physical_turn_started(&mut self) {
+        if self.active {
+            self.physical_turn_active = true;
+        }
+    }
+
+    fn abort(&mut self) {
+        *self = Self::default();
+    }
+
+    fn observe_goal(&mut self, status: CodexGoalStatus) -> Option<SessionEvent> {
+        self.status = Some(status);
+        if status == CodexGoalStatus::Active {
+            self.active = true;
+            self.cleared = false;
+            return None;
+        }
+        self.finish_if_ready()
+    }
+
+    fn observe_cleared(&mut self) -> Option<SessionEvent> {
+        self.cleared = true;
+        // Clearing is also the first half of replacing an existing Goal. It is
+        // not a logical turn completion; the subsequent goal/set owns that
+        // lifecycle. User cancellation aborts the local runtime before sending
+        // clear, so it does not need a synthetic terminal here either.
+        None
+    }
+
+    fn observe_physical_terminal(&mut self, event: SessionEvent) -> Option<SessionEvent> {
+        self.physical_turn_active = false;
+        if !self.active {
+            return Some(event);
+        }
+
+        let is_error = matches!(event, SessionEvent::TurnResult { is_error: true, .. });
+        let is_cancelled = matches!(
+            event,
+            SessionEvent::TurnResult {
+                outcome: TurnOutcome::Cancelled { .. },
+                ..
+            }
+        );
+        self.last_terminal = Some(event.clone());
+        if is_error {
+            self.failed_terminal = Some(event.clone());
+        }
+        if is_cancelled {
+            self.active = false;
+            return Some(event);
+        }
+        self.finish_if_ready()
+    }
+
+    fn finish_if_ready(&mut self) -> Option<SessionEvent> {
+        if !self.active
+            || self.physical_turn_active
+            || !(self.cleared || self.status.is_some_and(CodexGoalStatus::is_terminal))
+        {
+            return None;
+        }
+        self.active = false;
+        self.failed_terminal.take().or_else(|| self.last_terminal.take())
+    }
+}
+
 /// Which pending response a claimed rpc id maps to. Models/Modes fill the
 /// per-session `discovered` cache (capabilities() merges them); Checkpoints maps
 /// to a `CheckpointList` event (O2 up-leg); Rewind maps to a `Rewound{to_turn}`
@@ -1416,6 +1554,10 @@ struct CodexReaderState {
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
+    pending_goal_clears: Arc<Mutex<HashMap<u64, PendingGoalStart>>>,
+    pending_goal_gets: Arc<Mutex<HashSet<u64>>>,
+    rpc_id: Arc<AtomicU64>,
+    goal: Arc<Mutex<CodexGoalRuntime>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     /// F-4 turn-active flag: set on dispatch(Send), cleared by the reader at a turn
@@ -1460,6 +1602,10 @@ fn start_codex_reader(
             state.pending_resume,
             state.resume_poison,
             state.pending_fork,
+            state.pending_goal_clears,
+            state.pending_goal_gets,
+            state.rpc_id,
+            state.goal,
             state.discovered,
             state.stdin,
             state.turn_in_flight,
@@ -1674,6 +1820,10 @@ impl CodexSessionBackend {
         let pending_resume = Arc::new(Mutex::new(None));
         let resume_poison = Arc::new(Mutex::new(None));
         let pending_fork = Arc::new(Mutex::new(None));
+        let pending_goal_clears = Arc::new(Mutex::new(HashMap::<u64, PendingGoalStart>::new()));
+        let pending_goal_gets = Arc::new(Mutex::new(HashSet::new()));
+        let rpc_id = Arc::new(AtomicU64::new(0));
+        let goal = Arc::new(Mutex::new(CodexGoalRuntime::default()));
         let discovered = Arc::new(std::sync::Mutex::new(Discovered::default()));
         let managed_runtime = saydone_managed_codex_runtime(&wake.config);
         let managed_model = managed_runtime.as_ref().map(|runtime| runtime.model.clone());
@@ -1703,6 +1853,10 @@ impl CodexSessionBackend {
             pending_resume: pending_resume.clone(),
             resume_poison: resume_poison.clone(),
             pending_fork: pending_fork.clone(),
+            pending_goal_clears: pending_goal_clears.clone(),
+            pending_goal_gets: pending_goal_gets.clone(),
+            rpc_id: rpc_id.clone(),
+            goal: goal.clone(),
             discovered: discovered.clone(),
             stdin: stdin.clone(),
             turn_in_flight: turn_in_flight.clone(),
@@ -1743,7 +1897,7 @@ impl CodexSessionBackend {
         Self {
             session_id,
             capabilities: codex_capabilities(),
-            rpc_id: AtomicU64::new(0),
+            rpc_id,
             turn_gen,
             stdin,
             event_tx,
@@ -1764,6 +1918,9 @@ impl CodexSessionBackend {
             pending_resume,
             resume_poison,
             pending_fork,
+            pending_goal_clears,
+            pending_goal_gets,
+            goal,
             discovered,
             steer_ack_timeout_ms: AtomicU64::new(STEER_ACK_TIMEOUT_MS),
         }
@@ -1947,6 +2104,23 @@ impl CodexSessionBackend {
             "jsonrpc": "2.0", "id": perm_list_id, "method": "permissionProfile/list", "params": {}
         }))
         .await?;
+        // Goal state is persisted by Codex on the thread. Hydrate it after a
+        // resume so an active Goal keeps its logical-turn boundary when the
+        // app-server process is replaced or the conversation is reopened.
+        // Fresh and fork handshakes do not have a binding yet; waiting for the
+        // asynchronous thread/started notification here would block the
+        // handshake before the reader can bind it.
+        if let Some(thread_id) = self.thread_binding.lock().await.clone() {
+            let goal_get_id = self.next_rpc_id();
+            self.pending_goal_gets.lock().await.insert(goal_get_id);
+            self.write_frame(json!({
+                "jsonrpc": "2.0",
+                "id": goal_get_id,
+                "method": "thread/goal/get",
+                "params": { "threadId": thread_id }
+            }))
+            .await?;
+        }
         Ok(())
     }
 
@@ -2034,6 +2208,10 @@ async fn reader_task(
     pending_resume: Arc<Mutex<Option<u64>>>,
     resume_poison: Arc<Mutex<Option<String>>>,
     pending_fork: Arc<Mutex<Option<u64>>>,
+    pending_goal_clears: Arc<Mutex<HashMap<u64, PendingGoalStart>>>,
+    pending_goal_gets: Arc<Mutex<HashSet<u64>>>,
+    rpc_id: Arc<AtomicU64>,
+    goal: Arc<Mutex<CodexGoalRuntime>>,
     discovered: Arc<std::sync::Mutex<Discovered>>,
     stdin: Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -2187,6 +2365,17 @@ async fn reader_task(
                             idle_pending = false; // and a fresh turn has no deferred idle
                             system_error_pending = false; // nor a deferred systemError
                             system_error_deadline = None;
+                            let goal_active = {
+                                let mut goal_state = goal.lock().await;
+                                let active = goal_state.is_active();
+                                if active {
+                                    goal_state.mark_physical_turn_started();
+                                }
+                                active
+                            };
+                            if goal_active {
+                                turn_in_flight.store(true, Ordering::SeqCst);
+                            }
                             // Capture the active turn id (optimistic token needed by
                             // turn/interrupt{turnId} + turn/steer{expectedTurnId}).
                             if let Some(tid) = params.get("turn").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -2205,6 +2394,49 @@ async fn reader_task(
                                 );
                             }
                         }
+                        if m == "thread/goal/updated" {
+                            if let Some(status) = CodexGoalStatus::from_wire(
+                                params
+                                    .get("goal")
+                                    .and_then(|value| value.get("status"))
+                                    .and_then(Value::as_str),
+                            ) {
+                                if let Some(ev) = goal.lock().await.observe_goal(status) {
+                                    *active_turn_id.lock().await = None;
+                                    turn_in_flight.store(false, Ordering::SeqCst);
+                                    if let SessionEvent::TurnResult {
+                                        is_error: false,
+                                        result_text,
+                                        ..
+                                    } = &ev
+                                    {
+                                        title_gen.fire(&session_id, result_text, &event_tx, cur);
+                                    }
+                                    emit(&event_tx, &session_id, cur, ev);
+                                }
+                            }
+                            // Goal updates are consumed by the backend's logical
+                            // turn coalescer. They are not ordinary message
+                            // boundaries and must never reach the relay as a
+                            // completion on their own.
+                            continue;
+                        }
+                        if m == "thread/goal/cleared" {
+                            if let Some(ev) = goal.lock().await.observe_cleared() {
+                                *active_turn_id.lock().await = None;
+                                turn_in_flight.store(false, Ordering::SeqCst);
+                                if let SessionEvent::TurnResult {
+                                    is_error: false,
+                                    result_text,
+                                    ..
+                                } = &ev
+                                {
+                                    title_gen.fire(&session_id, result_text, &event_tx, cur);
+                                }
+                                emit(&event_tx, &session_id, cur, ev);
+                            }
+                            continue;
+                        }
                         // R8 dual-terminal reconcile: codex sends status→idle FIRST
                         // (deferred), then the authoritative turn/completed produces
                         // the rich terminal (M3). Exactly ONE TurnResult per turn.
@@ -2217,25 +2449,30 @@ async fn reader_task(
                                 &mut idle_pending,
                                 &mut system_error_pending,
                             ) {
-                                // Turn ended → clear the active turn id (a stale token
-                                // would make a later steer/interrupt target a dead turn).
+                                let ev = goal.lock().await.observe_physical_terminal(ev);
+                                // A Goal may continue with another physical turn.
+                                // The previous turn id is no longer a valid
+                                // interrupt/steer token even when no logical
+                                // terminal is emitted yet.
                                 *active_turn_id.lock().await = None;
-                                // F-4: turn terminal → clear the turn-active flag so the
-                                // idle timer may suspend the now-idle process.
-                                turn_in_flight.store(false, Ordering::SeqCst);
-                                // First-turn title: every SUCCESSFUL turn fires
-                                // while the latch is armed (an error turn keeps it
-                                // armed for the next one). Detached onto its own
-                                // process — see `codex_title`.
-                                if let SessionEvent::TurnResult {
-                                    is_error: false,
-                                    result_text,
-                                    ..
-                                } = &ev
-                                {
-                                    title_gen.fire(&session_id, result_text, &event_tx, cur);
+                                if let Some(ev) = ev {
+                                    // F-4: turn terminal → clear the turn-active flag so the
+                                    // idle timer may suspend the now-idle process.
+                                    turn_in_flight.store(false, Ordering::SeqCst);
+                                    // First-turn title: every SUCCESSFUL turn fires
+                                    // while the latch is armed (an error turn keeps it
+                                    // armed for the next one). Detached onto its own
+                                    // process — see `codex_title`.
+                                    if let SessionEvent::TurnResult {
+                                        is_error: false,
+                                        result_text,
+                                        ..
+                                    } = &ev
+                                    {
+                                        title_gen.fire(&session_id, result_text, &event_tx, cur);
+                                    }
+                                    emit(&event_tx, &session_id, cur, ev);
                                 }
-                                emit(&event_tx, &session_id, cur, ev);
                             } else if system_error_pending && !was_pending {
                                 // systemError was just deferred: arm the bounded grace
                                 // for the rich follow-up (error{willRetry:false} /
@@ -2301,7 +2538,6 @@ async fn reader_task(
                                 system_error_pending = false; // the fatal error IS the rich follow-up
                                 system_error_deadline = None;
                                 *active_turn_id.lock().await = None;
-                                turn_in_flight.store(false, Ordering::SeqCst);
                                 let message = params
                                     .get("error")
                                     .and_then(|e| e.get("message").and_then(Value::as_str).or_else(|| e.as_str()))
@@ -2312,7 +2548,14 @@ async fn reader_task(
                                     turn_gen = cur,
                                     "codex error{{willRetry:false}} → synthesizing is_error terminal (no turn/completed guaranteed)"
                                 );
-                                emit(&event_tx, &session_id, cur, synth_error_terminal(message));
+                                if let Some(ev) = goal
+                                    .lock()
+                                    .await
+                                    .observe_physical_terminal(synth_error_terminal(message))
+                                {
+                                    turn_in_flight.store(false, Ordering::SeqCst);
+                                    emit(&event_tx, &session_id, cur, ev);
+                                }
                             }
                             continue;
                         }
@@ -2408,6 +2651,109 @@ async fn reader_task(
                                 *resume_poison.lock().await = Some(format!("codex thread/fork failed: {msg}"));
                                 continue;
                             }
+                            // Goal start is deliberately serialized as clear → set.
+                            // The upstream client uses the same order so a stale
+                            // persisted goal cannot race the new objective.
+                            if let Some(goal_start) = pending_goal_clears.lock().await.remove(&rid) {
+                                if let Some(msg) = error_message.as_deref() {
+                                    goal.lock().await.abort();
+                                    turn_in_flight.store(false, Ordering::SeqCst);
+                                    if !terminated {
+                                        terminated = true;
+                                        emit(
+                                            &event_tx,
+                                            &session_id,
+                                            turn_gen.load(Ordering::SeqCst),
+                                            synth_error_terminal(format!("Codex goal could not be prepared: {msg}")),
+                                        );
+                                    }
+                                    continue;
+                                }
+                                let Some(thread_id) = thread_binding.lock().await.clone() else {
+                                    goal.lock().await.abort();
+                                    turn_in_flight.store(false, Ordering::SeqCst);
+                                    if !terminated {
+                                        terminated = true;
+                                        emit(
+                                            &event_tx,
+                                            &session_id,
+                                            turn_gen.load(Ordering::SeqCst),
+                                            synth_error_terminal("Codex goal thread is not bound".into()),
+                                        );
+                                    }
+                                    continue;
+                                };
+                                let set_id = rpc_id.fetch_add(1, Ordering::SeqCst) + 1;
+                                pending_sends.lock().await.insert(
+                                    set_id,
+                                    PendingSend {
+                                        client_msg_id: goal_start.client_msg_id,
+                                        opens_turn: true,
+                                    },
+                                );
+                                let frame = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": set_id,
+                                    "method": "thread/goal/set",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "objective": goal_start.objective,
+                                        "status": "active",
+                                        "origin": "user"
+                                    }
+                                });
+                                let mut write_guard = stdin.lock().await;
+                                let write_result = if let Some(writer) = write_guard.as_mut() {
+                                    use tokio::io::AsyncWriteExt;
+                                    match serde_json::to_vec(&frame) {
+                                        Ok(mut line) => {
+                                            line.push(b'\n');
+                                            let result = writer.write_all(&line).await;
+                                            if result.is_ok() { writer.flush().await } else { result }
+                                        }
+                                        Err(error) => Err(std::io::Error::other(error)),
+                                    }
+                                } else {
+                                    Err(std::io::Error::other("codex stdin unavailable"))
+                                };
+                                drop(write_guard);
+                                if let Err(error) = write_result {
+                                    pending_sends.lock().await.remove(&set_id);
+                                    goal.lock().await.abort();
+                                    turn_in_flight.store(false, Ordering::SeqCst);
+                                    if !terminated {
+                                        terminated = true;
+                                        emit(
+                                            &event_tx,
+                                            &session_id,
+                                            turn_gen.load(Ordering::SeqCst),
+                                            synth_error_terminal(format!("Codex goal could not start: {error}")),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                            // Resume hydration. Older Codex versions may reject
+                            // this method; that is a capability downgrade, not a
+                            // reason to fail an otherwise valid session.
+                            if pending_goal_gets.lock().await.remove(&rid) {
+                                if let Some(result) = frame.get("result")
+                                    && let Some(goal_value) = result.get("goal")
+                                    && let Some(status) =
+                                        CodexGoalStatus::from_wire(goal_value.get("status").and_then(Value::as_str))
+                                {
+                                    let mut state = goal.lock().await;
+                                    if status == CodexGoalStatus::Active {
+                                        state.active = true;
+                                        state.cleared = false;
+                                        state.status = Some(status);
+                                    } else if !state.physical_turn_active {
+                                        state.abort();
+                                        state.status = Some(status);
+                                    }
+                                }
+                                continue;
+                            }
                             let pending_send = pending_sends.lock().await.remove(&rid);
                             if let Some(send) = pending_send {
                                 if frame.get("result").is_some() {
@@ -2429,6 +2775,7 @@ async fn reader_task(
                                     // terminal is absorbed by I10). NoTurn (/logout) →
                                     // no turn to end; surface a Notice instead.
                                     if send.opens_turn {
+                                        goal.lock().await.abort();
                                         if !terminated {
                                             terminated = true;
                                             *active_turn_id.lock().await = None;
@@ -2629,11 +2976,28 @@ async fn reader_task(
         );
     }
 
+    // If EOF followed a physical Goal turn whose completion was waiting for a
+    // final goal/cleared or terminal status, release that one logical terminal
+    // before Detached is emitted. This preserves the same single-completion
+    // rule during process teardown.
+    if let Some(ev) = goal.lock().await.finish_if_ready() {
+        *active_turn_id.lock().await = None;
+        if let SessionEvent::TurnResult {
+            is_error: false,
+            result_text,
+            ..
+        } = &ev
+        {
+            title_gen.fire(&session_id, result_text, &event_tx, turn_gen.load(Ordering::SeqCst));
+        }
+        emit(&event_tx, &session_id, turn_gen.load(Ordering::SeqCst), ev);
+    }
+
     // M3 defensive flush: the stream ended with a deferred `status→idle` but NO
     // authoritative `turn/completed` ever arrived (not observed in real codex, but
     // the §C5 R8 contract allows "one may be missing"). Emit a clean terminal so a
     // turn that reached idle isn't left hanging Running.
-    if idle_pending && !terminated {
+    if idle_pending && !terminated && !goal.lock().await.is_active() {
         *active_turn_id.lock().await = None;
         emit(
             &event_tx,
@@ -4426,6 +4790,55 @@ impl SessionBackend for CodexSessionBackend {
                 // handle_prompt) — codex does NOT interpret slash text itself.
                 let route = route_slash_command(&content);
 
+                // Codex Goals are thread-scoped and may span several physical
+                // turns. Start them through the native goal API so Codex owns
+                // continuation, while this adapter keeps one logical turn for
+                // the rest of AionCore. The clear is serialized before set to
+                // replace any persisted Goal from a previous run.
+                if let Some(SlashRoute::Goal(objective)) = route.as_ref() {
+                    if self.turn_in_flight.load(Ordering::SeqCst)
+                        || self.active_turn_id.lock().await.is_some()
+                        || self.goal.lock().await.is_active()
+                    {
+                        return Err(BackendError::Transport(
+                            "cannot start a Codex goal while a turn or goal is in flight".into(),
+                        ));
+                    }
+                    self.suspend
+                        .ensure_awake(aionui_common::now_ms(), || self.wake_handle())
+                        .await?;
+                    let tid = self.bound_thread().await?;
+                    self.goal.lock().await.begin();
+                    self.turn_in_flight.store(true, Ordering::SeqCst);
+
+                    let clear_id = self.next_rpc_id();
+                    self.pending_goal_clears.lock().await.insert(
+                        clear_id,
+                        PendingGoalStart {
+                            objective: objective.clone(),
+                            client_msg_id: metadata.client_msg_id.clone(),
+                        },
+                    );
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "id": clear_id,
+                        "method": "thread/goal/clear",
+                        "params": { "threadId": tid, "origin": "user" }
+                    });
+                    if let Err(error) = self.write_frame(frame).await {
+                        self.pending_goal_clears.lock().await.remove(&clear_id);
+                        self.goal.lock().await.abort();
+                        self.turn_in_flight.store(false, Ordering::SeqCst);
+                        return Err(error);
+                    }
+                    let cur_gen = self.turn_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                    return Ok(CommandReceipt {
+                        accepted: true,
+                        admission: Admission::Started,
+                        turn_gen: cur_gen,
+                    });
+                }
+
                 // /logout → account/logout. No turn lifecycle follows (bridge:
                 // auth.logout() then auth_required), so it is handled before the
                 // flight-check and returns NoTurn: no turn_gen bump, no
@@ -4543,6 +4956,7 @@ impl SessionBackend for CodexSessionBackend {
                     // delivery omitted = inline on this thread, the bridge's behavior).
                     Some(SlashRoute::Review(target)) => ("review/start", json!({ "threadId": tid, "target": target })),
                     Some(SlashRoute::Logout) => unreachable!("handled above"),
+                    Some(SlashRoute::Goal(_)) => unreachable!("handled before ordinary turn routing"),
                 };
                 let frame = json!({
                     "jsonrpc": "2.0",
@@ -4562,11 +4976,35 @@ impl SessionBackend for CodexSessionBackend {
                 if let CancelTarget::Tool(_) = target {
                     return Err(BackendError::CommandNotSupported { command: "cancel_tool" });
                 }
+                // A Goal can be between physical turns while Codex is still
+                // allowed to continue it. Abort the local coalescer first so
+                // any late physical completion is forwarded as the user's
+                // cancellation, then clear the persisted Goal before the
+                // current physical turn is interrupted.
+                let goal_was_active = self.goal.lock().await.is_active();
+                if goal_was_active {
+                    self.goal.lock().await.abort();
+                }
                 // REAL codex: `turn/interrupt{threadId, turnId}` (hard cancel).
                 // `turnId` is REQUIRED (non-Option on the wire). bound_thread first
                 // (establishes the handshake completed + lets the reader bind the
                 // active turn from turn/started).
                 let tid = self.bound_thread().await?;
+                if goal_was_active {
+                    let clear_frame = json!({
+                        "jsonrpc": "2.0",
+                        "id": self.next_rpc_id(),
+                        "method": "thread/goal/clear",
+                        "params": { "threadId": tid, "origin": "user" }
+                    });
+                    if let Err(error) = self.write_frame(clear_frame).await {
+                        tracing::warn!(
+                            conversation_id = %self.session_id,
+                            error = %error,
+                            "failed to clear Codex goal during cancellation"
+                        );
+                    }
+                }
                 // cancel-before-fold race (token-burn half): a cancel can arrive in the
                 // window between dispatch(Send) (which set turn_in_flight + wrote
                 // turn/start) and the reader binding `active_turn_id` from the async
@@ -4588,6 +5026,9 @@ impl SessionBackend for CodexSessionBackend {
                     }
                 }
                 let Some(turn_id) = active else {
+                    if goal_was_active {
+                        self.turn_in_flight.store(false, Ordering::SeqCst);
+                    }
                     return Ok(CommandReceipt {
                         accepted: true,
                         admission: Admission::NoTurn,
@@ -5153,6 +5594,11 @@ enum SlashRoute {
     Review(Value),
     /// `/logout` → `account/logout` (no turn follows).
     Logout,
+    /// `/goal <objective>` → `thread/goal/clear` followed by
+    /// `thread/goal/set{objective,status:active}`. Codex starts the first
+    /// physical turn itself; the reader coalesces the whole Goal into one
+    /// logical turn.
+    Goal(String),
 }
 
 /// Parse a leading slash command NAME from raw text. Sole grammar owner, shared
@@ -5211,6 +5657,7 @@ fn route_slash_command(content: &[ContentBlock]) -> Option<SlashRoute> {
             Some(SlashRoute::Review(json!({ "type": "commit", "sha": rest.trim() })))
         }
         "logout" => Some(SlashRoute::Logout),
+        "goal" if !rest.trim().is_empty() => Some(SlashRoute::Goal(rest.trim().to_owned())),
         _ => None,
     }
 }
@@ -7048,6 +7495,11 @@ mod tests {
         assert_eq!(route_slash_command(&text("/init")), Some(SlashRoute::Init));
         assert_eq!(route_slash_command(&text("/logout")), Some(SlashRoute::Logout));
         assert_eq!(
+            route_slash_command(&text("/goal finish the release")),
+            Some(SlashRoute::Goal("finish the release".into()))
+        );
+        assert_eq!(route_slash_command(&text("/goal")), None);
+        assert_eq!(
             route_slash_command(&text("/review")),
             Some(SlashRoute::Review(json!({ "type": "uncommittedChanges" })))
         );
@@ -7120,7 +7572,15 @@ mod tests {
         // And the reverse: no name routes that the catalog fails to advertise.
         // Enumerate the full universe the route table recognizes today; if a new
         // arm is added to `route_slash_command`, add it here AND to the catalog.
-        let route_universe = ["review", "review-branch", "review-commit", "init", "compact", "logout"];
+        let route_universe = [
+            "review",
+            "review-branch",
+            "review-commit",
+            "init",
+            "compact",
+            "logout",
+            "goal",
+        ];
         for name in route_universe {
             assert!(
                 route_slash_command(&[ContentBlock::Text(format!("/{name} arg"))]).is_some(),
@@ -7138,7 +7598,7 @@ mod tests {
         );
     }
 
-    /// #101/ELECTRON-3PX: codex advertises the bridge's static 6-command table
+    /// #101/ELECTRON-3PX: codex advertises the bridge's static command table
     /// (codex-acp v0.14.0 thread.rs:2894 builtin_commands) so the in-session `/`
     /// menu is no longer empty on the direct-CLI path.
     #[test]
@@ -7150,8 +7610,79 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["review", "review-branch", "review-commit", "init", "compact", "logout"]
+            vec![
+                "review",
+                "review-branch",
+                "review-commit",
+                "init",
+                "compact",
+                "logout",
+                "goal"
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_slash_goal_clears_before_setting_objective() {
+        let prefix = format!(
+            "{}\n",
+            r#"{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"th-goal"}}}"#
+        )
+        .into_bytes();
+        let clear_response = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string() + "\n";
+        let fake = FakeAgentIo::new(prefix, None).with_gated_tail(clear_response.into_bytes());
+        let release = fake.stdout_releaser();
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-goal", Box::new(fake)).await;
+
+        let receipt = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("/goal finish the release".into())],
+                metadata: super::super::types::CommandMeta {
+                    client_msg_id: Some("goal-msg-1".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect("goal accepted");
+        assert_eq!(receipt.admission, Admission::Started);
+        assert_eq!(receipt.turn_gen, 1);
+
+        let before_clear_response = captured_str(&captured).await;
+        assert!(
+            before_clear_response.contains(r#""method":"thread/goal/clear""#),
+            "goal must clear the persisted objective first, got: {before_clear_response}"
+        );
+        assert!(
+            !before_clear_response.contains(r#""method":"thread/goal/set""#),
+            "goal/set must wait for the clear response, got: {before_clear_response}"
+        );
+
+        release();
+        let written = captured_str(&captured).await;
+        let clear_pos = written.find(r#""method":"thread/goal/clear""#).expect("clear frame");
+        let set_pos = written.find(r#""method":"thread/goal/set""#).expect("set frame");
+        assert!(clear_pos < set_pos, "goal clear must precede goal set, got: {written}");
+        assert!(written.contains(r#""objective":"finish the release""#));
+        assert!(written.contains(r#""status":"active""#));
+    }
+
+    #[test]
+    fn goal_runtime_coalesces_physical_turns_until_terminal_goal_status() {
+        let mut runtime = CodexGoalRuntime::default();
+        runtime.begin();
+        runtime.mark_physical_turn_started();
+
+        let physical_terminal = synth_clean_terminal();
+        assert!(runtime.observe_physical_terminal(physical_terminal).is_none());
+        assert!(runtime.is_active());
+
+        let logical_terminal = runtime.observe_goal(CodexGoalStatus::Complete);
+        assert!(matches!(
+            logical_terminal,
+            Some(SessionEvent::TurnResult { is_error: false, .. })
+        ));
+        assert!(!runtime.is_active());
     }
 
     #[tokio::test]
