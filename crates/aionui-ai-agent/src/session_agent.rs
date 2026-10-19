@@ -1910,6 +1910,7 @@ fn spec_mode_model(
     config: &AcpBuildExtra,
     session_snapshot: Option<&PersistedSessionState>,
     metadata: &aionui_api_types::AgentMetadata,
+    runtime_env: &[(String, String)],
 ) -> (aionui_session::SessionSpec, Option<String>, Option<String>) {
     use aionui_session::SessionSpec;
     let spec = match &backend_session_id {
@@ -1959,8 +1960,30 @@ fn spec_mode_model(
             .or_else(|| config.current_model_id.clone())
             .filter(|s| !s.is_empty()),
         conversation_id,
+        managed_model_from_runtime_env(runtime_env).as_deref(),
     );
     (spec, mode, model)
+}
+
+/// Return the model from the host-owned managed runtime lease, when one is
+/// present. Managed model ids come from the backend lease and may legitimately
+/// be absent from the CLI's bundled catalog, so they must not be treated as
+/// stale selections during session rebuild.
+fn managed_model_from_runtime_env(runtime_env: &[(String, String)]) -> Option<String> {
+    let value = |name: &str| {
+        let mut values = runtime_env
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str());
+        let first = values.next()?;
+        values.all(|candidate| candidate == first).then_some(first)
+    };
+    (value(SAYDONE_MANAGED_AGENT_ENV) == Some("1"))
+        .then(|| value("SAYDONE_MANAGED_MODEL"))
+        .flatten()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Drop a model selection the agent's advertised catalog does not contain.
@@ -1974,9 +1997,13 @@ fn clear_stale_model(
     metadata: &aionui_api_types::AgentMetadata,
     model: Option<String>,
     conversation_id: &str,
+    managed_model: Option<&str>,
 ) -> Option<String> {
     use crate::manager::acp::config_option_catalog::extract_models_from_value;
     let model = model?;
+    if managed_model == Some(model.as_str()) {
+        return Some(model);
+    }
     let Some(catalog) = metadata
         .handshake
         .available_models
@@ -2040,7 +2067,14 @@ pub async fn build_antigravity_instance(
         permission_hook_body,
     } = inputs;
 
-    let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
+    let (spec, mode, model) = spec_mode_model(
+        &conversation_id,
+        backend_session_id,
+        config,
+        session_snapshot,
+        metadata,
+        runtime_env,
+    );
 
     // Same MCP init surface and ordering as the claude/codex path: user servers
     // resolved from the repo, plus the inline snapshot, with the team
@@ -2171,7 +2205,14 @@ pub async fn build_session_instance(
     // GAP #1/#2 — the pure spec + mode/model mapping (resume anchor → Resume/Fresh,
     // snapshot-wins precedence). Extracted so it is unit-testable in isolation, the
     // exact sibling of clean-slate's `spec_and_config`.
-    let (spec, mode, model) = spec_mode_model(&conversation_id, backend_session_id, config, session_snapshot, metadata);
+    let (spec, mode, model) = spec_mode_model(
+        &conversation_id,
+        backend_session_id,
+        config,
+        session_snapshot,
+        metadata,
+        runtime_env,
+    );
 
     // GAP #3 — MCP init surface: resolve user-configured servers to the neutral
     // spec (clean-slate resolve_session_init), fold in the inline snapshot, then
@@ -6058,7 +6099,8 @@ mod build_mapping_tests {
     #[test]
     fn spec_fresh_when_no_anchor() {
         let cfg = AcpBuildExtra::default();
-        let (spec, mode, model) = spec_mode_model("conv_1", None, &cfg, None, &test_metadata(Some("claude"), None));
+        let (spec, mode, model) =
+            spec_mode_model("conv_1", None, &cfg, None, &test_metadata(Some("claude"), None), &[]);
         assert!(matches!(spec, SessionSpec::Fresh { session_id } if session_id == "conv_1"));
         assert_eq!(mode, None);
         assert_eq!(model, None);
@@ -6077,6 +6119,7 @@ mod build_mapping_tests {
             &cfg,
             None,
             &test_metadata(Some("claude"), None),
+            &[],
         );
         assert!(matches!(
             spec,
@@ -6112,7 +6155,7 @@ mod build_mapping_tests {
             ..Default::default()
         };
         let md = metadata_with_models(&["default", "sonnet", "opus", "haiku"]);
-        let (_spec, _mode, model) = spec_mode_model("conv_stale", None, &cfg, None, &md);
+        let (_spec, _mode, model) = spec_mode_model("conv_stale", None, &cfg, None, &md, &[]);
         assert_eq!(model, None, "an id absent from the catalog must not be sent");
 
         // A selection the catalog DOES advertise survives untouched.
@@ -6120,7 +6163,7 @@ mod build_mapping_tests {
             current_model_id: Some("haiku".into()),
             ..Default::default()
         };
-        let (_spec, _mode, model) = spec_mode_model("conv_live", None, &live, None, &md);
+        let (_spec, _mode, model) = spec_mode_model("conv_live", None, &live, None, &md, &[]);
         assert_eq!(model.as_deref(), Some("haiku"));
 
         // `default` is a real catalog row, so it survives here; suppressing it is the
@@ -6129,8 +6172,33 @@ mod build_mapping_tests {
             current_model_id: Some("default".into()),
             ..Default::default()
         };
-        let (_spec, _mode, model) = spec_mode_model("conv_default", None, &default_row, None, &md);
+        let (_spec, _mode, model) = spec_mode_model("conv_default", None, &default_row, None, &md, &[]);
         assert_eq!(model.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn backend_authorized_managed_model_survives_cli_catalog_validation() {
+        let cfg = AcpBuildExtra {
+            current_model_id: Some("gpt-6.1-sol".into()),
+            ..Default::default()
+        };
+        let metadata = metadata_with_models(&["gpt-5.6-luna"]);
+        let runtime_env = vec![
+            ("SAYDONE_MANAGED_AGENT".into(), "1".into()),
+            ("SAYDONE_MANAGED_MODEL".into(), "gpt-6.1-sol".into()),
+        ];
+        let (_spec, _mode, model) = spec_mode_model("conv_managed", None, &cfg, None, &metadata, &runtime_env);
+        assert_eq!(model.as_deref(), Some("gpt-6.1-sol"));
+
+        let conflicting_lease = vec![
+            ("SAYDONE_MANAGED_AGENT".into(), "1".into()),
+            ("SAYDONE_MANAGED_MODEL".into(), "gpt-5.6-luna".into()),
+        ];
+        let (_spec, _mode, model) = spec_mode_model("conv_mismatch", None, &cfg, None, &metadata, &conflicting_lease);
+        assert_eq!(
+            model, None,
+            "a lease for another model must not bypass catalog validation"
+        );
     }
 
     /// No catalog (first-ever open, nothing handshaked) is NOT evidence the selection is
@@ -6143,11 +6211,12 @@ mod build_mapping_tests {
             ..Default::default()
         };
         // handshake.available_models = None
-        let (_spec, _mode, model) = spec_mode_model("conv_a", None, &cfg, None, &test_metadata(Some("codex"), None));
+        let (_spec, _mode, model) =
+            spec_mode_model("conv_a", None, &cfg, None, &test_metadata(Some("codex"), None), &[]);
         assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "absent catalog ⇒ pass through");
 
         // An EMPTY catalog is equally uninformative.
-        let (_spec, _mode, model) = spec_mode_model("conv_b", None, &cfg, None, &metadata_with_models(&[]));
+        let (_spec, _mode, model) = spec_mode_model("conv_b", None, &cfg, None, &metadata_with_models(&[]), &[]);
         assert_eq!(model.as_deref(), Some("gpt-5.6-terra"), "empty catalog ⇒ pass through");
     }
 
@@ -6170,7 +6239,7 @@ mod build_mapping_tests {
         let md = test_metadata(Some("codex"), None);
 
         // (None, fork) -> Fork with the parent anchor + turn id.
-        let (spec, _, _) = spec_mode_model("conv_f", None, &fork_cfg, None, &md);
+        let (spec, _, _) = spec_mode_model("conv_f", None, &fork_cfg, None, &md, &[]);
         assert!(matches!(
             spec,
             SessionSpec::Fork { ref parent_backend_session_id, ref at_turn_id, .. }
@@ -6178,18 +6247,18 @@ mod build_mapping_tests {
         ));
 
         // (Some, fork) -> Resume (fork already materialized; never re-fork).
-        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &fork_cfg, None, &md);
+        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &fork_cfg, None, &md, &[]);
         assert!(matches!(
             spec,
             SessionSpec::Resume { backend_session_id: Some(ref b), .. } if b == "own-sid"
         ));
 
         // (None, no fork) -> Fresh.
-        let (spec, _, _) = spec_mode_model("conv_f", None, &plain_cfg, None, &md);
+        let (spec, _, _) = spec_mode_model("conv_f", None, &plain_cfg, None, &md, &[]);
         assert!(matches!(spec, SessionSpec::Fresh { .. }));
 
         // (Some, no fork) -> Resume (unchanged baseline).
-        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &plain_cfg, None, &md);
+        let (spec, _, _) = spec_mode_model("conv_f", Some("own-sid".into()), &plain_cfg, None, &md, &[]);
         assert!(matches!(spec, SessionSpec::Resume { .. }));
     }
 
@@ -6210,6 +6279,7 @@ mod build_mapping_tests {
             &cfg,
             Some(&snap),
             &test_metadata(Some("claude"), None),
+            &[],
         );
         assert_eq!(mode.as_deref(), Some("plan"), "snapshot mode wins");
         assert_eq!(model.as_deref(), Some("claude-opus-4-8"), "snapshot model wins");
@@ -6224,7 +6294,8 @@ mod build_mapping_tests {
             current_model_id: Some(String::new()),
             ..Default::default()
         };
-        let (_spec, mode, model) = spec_mode_model("conv_1", None, &cfg, None, &test_metadata(Some("claude"), None));
+        let (_spec, mode, model) =
+            spec_mode_model("conv_1", None, &cfg, None, &test_metadata(Some("claude"), None), &[]);
         assert_eq!(mode, None);
         assert_eq!(model, None);
     }
@@ -6241,7 +6312,7 @@ mod build_mapping_tests {
             session_mode: Some("yoloNoSandbox".into()),
             ..Default::default()
         };
-        let (_s, mode, _m) = spec_mode_model("c", None, &yolo_cfg, None, &codex);
+        let (_s, mode, _m) = spec_mode_model("c", None, &yolo_cfg, None, &codex, &[]);
         assert_eq!(
             mode.as_deref(),
             Some("full-access"),
@@ -6252,7 +6323,7 @@ mod build_mapping_tests {
             session_mode: Some("default".into()),
             ..Default::default()
         };
-        let (_s, mode, _m) = spec_mode_model("c", None, &def_cfg, None, &codex);
+        let (_s, mode, _m) = spec_mode_model("c", None, &def_cfg, None, &codex, &[]);
         assert_eq!(mode.as_deref(), Some("auto"), "codex default → auto");
 
         // A native / non-alias mode passes through unchanged.
@@ -6260,7 +6331,7 @@ mod build_mapping_tests {
             session_mode: Some("plan".into()),
             ..Default::default()
         };
-        let (_s, mode, _m) = spec_mode_model("c", None, &plan_cfg, None, &test_metadata(Some("claude"), None));
+        let (_s, mode, _m) = spec_mode_model("c", None, &plan_cfg, None, &test_metadata(Some("claude"), None), &[]);
         assert_eq!(mode.as_deref(), Some("plan"), "non-alias mode unchanged");
     }
 
