@@ -32,6 +32,14 @@ const LEGACY_INITIAL_SCHEMA_CHECKSUM: &[u8] = &[
     0x75, 0x4f, 0x34, 0xca, 0x0a, 0xab, 0x07, 0x9b, 0x4e, 0xc9, 0x27, 0x79, 0xdd, 0x70, 0xa8, 0x1f, 0xcf, 0x67, 0x47,
     0x2c, 0x53, 0xe1, 0x8f, 0xc8, 0xbe, 0xc2, 0x51, 0x2c, 0x54,
 ];
+// Checksum from the original Windows 0.1.7 migration set, verified against
+// affected installations whose migration 002 row has the legacy checksum
+// below. Keep this allowlisted; unknown checksums must still fail closed.
+const LEGACY_WINDOWS_INITIAL_SCHEMA_CHECKSUM: &[u8] = &[
+    0xd4, 0xdd, 0x44, 0x15, 0x8a, 0x52, 0xea, 0x3a, 0x14, 0x01, 0x89, 0xb5, 0xa7, 0x78, 0xaa, 0x85, 0x72, 0x8f, 0x00,
+    0x94, 0x55, 0xca, 0x5f, 0x76, 0x4b, 0xc7, 0xe6, 0xbf, 0x8e, 0x96, 0x82, 0xde, 0xae, 0x28, 0x5a, 0xb2, 0xb2, 0xa2,
+    0xf1, 0x5b, 0x61, 0x36, 0xff, 0x0b, 0x78, 0x79, 0x74, 0x0e,
+];
 // Checksum from the same legacy migration set for the next historical
 // migration. This also lets startup recover if an earlier build already
 // aligned migration 001 before being replaced by this broader repair.
@@ -422,23 +430,35 @@ async fn align_legacy_initial_schema_checksum(conn: &mut sqlx::SqliteConnection)
             .fetch_optional(&mut *conn)
             .await
             .map_err(DbError::Query)?;
-    let legacy_partial_repair = if checksum.as_deref() == Some(LEGACY_INITIAL_SCHEMA_CHECKSUM) {
-        true
-    } else if let Some(migration) = DB_MIGRATOR
-        .iter()
-        .find(|migration| migration.version == INITIAL_SCHEMA_MIGRATION_VERSION)
-    {
+    let windows_legacy_checksum_pair = if checksum.as_deref() == Some(LEGACY_WINDOWS_INITIAL_SCHEMA_CHECKSUM) {
         let next_checksum: Option<Vec<u8>> =
             sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ? AND success = 1")
                 .bind(LEGACY_NORMALIZE_SCHEMA_MIGRATION_VERSION)
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(DbError::Query)?;
-        checksum.as_deref() == Some(&*migration.checksum)
-            && next_checksum.as_deref() == Some(LEGACY_NORMALIZE_SCHEMA_CHECKSUM)
+        next_checksum.as_deref() == Some(LEGACY_NORMALIZE_SCHEMA_CHECKSUM)
     } else {
         false
     };
+    let legacy_partial_repair =
+        if checksum.as_deref() == Some(LEGACY_INITIAL_SCHEMA_CHECKSUM) || windows_legacy_checksum_pair {
+            true
+        } else if let Some(migration) = DB_MIGRATOR
+            .iter()
+            .find(|migration| migration.version == INITIAL_SCHEMA_MIGRATION_VERSION)
+        {
+            let next_checksum: Option<Vec<u8>> =
+                sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ? AND success = 1")
+                    .bind(LEGACY_NORMALIZE_SCHEMA_MIGRATION_VERSION)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(DbError::Query)?;
+            checksum.as_deref() == Some(&*migration.checksum)
+                && next_checksum.as_deref() == Some(LEGACY_NORMALIZE_SCHEMA_CHECKSUM)
+        } else {
+            false
+        };
     if !legacy_partial_repair {
         return Ok(false);
     }

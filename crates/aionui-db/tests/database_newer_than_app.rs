@@ -24,6 +24,11 @@ const LEGACY_NORMALIZE_SCHEMA_CHECKSUM: [u8; 48] = [
     0x7a, 0x41, 0xb1, 0x28, 0x93, 0xac, 0xf5, 0x1e, 0xc4, 0x00, 0xfd, 0xef, 0xaa, 0xd8, 0x8e, 0x76, 0x9a, 0x08, 0xd1,
     0x15, 0xf8, 0x35, 0x8f, 0xdf, 0xc3, 0x31, 0xa0, 0xc4, 0x44,
 ];
+const LEGACY_WINDOWS_INITIAL_SCHEMA_CHECKSUM: [u8; 48] = [
+    0xd4, 0xdd, 0x44, 0x15, 0x8a, 0x52, 0xea, 0x3a, 0x14, 0x01, 0x89, 0xb5, 0xa7, 0x78, 0xaa, 0x85, 0x72, 0x8f, 0x00,
+    0x94, 0x55, 0xca, 0x5f, 0x76, 0x4b, 0xc7, 0xe6, 0xbf, 0x8e, 0x96, 0x82, 0xde, 0xae, 0x28, 0x5a, 0xb2, 0xb2, 0xa2,
+    0xf1, 0x5b, 0x61, 0x36, 0xff, 0x0b, 0x78, 0x79, 0x74, 0x0e,
+];
 
 async fn seed_future_migration_row(path: &std::path::Path) {
     let db = init_database_staged(path).await.unwrap();
@@ -168,6 +173,75 @@ async fn partially_aligned_legacy_database_resumes_from_migration_two() {
         .unwrap();
     assert_ne!(checksum, LEGACY_NORMALIZE_SCHEMA_CHECKSUM);
     db.close().await;
+}
+
+#[tokio::test]
+async fn windows_legacy_checksum_pair_is_aligned_without_losing_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("saydone.db");
+
+    let db = init_database_staged(&path).await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('windows-legacy-user', 'windows-legacy-user', 'hash', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
+        .bind(LEGACY_WINDOWS_INITIAL_SCHEMA_CHECKSUM.to_vec())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 2")
+        .bind(LEGACY_NORMALIZE_SCHEMA_CHECKSUM.to_vec())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.close().await;
+
+    let db = init_database_staged(&path)
+        .await
+        .expect("the verified Windows legacy checksum pair must be aligned");
+    let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = 'windows-legacy-user'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(username, "windows-legacy-user");
+
+    let checksums: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version IN (1, 2) ORDER BY version")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(checksums.len(), 2);
+    assert_ne!(checksums[0], LEGACY_WINDOWS_INITIAL_SCHEMA_CHECKSUM);
+    assert_ne!(checksums[1], LEGACY_NORMALIZE_SCHEMA_CHECKSUM);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn windows_legacy_initial_checksum_with_unknown_second_checksum_is_not_aligned() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("saydone.db");
+
+    let db = init_database_staged(&path).await.unwrap();
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
+        .bind(LEGACY_WINDOWS_INITIAL_SCHEMA_CHECKSUM.to_vec())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = x'00' WHERE version = 2")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.close().await;
+
+    let err = init_database_staged(&path)
+        .await
+        .expect_err("a Windows legacy checksum without its verified migration 002 pair must fail");
+    assert_eq!(err.stage(), "database.migration");
+    assert_eq!(err.into_source().missing_migration_version(), None);
 }
 
 #[tokio::test]
